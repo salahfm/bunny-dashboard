@@ -1,0 +1,22 @@
+# Run the dashboard with a persistent data volume:
+#
+#   docker compose up -d --build
+#
+# Then open http://127.0.0.1:4747. Add TMDB/Bunny credentials in Settings —
+# they live in the volume, not in this file.
+services:
+  dashboard:
+    build: .
+    image: bunny-publisher-dashboard
+    restart: unless-stopped
+    ports:
+      - "4747:4747"
+    environment:
+      HOST: 0.0.0.0
+      DATA_DIR: /data
+      # MOCK_PROVIDERS: "1"   # uncomment for a fully offline demo run
+    volumes:
+      - dashboard-data:/data
+
+volumes:
+  dashboard-data:

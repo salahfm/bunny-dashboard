@@ -1,0 +1,8 @@
+node_modules/
+.tools/
+data/
+data-*/
+.scratch/
+.freebuff/
+.env
+*.log

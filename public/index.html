@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bunny Publisher</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">Bunny Publisher</div>
+      <div class="topbar-right">
+        <span id="mode-badge" class="badge">…</span>
+        <span id="queue-badge" class="badge">0 active</span>
+        <span id="tunnel-badge" class="badge">tunnel: unknown</span>
+      </div>
+    </header>
+
+    <div class="layout">
+      <nav class="nav" id="nav">
+        <button class="nav-item is-active" data-tab="titles">Titles</button>
+        <button class="nav-item" data-tab="source">Source URL</button>
+        <button class="nav-item" data-tab="queue">Queue</button>
+        <button class="nav-item" data-tab="accounts">Accounts</button>
+        <button class="nav-item" data-tab="watch">Watched folder</button>
+        <button class="nav-item" data-tab="settings">Settings</button>
+      </nav>
+
+      <main class="panels">
+        <!-- ---------------------------------------------------------- titles -->
+        <section class="panel is-active" id="tab-titles">
+          <h1>Titles</h1>
+          <p class="muted">Search TMDB, pick a target, then publish it.</p>
+
+          <div class="row">
+            <input id="search-input" type="search" placeholder="title, TMDB id (27205) or IMDb id (tt1375666)" />
+            <button id="search-button" class="primary">Search</button>
+          </div>
+          <div id="search-results" class="list"></div>
+
+          <div id="target-panel" class="box hidden">
+            <div class="box-head">
+              <strong id="target-title">—</strong>
+              <button id="target-clear" class="link">clear</button>
+            </div>
+            <div id="target-meta" class="muted small"></div>
+            <div id="season-picker" class="row hidden">
+              <label for="season-select">Season</label>
+              <select id="season-select"></select>
+            </div>
+            <div id="episode-list" class="list"></div>
+
+            <h2>Publish options</h2>
+            <div class="grid2">
+              <label>
+                Minimum tier for scraping
+                <select id="min-height">
+                  <option value="2160">4K</option>
+                  <option value="1440">2K / 1440p</option>
+                  <option value="1080" selected>1080p</option>
+                  <option value="720">720p</option>
+                  <option value="480">480p</option>
+                  <option value="0">whatever is available</option>
+                </select>
+              </label>
+              <label>
+                Hosts
+                <span id="host-list" class="checks"></span>
+              </label>
+            </div>
+            <div class="row">
+              <button id="scrape-button" class="primary">Direct scraping → upload</button>
+              <button id="preview-button">Preview sources</button>
+              <button id="remote-button">Bunny fetch (URL)</button>
+              <label class="file-button">
+                Upload file
+                <input id="file-input" type="file" />
+              </label>
+            </div>
+            <div class="row">
+              <input id="remote-url" type="url" placeholder="https://… direct media URL for Bunny's own fetch" />
+            </div>
+            <pre id="preview-output" class="output hidden"></pre>
+          </div>
+        </section>
+
+        <!-- ---------------------------------------------------------- source -->
+        <section class="panel" id="tab-source">
+          <h1>Source URL</h1>
+          <p class="muted">
+            Paste a source and this machine downloads it, then hands it to Bunny. A <code>.m3u8</code> master playlist is
+            read to its highest tier, a plain media URL is streamed as-is, and an embed page is scanned for a playlist.
+          </p>
+          <div class="grid2">
+            <label class="grow">
+              Source URL
+              <textarea id="source-url" rows="3" placeholder="https://host/master.m3u8  ·  https://host/movie.mp4  ·  https://host/embed/movie/27205"></textarea>
+            </label>
+            <label>
+              Title for the library
+              <input id="source-title" type="text" placeholder="Inception (2010)" />
+            </label>
+          </div>
+          <div class="grid2">
+            <label>
+              Optional TMDB link
+              <input id="source-tmdb" type="text" placeholder="TMDB id, or leave empty and the URL is used" />
+            </label>
+            <label>
+              Minimum tier
+              <select id="source-min-height">
+                <option value="2160">4K</option>
+                <option value="1440">2K / 1440p</option>
+                <option value="1080" selected>1080p</option>
+                <option value="720">720p</option>
+                <option value="480">480p</option>
+                <option value="0">whatever the URL has</option>
+              </select>
+            </label>
+          </div>
+          <div class="row">
+            <button id="source-send" class="primary">Download &amp; upload</button>
+            <span class="muted small">the backend downloads the TS, Bunny pulls it through the tunnel, or the bytes are uploaded directly</span>
+          </div>
+
+          <h2>Tunnel</h2>
+          <p class="muted small">
+            Bunny fetches from its own network, so the relay needs a public address. This starts the bundled
+            <code>cloudflared</code> quick tunnel; without one the dashboard uploads the bytes itself.
+          </p>
+          <div class="row">
+            <button id="tunnel-start" class="primary">Start tunnel</button>
+            <button id="tunnel-stop">Stop tunnel</button>
+            <span id="tunnel-status" class="muted small">unknown</span>
+          </div>
+          <pre id="tunnel-output" class="output hidden"></pre>
+        </section>
+
+        <!-- ----------------------------------------------------------- queue -->
+        <section class="panel" id="tab-queue">
+          <h1>Queue</h1>
+          <div class="row">
+            <select id="queue-filter">
+              <option value="">all statuses</option>
+              <option value="queued">queued</option>
+              <option value="uploading">uploading</option>
+              <option value="encoding">encoding</option>
+              <option value="ready">ready</option>
+              <option value="failed">failed</option>
+              <option value="cancelled">cancelled</option>
+            </select>
+            <label class="inline"><input id="queue-autorefresh" type="checkbox" checked /> refresh every 2 s</label>
+            <span id="queue-summary" class="muted small"></span>
+          </div>
+          <table class="table" id="jobs-table">
+            <thead>
+              <tr>
+                <th>Title</th>
+                <th>Status</th>
+                <th>Progress</th>
+                <th>Stage</th>
+                <th>Source</th>
+                <th>Account</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+          <div id="job-detail" class="box hidden"></div>
+        </section>
+
+        <!-- -------------------------------------------------------- accounts -->
+        <section class="panel" id="tab-accounts">
+          <h1>Accounts</h1>
+          <p class="muted">Up to 30 Stream libraries, 10 concurrent uploads each.</p>
+          <table class="table" id="accounts-table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Library</th>
+                <th>Pull zone</th>
+                <th>API key</th>
+                <th>Active</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+
+          <h2>Add an account</h2>
+          <div class="grid2">
+            <label>
+              Name
+              <input id="account-name" type="text" placeholder="library 1" />
+            </label>
+            <label>
+              Stream library ID
+              <input id="account-library" type="text" placeholder="123456" />
+            </label>
+            <label>
+              Stream API key
+              <input id="account-key" type="password" placeholder="…" />
+            </label>
+            <label>
+              Pull zone host (for playback URLs)
+              <input id="account-pullzone" type="text" placeholder="vz-xxxxx.b-cdn.net" />
+            </label>
+          </div>
+          <div class="row">
+            <button id="account-add" class="primary">Add account</button>
+            <span id="account-limit" class="muted small"></span>
+          </div>
+        </section>
+
+        <!-- ----------------------------------------------------------- watch -->
+        <section class="panel" id="tab-watch">
+          <h1>Watched folder</h1>
+          <p class="muted">New video files in this folder are matched against TMDB and queued automatically.</p>
+          <div class="row">
+            <input id="watch-dir" type="text" placeholder="D:\films\incoming" />
+            <label class="inline"><input id="watch-enabled" type="checkbox" /> enabled</label>
+            <button id="watch-save">Save</button>
+            <button id="watch-scan" class="primary">Scan now</button>
+          </div>
+          <div id="watch-state" class="muted small"></div>
+          <table class="table" id="watch-table">
+            <thead>
+              <tr>
+                <th>File</th>
+                <th>Status</th>
+                <th>Target</th>
+                <th>Job</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </section>
+
+        <!-- -------------------------------------------------------- settings -->
+        <section class="panel" id="tab-settings">
+          <h1>Settings</h1>
+          <div class="grid2">
+            <label>
+              TMDB API key (v3)
+              <input id="settings-key" type="password" placeholder="leave empty to keep the current one" />
+            </label>
+            <label>
+              TMDB access token (v4)
+              <input id="settings-token" type="password" placeholder="leave empty to keep the current one" />
+            </label>
+            <label>
+              Concurrent uploads per account (1–10)
+              <input id="settings-concurrency" type="number" min="1" max="10" />
+            </label>
+            <label>
+              Account limit (1–30)
+              <input id="settings-maxaccounts" type="number" min="1" max="30" />
+            </label>
+          </div>
+          <div class="row">
+            <button id="settings-save" class="primary">Save settings</button>
+            <button id="settings-clear">Forget TMDB credential</button>
+          </div>
+          <h2>Network</h2>
+          <p class="muted small">
+            A job that fails with <code>fetch failed</code> is almost always one of two things: this machine cannot reach
+            Bunny, or it cannot reach the host that had the source. This checks both.
+          </p>
+          <div class="row">
+            <button id="diagnostics-run" class="primary">Check network</button>
+            <span id="diagnostics-summary" class="muted small"></span>
+          </div>
+          <table class="table" id="diagnostics-table">
+            <thead>
+              <tr>
+                <th>Check</th>
+                <th>Result</th>
+                <th>Latency</th>
+                <th>Address</th>
+                <th>Detail</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+
+          <h2>Runtime</h2>
+          <table class="table" id="runtime-table">
+            <tbody></tbody>
+          </table>
+          <h2>How it reaches Bunny</h2>
+          <p class="muted small">
+            Control-plane calls retry a flaky path (a dropped connection or a timeout) before giving up; uploads already do
+            this per chunk. Tune it with <code>NETWORK_TIMEOUT_MS</code> and <code>NETWORK_RETRIES</code>.
+          </p>
+
+          <h2>Scraping hosts</h2>
+          <table class="table" id="providers-table">
+            <thead>
+              <tr>
+                <th>Host</th>
+                <th>Kind</th>
+                <th>How it is resolved</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </section>
+      </main>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,12 @@
+node_modules
+data
+data-*
+.tools
+.env
+.env.*
+*.log
+tests
+scripts
+*.md
+.git
+.gitignore

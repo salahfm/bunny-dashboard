@@ -1,0 +1,23 @@
+{
+  "name": "bunny-publisher-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone dashboard: search TMDB, select movies/episodes, and queue media you own into Bunny Stream across up to 30 accounts with a 10-concurrent-upload cap per account.",
+  "scripts": {
+    "start": "tsx src/server.ts",
+    "dev": "tsx watch src/server.ts",
+    "mock": "tsx src/server.ts --mock",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test \"tests/*.test.ts\""
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "tsx": "^4.19.4"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.1",
+    "@types/node": "^22.15.0",
+    "typescript": "^5.8.3"
+  }
+}
