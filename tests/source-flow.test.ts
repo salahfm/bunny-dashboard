@@ -19,7 +19,8 @@ import type { BunnyClient } from '../src/bunny';
 import { parseMasterPlaylist, parseMediaPlaylist, StreamSpool } from '../src/hls';
 import { RelayHub } from '../src/relay';
 import { Store } from '../src/store';
-import { chooseCandidate, runStreamJob } from '../src/stream';
+import type { AppConfig } from '../src/config';
+import { chooseCandidate, floorFor, runStreamJob } from '../src/stream';
 import { TunnelManager } from '../src/tunnel';
 import { testConfig } from './helpers';
 
@@ -40,8 +41,21 @@ interface Origin {
 }
 
 /** An origin CDN: master playlist, one media playlist, ranged segment responses. */
+const ENGLISH_VTT = [
+  'WEBVTT',
+  '',
+  '00:00:01.000 --> 00:00:03.000',
+  'Hello there',
+  '',
+  '00:00:04.000 --> 00:00:06.000',
+  'Second line',
+  '',
+].join('\n');
+
+const ARABIC_VTT = ['WEBVTT', '', '00:00:01.000 --> 00:00:03.000', 'مرحبا', ''].join('\n');
+
 async function startOrigin(
-  options: { delayMs?: number; includeInit?: boolean; overdeliver?: number; shortfall?: number } = {},
+  options: { delayMs?: number; includeInit?: boolean; overdeliver?: number; shortfall?: number; subtitles?: 'both' | 'english' } = {},
 ): Promise<Origin> {
   const delayMs = options.delayMs ?? 0;
   const init = Buffer.from('INITSEGMENT');
@@ -64,6 +78,14 @@ async function startOrigin(
   ].join('\n');
   const master = [
     '#EXTM3U',
+    ...(options.subtitles
+      ? [
+          '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",LANGUAGE="en-US",DEFAULT=YES,AUTOSELECT=YES,URI="subs/eng.vtt"',
+          ...(options.subtitles === 'both'
+            ? ['#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="العربية",LANGUAGE="ar",AUTOSELECT=YES,URI="subs/ara.vtt"']
+            : []),
+        ]
+      : []),
     '#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=1280x720',
     'v720/index.m3u8',
     '#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080',
@@ -104,6 +126,8 @@ async function startOrigin(
     const delay = (fn: () => void) => (delayMs ? setTimeout(fn, delayMs) : fn());
 
     if (url.pathname === '/master.m3u8') return send(Buffer.from(master, 'utf8'), 'application/vnd.apple.mpegurl');
+    if (url.pathname === '/subs/eng.vtt') return send(Buffer.from(ENGLISH_VTT, 'utf8'), 'text/vtt');
+    if (url.pathname === '/subs/ara.vtt') return send(Buffer.from(ARABIC_VTT, 'utf8'), 'text/vtt');
     if (url.pathname === '/v1080/index.m3u8' || url.pathname === '/v720/index.m3u8') {
       return send(Buffer.from(media, 'utf8'), 'application/vnd.apple.mpegurl');
     }
@@ -269,6 +293,12 @@ test('a relay serves the bytes that exist, not the sizes the playlist promised',
   }
 });
 
+test('a floor of zero means the best tier available, not the default', () => {
+  assert.equal(floorFor(0), 0, '"whatever is available" must not be upgraded to 1080p');
+  assert.equal(floorFor(undefined), 1080, 'an absent floor keeps the default');
+  assert.equal(floorFor(-5), 1080, 'a nonsense floor falls back to the default');
+});
+
 test('the floor walks past a source that cannot reach it', async () => {
   const origin = await startOrigin();
   try {
@@ -386,6 +416,14 @@ test('Bunny pulls the stream through the tunnel while it is still downloading', 
     assert.equal(created, 0, 'a Bunny-side fetch must not create a video object of its own');
     assert.equal(store.job(job.id)?.bunnyVideoId, 'bunny-made-this', 'the job adopts the video Bunny created');
     assert.equal(result.quality, '1080p');
+    // The job keeps the whole ladder its source declared, not only the rung it
+    // settled on — this is what the published catalogue reports as the qualities
+    // that were available.
+    assert.deepEqual(
+      store.job(job.id)?.source.tiers?.map((tier) => tier.label),
+      ['1080p', '720p'],
+    );
+    assert.equal(store.job(job.id)?.source.tiers?.[1]?.url, `${origin.url}/v720/index.m3u8`);
     assert.equal(seen.length, 1);
     assert.equal(seen[0]?.bytes, origin.expected.length, 'Bunny must receive the whole stream');
     assert.equal(seen[0]?.intact, true, 'the segments Bunny pulled must be the source stream, byte for byte');
@@ -644,6 +682,209 @@ test('a short delivery is still refused, with the numbers', async () => {
       ),
       /refusing to publish an incomplete file/,
     );
+  } finally {
+    await rig.close();
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* Subtitles                                                           */
+/* ------------------------------------------------------------------ */
+
+interface RecordedCaption {
+  srclang: string;
+  label: string;
+  body: string;
+}
+
+/** Bunny for the direct-upload path: makes the video and records the captions. */
+function recordingBunny(captions: RecordedCaption[]): BunnyClient {
+  return {
+    async createVideo(title: string) {
+      return { guid: 'video-1', title, status: 1, encodeProgress: 0, length: 0 };
+    },
+    async uploadVideoResumable() {
+      return { uploadUrl: 'mock://tus/video-1', bytesSent: 0, totalBytes: 0, resumed: false };
+    },
+    async addCaption(_videoId: string, srclang: string, label: string, content: string | Buffer) {
+      captions.push({ srclang, label, body: Buffer.isBuffer(content) ? content.toString('utf8') : content });
+    },
+    async getVideo() {
+      return { guid: 'video-1', title: 'x', status: 4, encodeProgress: 100, length: 90 };
+    },
+    async fetchFromUrl() {
+      return { success: false, message: 'no tunnel in this test' };
+    },
+  } as unknown as BunnyClient;
+}
+
+/** One stream job on the direct-upload transport, with its captions recorded. */
+async function startDirectJob(
+  id: string,
+  title: string,
+  origin: Origin,
+  overrides: Partial<AppConfig> = {},
+): Promise<{
+  dir: string;
+  store: Store;
+  captions: RecordedCaption[];
+  deps: Parameters<typeof runStreamJob>[1];
+  target: Parameters<typeof runStreamJob>[3];
+  close(): Promise<void>;
+}> {
+  const dir = tempDir();
+  const config = testConfig(dir, { streamConcurrency: 2, tunnelEnabled: false, ...overrides });
+  const store = new Store(config);
+  const relay = new RelayHub();
+  const tunnel = new TunnelManager({ root: dir, port: 0, enabled: false, allowDownload: false });
+  const captions: RecordedCaption[] = [];
+
+  store.addJob({
+    id,
+    target: { kind: 'movie', tmdbId: 27205, title },
+    source: { kind: 'stream', mode: 'source', name: 'pasted.m3u8', input: origin.masterUrl },
+    status: 'uploading',
+    progress: 0,
+    polls: 0,
+    attempts: 1,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
+
+  return {
+    dir,
+    store,
+    captions,
+    deps: { config, store, relay, tunnel, log: () => undefined },
+    target: {
+      title,
+      client: recordingBunny(captions),
+      ensureVideo: async () => 'video-1',
+      adoptFetchedVideo: async () => undefined,
+    },
+    async close() {
+      relay.release(store.job(id)?.relayToken);
+      await origin.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+/**
+ * A stand-in for the translation engine, speaking the OpenAI chat-completions
+ * shape. Every cue it is asked for comes back prefixed, so a test can prove
+ * exactly which text was sent and that the timings were not touched.
+ */
+async function startFakeTranslator(): Promise<{ url: string; calls: Array<{ cues: string[]; prompt: string }>; close(): Promise<void> }> {
+  const calls: Array<{ cues: string[]; prompt: string }> = [];
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+    req.on('end', () => {
+      const parsed = JSON.parse(body || '{}') as { messages?: Array<{ content?: string }> };
+      const user = JSON.parse(parsed.messages?.[1]?.content ?? '{}') as { cues?: string[] };
+      const cues = user.cues ?? [];
+      calls.push({ cues, prompt: parsed.messages?.[0]?.content ?? '' });
+      const translations = cues.map((cue) => `[ar] ${cue.replace(/\n/g, ' ')}`);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ translations }) } }] }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as AddressInfo).port;
+  return {
+    url: `http://127.0.0.1:${port}/v1`,
+    calls,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
+
+test('the subtitle tracks a stream declares are carried into Bunny', async () => {
+  const origin = await startOrigin({ delayMs: 5, subtitles: 'both' });
+  const rig = await startDirectJob('job-subs', 'Inception', origin);
+  try {
+    await runStreamJob(
+      'job-subs',
+      rig.deps,
+      { update: (patch) => void rig.store.updateJob('job-subs', patch), isRunning: () => true },
+      rig.target,
+    );
+
+    const tracks = rig.store.job('job-subs')?.subtitles ?? [];
+    assert.deepEqual(tracks.map((track) => track.srclang).sort(), ['ar', 'en'], 'both declared tracks land');
+    assert.ok(tracks.every((track) => track.uploaded));
+
+    // `LANGUAGE="en-US"` is filed as plain `en`, and the file arrives as WebVTT.
+    const english = rig.captions.find((caption) => caption.srclang === 'en');
+    assert.equal(english?.label, 'English');
+    assert.match(english?.body ?? '', /^WEBVTT/);
+    assert.match(english?.body ?? '', /Hello there/);
+    assert.match(english?.body ?? '', /00:00:01\.000 --> 00:00:03\.000/);
+
+    const arabic = rig.captions.find((caption) => caption.srclang === 'ar');
+    assert.match(arabic?.body ?? '', /مرحبا/, 'the Arabic track is carried with its text intact');
+  } finally {
+    await rig.close();
+  }
+});
+
+test('with no Arabic track, the English text is translated — and no audio is touched', async () => {
+  const origin = await startOrigin({ delayMs: 5, subtitles: 'english' });
+  const translator = await startFakeTranslator();
+  const rig = await startDirectJob('job-translate', 'Inception', origin, {
+    translator: { provider: 'openai', apiKey: 'test-key', baseUrl: translator.url, model: 'fake-model' },
+    subtitleTargetLanguage: 'ar',
+  });
+  try {
+    await runStreamJob(
+      'job-translate',
+      rig.deps,
+      { update: (patch) => void rig.store.updateJob('job-translate', patch), isRunning: () => true },
+      rig.target,
+    );
+
+    const arabic = (rig.store.job('job-translate')?.subtitles ?? []).find((track) => track.srclang === 'ar');
+    assert.ok(arabic?.uploaded, 'an Arabic track was created');
+    assert.equal(arabic?.translated, true);
+    assert.equal(arabic?.translatedFrom, 'en');
+
+    // The translator was handed the English cue *text*, nothing else — this is
+    // the whole point of not using bunny.net's audio-first transcribe.
+    assert.equal(translator.calls.length, 1);
+    assert.deepEqual(translator.calls[0]?.cues, ['Hello there', 'Second line']);
+    assert.match(translator.calls[0]?.prompt ?? '', /subtitle translator/i);
+
+    const caption = rig.captions.find((entry) => entry.srclang === 'ar');
+    assert.match(caption?.body ?? '', /\[ar\] Hello there/);
+    // The translation kept the source timings; it did not invent its own.
+    assert.match(caption?.body ?? '', /00:00:01\.000 --> 00:00:03\.000/);
+    assert.match(caption?.body ?? '', /00:00:04\.000 --> 00:00:06\.000/);
+  } finally {
+    await translator.close();
+    await rig.close();
+  }
+});
+
+test('without a translator the missing language is noted, never invented', async () => {
+  const origin = await startOrigin({ delayMs: 5, subtitles: 'english' });
+  const rig = await startDirectJob('job-notrans', 'Inception', origin);
+  try {
+    await runStreamJob(
+      'job-notrans',
+      rig.deps,
+      { update: (patch) => void rig.store.updateJob('job-notrans', patch), isRunning: () => true },
+      rig.target,
+    );
+
+    const tracks = rig.store.job('job-notrans')?.subtitles ?? [];
+    const arabic = tracks.find((track) => track.srclang === 'ar');
+    assert.equal(arabic?.uploaded, false, 'nothing was invented');
+    assert.match(arabic?.note ?? '', /no text translator is configured/);
+    assert.ok(!rig.captions.some((caption) => caption.srclang === 'ar'));
+    // The track the stream *did* have still made it.
+    assert.ok(rig.captions.some((caption) => caption.srclang === 'en'));
   } finally {
     await rig.close();
   }

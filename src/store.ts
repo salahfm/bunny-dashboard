@@ -40,6 +40,21 @@ export interface JobSource {
   provider?: string;
   /** The media CDN's required headers, so a retry can fetch the same screen again. */
   headers?: Record<string, string>;
+  /**
+   * Every tier the chosen source offers, best first — the ladder its master
+   * playlist declared (a single entry for a plain file). Recorded so the
+   * published catalogue can say which qualities were available, not just the
+   * one that happened to be downloaded.
+   */
+  tiers?: SourceTier[];
+}
+
+/** One rung of a source's quality ladder. */
+export interface SourceTier {
+  label: string;
+  height: number;
+  url: string;
+  bandwidth?: number;
 }
 
 /** One candidate the scrape found, kept on the job so the dashboard can show the ladder. */
@@ -86,12 +101,43 @@ export interface Job {
   relayToken?: string;
   /** Every source the scrape found, best first. */
   candidates?: JobCandidate[];
+  /**
+   * The subtitle tracks carried to Bunny for this video.
+   *
+   * One entry per caption Bunny now holds: what the stream offered (or the
+   * translation of it), the language it was filed under, and whether the upload
+   * actually landed. Recorded on the job so "did this get subtitles, and which?"
+   * is answerable without reopening Bunny.
+   */
+  subtitles?: SubtitleTrack[];
   polls: number;
   attempts: number;
   createdAt: string;
   updatedAt: string;
   startedAt?: string;
   finishedAt?: string;
+}
+
+/** One subtitle track carried to Bunny, as the job's report keeps it. */
+export interface SubtitleTrack {
+  /** The ISO 639-1 code the caption was filed under with Bunny. */
+  srclang: string;
+  /** The label a player shows for it. */
+  label: string;
+  /** The URL the text was scraped from (absent for a translation). */
+  url?: string;
+  /** What the manifest/host called the language, before normalisation. */
+  language?: string;
+  /** Bunny accepted the caption. */
+  uploaded: boolean;
+  /** It was translated from another track rather than scraped. */
+  translated?: boolean;
+  /** The track a translation was made from, e.g. `en`. */
+  translatedFrom?: string;
+  /** Cues in the track, and the bytes handed to Bunny. */
+  cues?: number;
+  bytes?: number;
+  note?: string;
 }
 
 export interface Account {
@@ -122,9 +168,25 @@ export interface Db {
   jobs: Job[];
 }
 
+/**
+ * Job fields that change on every uploaded chunk or downloaded segment.
+ *
+ * Writing the whole database for one of these is the difference between a few
+ * writes a second and a few hundred: a busy queue calls `updateJob` with a new
+ * `progress` (or byte count) many times a second, and each call would otherwise
+ * re-serialise every job — candidates and all — and block the event loop doing
+ * it. These are coalesced; everything else is written immediately.
+ */
+const VOLATILE_JOB_FIELDS = new Set<keyof Job>(['progress', 'bytesIn', 'bytesOut', 'stage', 'detail']);
+
+/** How long a coalesced progress write may stay only in memory. */
+const SAVE_DEBOUNCE_MS = 100;
+
 export class Store {
   private config: AppConfig;
   private db: Db;
+  private savePending = false;
+  private saveTimer: NodeJS.Timeout | undefined;
 
   constructor(config: AppConfig) {
     this.config = config;
@@ -168,11 +230,41 @@ export class Store {
     }
   }
 
+  /** Writes the database now, cancelling any pending coalesced write. */
   save(): void {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = undefined;
+    }
+    this.savePending = false;
     fs.mkdirSync(path.dirname(this.config.dbPath), { recursive: true });
     const tmp = `${this.config.dbPath}.tmp`;
     fs.writeFileSync(tmp, `${JSON.stringify(this.db, null, 2)}\n`);
     fs.renameSync(tmp, this.config.dbPath);
+  }
+
+  /**
+   * Writes soon rather than now: a burst of progress updates lands as one write.
+   * The timer is unref'd so a pending write never keeps the process alive.
+   */
+  private saveSoon(): void {
+    this.savePending = true;
+    if (this.saveTimer) return;
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = undefined;
+      if (this.savePending) this.save();
+    }, SAVE_DEBOUNCE_MS);
+    this.saveTimer.unref?.();
+  }
+
+  /** Persists anything a coalesced write left in memory (e.g. on shutdown). */
+  flush(): void {
+    if (this.savePending || this.saveTimer) this.save();
+  }
+
+  /** True when a coalesced write is still pending — used by tests. */
+  get hasPendingSave(): boolean {
+    return this.savePending;
   }
 
   get settings(): Settings {
@@ -244,7 +336,11 @@ export class Store {
     const job = this.job(id);
     if (!job) return undefined;
     Object.assign(job, patch, { updatedAt: new Date().toISOString() });
-    this.save();
+    // A patch that only moves a byte counter is not worth a full rewrite;
+    // anything structural (a status change, a session URL, …) is written at once.
+    const keys = Object.keys(patch) as Array<keyof Job>;
+    if (keys.length > 0 && keys.every((key) => VOLATILE_JOB_FIELDS.has(key))) this.saveSoon();
+    else this.save();
     return job;
   }
 
@@ -255,6 +351,20 @@ export class Store {
     this.save();
     return true;
   }
+}
+
+/**
+ * The identity of a target, for "is this already queued?" and for the published
+ * catalogue: a movie is its TMDB id, an episode is the show plus its numbers (so
+ * season 2 twice is one identity while season 3 is another).
+ *
+ * Kept here rather than in `bulk.ts` because the queue and the catalogue must
+ * agree on what "the same title" means.
+ */
+export function targetKey(target: JobTarget): string {
+  return target.kind === 'movie'
+    ? `movie:${target.tmdbId}`
+    : `episode:${target.tmdbId}:${target.season ?? 0}:${target.episode ?? 0}`;
 }
 
 export function newJob(target: JobTarget, source: JobSource): Job {

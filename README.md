@@ -9,9 +9,12 @@ Bunny does the encoding; the dashboard tracks every job until it is playable.
 > URL Bunny fetches itself, or — the *direct scraping* path — an embed host or a
 > source URL this machine resolves and downloads before handing the bytes to
 > Bunny. The scraping core is ported from the `ogaro` backend's providers
-> (`lib/providers/*`) with the subtitle/Arabic-track logic stripped out. Whatever
-> you publish is your responsibility: the hosts are third-party players, and
-> having the tool resolve them is not a licence to redistribute what they serve.
+> (`lib/providers/*`). Subtitles are carried from the stream's own HLS manifest
+> as Bunny caption tracks, and an English track is translated into Arabic when a
+> title has none — from the **text**, never from the audio (see *Subtitles*).
+> Whatever you publish is your responsibility: the hosts are third-party players,
+> and having the tool resolve them is not a licence to redistribute what they
+> serve.
 
 ## How the source pipeline works
 
@@ -54,7 +57,9 @@ Paste that URL into **Source URL** and press **Download & upload**.
 - **Titles**: search by title, bare TMDB id (`27205`), IMDb id (`tt1375666`) or a
   TMDB link; pick a movie, or a show → season → episode. The selected target then
   has four actions: *Direct scraping → upload*, *Preview sources*, *Bunny fetch*
-  (a direct URL Bunny pulls itself) and *Upload file*.
+  (a direct URL Bunny pulls itself) and *Upload file*. The minimum tier applies to
+  the scrape: pick *whatever is available* (`0`) and the best tier any host offers
+  is taken instead of the 1080p default.
 - **Add a whole list**: paste one entry per line — a title (`Inception (2010)`),
   a TMDB id (`27205`), an IMDb id (`tt1375666`), a TMDB link, or a show. Movies and
   shows can be mixed, `#` comments a line out, and anything already in the queue is
@@ -73,6 +78,17 @@ Paste that URL into **Source URL** and press **Download & upload**.
   in, which host and tier its source came from, and the transport that carried it.
   Click a row for the full candidate ladder, the resolved URL, byte counts and
   the relay state; retry, cancel and delete live per row.
+- **Library**: the permanent record. The moment a job turns *ready* its whole
+  record is written to `DATA_DIR/catalog.json` — where it plays (video id,
+  account, pull zone, playback URL, transport), what was published (the tier, the
+  host, the resolved URL and its headers), **every quality the chosen source
+  offered** (the full ladder from its master playlist), **every source URL the
+  scrape found** (each with the headers it needed and the note about it) and
+  **every subtitle track it was published with** — scraped or translated, with
+  the language and the cue count. It survives deleting the job and a dashboard
+  restart; filter it by title, id, quality, host, account or **subtitle
+  language**, open a record for the URL-by-URL detail, or forget one (the video
+  stays in Bunny).
 - **Preview sources** answers "what would be picked, and why" without downloading
   anything: every probed candidate with its height, host and note.
 - **Accounts**: add/enable/disable/test/delete Bunny Stream accounts; keys are
@@ -83,6 +99,31 @@ Paste that URL into **Source URL** and press **Download & upload**.
 - **Watched folder**: drop video files into a folder and the dashboard reads the
   title, year and episode numbers out of each filename, matches them on TMDB and
   queues them automatically.
+- **Autopilot**: walk TMDB's **top-rated** movies and shows without clicking.
+  Each page is read highest rating first and a title is only queued when it
+  **clears a rating floor** (default 3) — a title with **no rating at all**
+  counts as failing, because a title nobody has rated is not "top rated".
+  Titles already queued or already published are stepped over, so re-reading a
+  page is free. When a cycle finds nothing new it **retries the failed jobs**
+  automatically; when there is nothing to retry either it starts the list over
+  from page one. A cycle creates a bounded number of jobs and the whole thing
+  pauses while the queue is deep, so it can be left running. See *Autopilot*.
+- **Stays unblocked**: requests to one scraping host are spaced out, and a host
+  that refuses (401/403/429/503) or serves a bot wall goes into an **escalating
+  cooldown** instead of being retried into a permanent ban; a host can also be
+  routed through a **bunny.net pull zone** so it sees Bunny's IPs, not this
+  machine's. See *Avoiding blocks*.
+- **Subtitles**: a scraped stream's subtitle tracks are read from its HLS
+  manifest, downloaded, converted to WebVTT and attached to the Bunny video as
+  **caption tracks**. When a title has no Arabic, the English subtitle *text* is
+  translated and uploaded against the same timings — no speech recognition is
+  involved. See *Subtitles* below.
+- **Named by TMDB id**: the video object created in Bunny is called `tmdb:27205`
+  for a movie and `tv:1396:S01E02` for an episode, not `Inception (2010)`.
+  A library of ids stays unique and joinable back to TMDB (and to this
+  dashboard's catalogue, whose keys are the same shape) however a release was
+  named; the readable title still travels with the job and is what the queue and
+  the Library show.
 - **Mock mode** that simulates TMDB and Bunny (encodes finish in ~20 s) so the
   whole flow can be used and tested without any credentials.
 
@@ -139,6 +180,15 @@ at startup and never overrides real environment variables.
 | `MOCK_PROVIDERS` | `0` | `1` behaves like `npm run mock` |
 | `NETWORK_TIMEOUT_MS` | `30000` | per-attempt ceiling for Bunny API and playlist calls (min 1000) |
 | `NETWORK_RETRIES` | `3` | extra attempts after a transport failure (clamped 0–8, with jittered backoff) |
+| `SCRAPER_MIN_INTERVAL_MS` | `350` | smallest gap between two requests to the same scraping host (`0` disables) |
+| `SCRAPER_COOLDOWN_MS` | `60000` | first cooldown for a host that refused us (min 1000); doubles per repeat, capped at 30 min |
+| `SCRAPER_EGRESS` | – | route a scraping host through a bunny.net pull zone: `host=base,host=base` |
+| `SUBTITLES` | `1` | carry a scraped stream's subtitle tracks into Bunny as caption tracks |
+| `SUBTITLE_TARGET_LANG` | `ar` | the language a title should end up with; filled in by translation when missing |
+| `SUBTITLE_TRANSLATOR` | – | `openai` (any OpenAI-compatible endpoint) or `deepl`; unset = carry tracks only, translate nothing |
+| `SUBTITLE_TRANSLATOR_KEY` | – | that service's API key |
+| `SUBTITLE_TRANSLATOR_URL` | provider default | the endpoint base, e.g. `https://api.openai.com/v1` or a local Ollama |
+| `SUBTITLE_TRANSLATOR_MODEL` | `gpt-4o-mini` | the model, for the `openai` provider |
 | `DASHBOARD_USER` | `index` | login user, used only when a password is set |
 | `DASHBOARD_PASSWORD` | – | set it to require the login on every page and API route |
 
@@ -155,6 +205,9 @@ the hard caps). Uploads are capped at 10 GB per file.
    TUS (see below) or calls `POST /videos/fetch` for remote URLs.
 4. Status moves `queued → uploading → encoding → ready` (or `failed`), polling
    Bunny every 10 s. While uploading, `progress` tracks bytes sent to Bunny.
+5. Turning `ready` writes the job's full record to the published catalogue
+   (`DATA_DIR/catalog.json`), so "what did we publish, at which quality, from
+   which URL?" outlives the job and the dashboard.
 
 ### Resumable (TUS) uploads
 
@@ -225,6 +278,154 @@ How it behaves:
 - A re-dropped file with a name that was already queued is new work: it is
   matched and queued again.
 
+## Subtitles
+
+A scraped stream carries its subtitles in its HLS manifest as
+`#EXT-X-MEDIA:TYPE=SUBTITLES` renditions — a URI per language, with the language
+code and a label. Those are the source of truth: the manifest is the one place a
+stream honestly says what subtitles come with it, so the pipeline reads them
+from there rather than guessing at file names on the host.
+
+For every subtitle track the chosen stream declares:
+
+1. **Fetch.** The rendition URI is read through the same host guard as the
+   scrape. It may be a plain `.vtt`/`.srt` file, or a *subtitle playlist* whose
+   chunks are WebVTT segments on their own timeline — the `X-TIMESTAMP-MAP` of
+   each chunk is applied, so segments do not all stack up at zero.
+2. **Normalise.** SRT is converted to WebVTT (commas become full stops, hours are
+   padded, cue indices dropped) and the language is normalised to a short ISO
+   639-1 code — `en-US`, `ENG` and a track named *English* all become `en`.
+3. **Attach.** The WebVTT is uploaded to Bunny as a caption track
+   (`POST /videos/{id}/captions/{srclang}`). A caption Bunny decides is malformed
+   is off the job with a note rather than reported as success.
+
+Nothing here fails the job: a host that will not hand over its subtitles, or a
+subtitle file that makes no sense, becomes a noted track on the job and the
+video is still published.
+
+### Arabic without speech recognition
+
+If the target language (`SUBTITLE_TARGET_LANG`, `ar` by default) is still
+missing, the dashboard translates an existing track into it and uploads that as
+a normal caption.
+
+The translation is **text → text**. Bunny's own transcribe/translate runs
+Whisper over the **audio** first — speech recognition — which is slower, costs
+per audio-minute, and is a poor way to reach a given language when the subtitle
+is already sitting there in English. So instead the English cue lines are sent
+to a translation engine and the Arabic comes back against the **same timings**:
+ose only the cue text, and the cue count and order are how the reply is matched
+back, so an Arabic track cannot drift out of sync.
+
+Two engines are wired, and `openai` is the one to reach for if the Arabic
+quality matters most, because the model sees the whole cue list and keeps names,
+register and pronouns consistent across a film:
+
+| `SUBTITLE_TRANSLATOR` | What it talks to | Notes |
+| --- | --- | --- |
+| `openai` | Any OpenAI-compatible `/chat/completions` | OpenAI, OpenRouter, Groq, Together, or a local Ollama/LM Studio. Best Arabic for subtitles; cost is per translation call, and nothing is transcribed. |
+| `deepl` | `api-free.deepl.com` / `api.deepl.com` | A dedicated engine with strong Arabic and a free tier. The host is chosen from the key itself (`:fx` = free). |
+
+With no translator configured, nothing is invented: the tracks the stream
+actually had are carried, and the job notes that the target language was missing
+and no translator is set up. A title published without subtitles at all is
+recorded as such in the Library, and the catalogue keeps the full list — so
+"which titles have Arabic?" is one search.
+
+## Autopilot
+
+The **Autopilot** tab fills the queue from TMDB's **top-rated** lists with nobody
+clicking. It is off by default; switch it on and it runs a cycle every
+`intervalMs` (default 5 min, floor 10 s), or press **Run a cycle now**.
+
+A cycle is one pass over the lists you ticked (movies and/or shows):
+
+1. Read the current page of `/movie/top_rated` or `/tv/top_rated`, **highest
+   rating first** — the client sorts by `voteAverage` itself, so the "best
+   first" rule does not depend on the API's own order.
+2. Queue a title only if its rating is **at or above the floor** (default **3**).
+   A title with **no rating** fails the floor: "nobody has rated this" is not
+   "top rated". Titles already queued or already in the published catalogue are
+   stepped over, so re-reading a page costs nothing.
+3. A show expands to every episode of every season (turn *expand shows into
+   every episode* off to step over shows instead).
+4. The cursor moves to the next page — but only once the page was fully dealt
+   with. A page cut short by `maxJobsPerCycle` is picked up again next cycle, so
+   a page is never half-skipped.
+
+When a cycle creates **nothing**, the failure cleanup runs on its own: every
+failed job whose attempts are below `maxAttempts` (default 5) is handed back to
+the queue. When there is **nothing to retry either**, the list starts over from
+page one, so a title that has gained a rating (or appeared on a new page) is
+seen next time. That is the whole loop: fill the queue from the top, clean up
+what fell over, then look again.
+
+The whole thing pauses when the queue already holds `maxQueueDepth` unfinished
+jobs (default 300) and reports why. State — the page cursor per list, the last
+report and a rolling 200-line log — is written to `DATA_DIR/autopilot.json`, so a
+restart resumes where it stopped instead of re-walking the same pages.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| rating floor | `3` | queue a title at or above this; **unrated counts as failing** |
+| lists | movies + shows | which top-rated lists to walk |
+| minimum tier | `1080p` | the scrape floor for the jobs it queues |
+| jobs per cycle | `25` | the most one cycle may create |
+| retry limit | `5` | a failed job is retried until it has this many attempts |
+| queue-depth pause | `300` | stop adding while this many jobs are unfinished |
+| interval | `5 min` | how often a cycle runs (min 10 s) |
+| expand shows | on | queue every episode of a show rather than stepping over shows |
+
+## Avoiding blocks (politeness and bunny.net egress)
+
+The scraping hosts are third-party players, and asking one of them for a
+thousand titles looks exactly like abuse. Two layers keep the dashboard out of
+trouble.
+
+**Politeness (always on).** Requests to a single host are **serialised with a
+minimum gap** between them (`SCRAPER_MIN_INTERVAL_MS`, default 350 ms) — several
+hosts are still asked in parallel, but one host never sees a burst. A host that
+answers `401`, `403`, `429` or `503` — or a body that is really a bot wall
+("Just a moment", a Cloudflare `challenge-platform` page, `DDoS-Guard`,
+"Checking your browser") — is put into **cooldown**, and a `Retry-After` is
+honoured when it sends one. The first cooldown is `SCRAPER_COOLDOWN_MS` (default
+60 s) and each further refusal doubles it up to 30 minutes, so a stuck host
+cannot be retried into a permanent ban. While a host cools, every request to it
+fails fast with a clear reason and the sweep moves on to the next host rather
+than burning its timeout. **Settings → Cooling down** lists the hosts that are
+cooling, why, and when they recover.
+
+**Egress through bunny.net.** A CDN's job is to fetch content from an origin on
+behalf of its visitors — and Bunny **forwards the visitor's headers unchanged**
+(`User-Agent`, `Accept`, `Accept-Language`, `Referer`, `Cookie`, `Authorization`
+and any custom header; it only adds `Host`, `X-Real-IP`, `X-Forwarded-For` and
+`CDN-*`). So a pull zone whose **Origin URL** is the embed host turns a request
+to a blocked host into a request from **Bunny's IPs**, with the dashboard's own
+headers preserved. Nothing else about the request changes: the dashboard still
+parses the page, only the address it came from does.
+
+To use it, create a **pull zone** in the bunny.net dashboard (CDN → Pull Zones)
+with the **Origin URL** set to the host you want to route, then tell the
+dashboard to send that host through it:
+
+```bash
+# comma-separated host=base pairs — route vidfast.vc and one other host
+SCRAPER_EGRESS="vidfast.vc=https://yourzone.b-cdn.net,embed.example=https://other.b-cdn.net"
+```
+
+A request for `https://vidfast.vc/x/y.m3u8` then goes out as
+`https://yourzone.b-cdn.net/x/y.m3u8`; the path and query are kept, so Bunny
+fetches the real URL from its own network and streams the answer back. The
+**Settings** tab shows the egress map in force, and the job still records the
+real host as its source.
+
+Because a pull zone is free to point at any origin, this is a general workaround
+for a host that blocks your IP, not just the embed hosts. It has limits: bunny.net
+**drops header names containing `_`** and adds its own `Host`, a host that pins an
+exact signed URL is not helped at all, and an interactive browser challenge is
+not something a proxy can answer — for that, the cooldown path above is what
+keeps the queue honest.
+
 ## API
 
 | Method | Path | Purpose |
@@ -244,21 +445,40 @@ How it behaves:
 | `POST` | `/api/jobs/bulk` | `{ text \| lines[], expandSeries?, seasons?, maxJobs?, skipQueued?, only?, minHeight? }` → one job per movie, every episode per show; answers `{ created, skipped, counts, truncated }` |
 | `POST` | `/api/jobs/series` | `{ target: { tmdbId, title? }, seasons?, maxJobs?, only?, minHeight? }` → every episode of the show (`seasons` narrows it) |
 | `POST` | `/api/jobs/retry-failed` | retry every failed job in one call |
-| `GET` | `/api/sources/providers` | the scraping hosts + default tier floor |
+| `GET` | `/api/sources/providers` | the scraping hosts, the default tier floor, and the hosts currently cooling down |
 | `POST` | `/api/sources/preview` | `{ target, only?, minHeight? }` → what a scrape would pick |
 | `GET` | `/api/tunnel` | tunnel state + recent cloudflared log |
 | `POST` | `/api/tunnel/start` / `/stop` | bring the quick tunnel up or down |
 | `GET` | `/relay/<token>/stream.<ext>` | the live spool, for Bunny (and only Bunny) |
 | `GET` | `/relay/<token>/master.m3u8` · `/playlist.m3u8` · `/seg/<n>.<ext>` | the same stream as an HLS ladder |
-| `GET` | `/api/jobs` | jobs + queue stats |
+| `GET` | `/api/jobs` | jobs + queue stats. The rows are deliberately lean — the candidate ladder and per-source headers are left out of a list that may hold hundreds of jobs |
+| `GET` | `/api/jobs/:id` | one job in full, its candidate ladder included (what opening a row fetches) |
 | `POST` | `/api/jobs/:id/retry` / `/cancel` | lifecycle |
 | `DELETE` | `/api/jobs/:id` | remove a finished job |
 | `GET` | `/api/queue/stats` | counts + per-account usage |
+| `GET` | `/api/catalog?q=&kind=&limit=` | published titles (search + filter) with stats |
+| `GET` | `/api/catalog/stats` | how many titles/qualities are recorded and how many bytes |
+| `GET` | `/api/catalog/:key` | one record in full: every quality rung and every source URL |
+| `DELETE` | `/api/catalog/:key` | forget a record (Bunny keeps the video) |
+| `GET`/`PUT` | `/api/autopilot` | read / change the autopilot (rating floor, lists, limits, interval) |
+| `POST` | `/api/autopilot/run` | run one cycle now, whatever the schedule says |
+| `POST` | `/api/autopilot/reset` | reset the page cursors to page 1 |
+| `POST` | `/api/autopilot/log/clear` | clear the autopilot log |
 
 ## Data & security
 
+- `DATA_DIR/catalog.json` — the published catalogue: one permanent record per
+  title that finished publishing, with every source URL, quality rung and
+  subtitle track the job produced. Written on the `ready` transition, atomic, and
+  set aside (not lost) if it cannot be parsed. Deleting a job does not touch it.
+- `DATA_DIR/autopilot.json` — the autopilot's own state: whether it is on, its
+  settings, the page cursor per top-rated list, the last report and a rolling
+  200-line log. Atomic, and set aside (not lost) if it cannot be parsed.
 - `DATA_DIR/db.json` — settings, accounts, jobs (atomic writes; a corrupt file is
-  moved aside rather than crashing the process).
+  moved aside rather than crashing the process). A busy queue moves byte counters
+  many times a second, so those progress-only updates are coalesced into one write
+  (and flushed on a clean shutdown) while every structural change — a status, a
+  session URL — is written immediately.
 - `DATA_DIR/.secret` — 32-byte AES-256-GCM key, generated on first run, mode
   `0600`. Account API keys and the TMDB credential are stored encrypted; the API
   returns them masked (`••••1234`) and the dashboard never renders them.
@@ -358,11 +578,11 @@ right home for the queue. Hosts that build from a git repository only need the
 
 ```bash
 npm run typecheck        # tsc --noEmit
-npm test                 # 98 tests (queue caps, crypto, store, clients, TUS, watcher, job lifecycle, crash resume, HLS, source pipeline, tunnel, network policy, diagnostics, login)
+npm test                 # 157 tests (queue caps, crypto, store, catalogue, clients, TUS, watcher, job lifecycle, crash resume, HLS, source pipeline, subtitles, translation, tunnel, network policy, diagnostics, login, autopilot, host politeness)
 
 # End-to-end against a running mock server:
 npm run mock &           # or in another terminal
-node scripts/smoke.mjs   # TMDB, accounts, uploads, concurrency cap, the source pipeline, watched folder, cleanup
+node scripts/smoke.mjs   # TMDB, accounts, uploads, concurrency cap, the source pipeline, the autopilot, watched folder, cleanup
 
 # …when the dashboard runs with a custom DATA_DIR:
 SMOKE_BASE_URL=http://127.0.0.1:4791 SMOKE_DATA_DIR=data-smoke2 node scripts/smoke.mjs
@@ -381,6 +601,30 @@ stripped) must still be served at the lengths that really exist. The smoke scrip
 does the same thing once over HTTP: it serves an HLS stream from its own process,
 submits it through `POST /api/jobs/source`, and checks the tier it settled on,
 the byte counts and that nothing was left on disk.
+
+`tests/subtitles.test.ts` covers the text side of captions: SRT→WebVTT
+conversion, cue settings and multi-line text surviving a round trip, language
+normalisation (`en-US`, `ENG`, *English*, *العربية*), the HLS timestamp map, and
+the rule that a translated cue keeps its original timing (and falls back to the
+original text rather than blanking). `tests/translate.test.ts` drives both
+engines against a fake endpoint: chunking a long cue list, refusing a reply with
+the wrong number of cues, choosing the free or paid DeepL host from the key,
+reading JSON out of a model reply wrapped in prose, and surfacing a quota refusal
+as a translation error. The source pipeline tests then run it for real: an origin
+that declares English and Arabic renditions has both attached, an origin with
+only English has an Arabic track translated out of the cue **text** (the fake
+translator records exactly what it was sent, and the timings are asserted to be
+untouched), and with no translator configured the missing language is noted
+rather than invented.
+
+`tests/autopilot.test.ts` drives the autopilot against a canned TMDB: it checks
+that a page is processed highest rating first, that a below-floor or **unrated**
+title is stepped over, that a page cut short by the per-cycle cap is not advanced,
+that the list wraps at the end, that a cycle with nothing to queue retries the
+failed jobs, that a deep queue pauses the cycle, and that settings are validated.
+`tests/hostguard.test.ts` covers the politeness guard: pacing and per-host
+serialisation, `Retry-After`, the escalating cooldown, and the bot-wall sniffing
+that keeps a challenge page from being mistaken for a source.
 
 `tests/crash-resume.test.ts` proves the resume behaviour end to end without any
 Bunny credentials. It stands up a fake Bunny over HTTP, starts the real

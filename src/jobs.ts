@@ -5,6 +5,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import type { Catalog } from './catalog';
 import type { AppConfig } from './config';
 import { BunnyError, bunnyStatusLabel, mapBunnyStatus, playbackUrlFor, type BunnyClient } from './bunny';
 import { isActiveStatus, planAssignments } from './queue';
@@ -20,6 +21,8 @@ export interface JobServiceDeps {
   clientFactory: (account: Account) => BunnyClient;
   relay: RelayHub;
   tunnel: TunnelManager;
+  /** Where a finished job's full record is kept; absent means it is not kept. */
+  catalog?: Catalog;
   now?: () => number;
 }
 
@@ -32,12 +35,24 @@ function isGoneFromBunny(error: unknown): boolean {
   return error instanceof BunnyError && (error.status === 404 || error.status === 410);
 }
 
+/**
+ * The name a video is created under in the Bunny library, and the key Bunny's
+ * own fetch is matched back by.
+ *
+ * It is the **TMDB id**, not the title: a library full of "Inception (2010)"
+ * duplicates is unusable, whereas `tmdb:27205` is unique, stable across
+ * releases and re-scrapes, and joins straight back to TMDB (and to this
+ * dashboard's own catalogue, whose keys are the same shape). An episode carries
+ * its coordinates too, so `tv:1396:S01E02` identifies one episode of one show.
+ *
+ * The human-readable title still travels with the job (`target.title`,
+ * `target.episodeTitle`) and is what the queue, the catalogue and the UI show.
+ */
 export function jobTitle(target: JobTarget): string {
-  if (target.kind === 'movie') return target.year ? `${target.title} (${target.year})` : target.title;
+  if (target.kind === 'movie') return `tmdb:${target.tmdbId}`;
   const season = String(target.season ?? 1).padStart(2, '0');
   const episode = String(target.episode ?? 1).padStart(2, '0');
-  const base = `${target.title} S${season}E${episode}`;
-  return target.episodeTitle ? `${base} · ${target.episodeTitle}` : base;
+  return `tv:${target.tmdbId}:S${season}E${episode}`;
 }
 
 export function sourceNameFromUrl(url: string): string {
@@ -56,6 +71,7 @@ export class JobService {
   private clientFactory: (account: Account) => BunnyClient;
   private relay: RelayHub;
   private tunnel: TunnelManager;
+  private catalog: Catalog | undefined;
   private now: () => number;
   private inFlight = new Set<string>();
   private polling = new Set<string>();
@@ -67,6 +83,7 @@ export class JobService {
     this.clientFactory = deps.clientFactory;
     this.relay = deps.relay;
     this.tunnel = deps.tunnel;
+    this.catalog = deps.catalog;
     this.now = deps.now ?? (() => Date.now());
   }
 
@@ -167,6 +184,8 @@ export class JobService {
   stop(): void {
     for (const timer of this.timers) clearInterval(timer);
     this.timers = [];
+    // A coalesced progress write may still be in memory; a clean stop keeps it.
+    this.store.flush();
   }
 
   createFileJob(target: JobTarget, tempPath: string, name: string, bytes?: number): Job {
@@ -193,7 +212,11 @@ export class JobService {
       name: options.name || (options.input ? sourceNameFromUrl(options.input) : jobTitle(target)),
       ...(options.input ? { input: options.input } : {}),
       ...(options.only && options.only.length ? { only: options.only } : {}),
-      ...(options.minHeight && options.minHeight > 0 ? { minHeight: Math.floor(options.minHeight) } : {}),
+      // Kept as given (0 included): 0 means "take the best tier available",
+      // while an absent value means "use the default floor".
+      ...(options.minHeight !== undefined && Number.isFinite(options.minHeight)
+        ? { minHeight: Math.max(0, Math.floor(options.minHeight)) }
+        : {}),
     };
     return this.store.addJob(newJob(target, source));
   }
@@ -447,18 +470,39 @@ export class JobService {
     return !job.bunnyVideoId && job.source.kind === 'url';
   }
 
-  /** Read encoding progress for every job Bunny is still working on. */
+  /**
+   * Read encoding progress for every job Bunny is still working on.
+   *
+   * Bounded concurrency on purpose: a full queue holds up to
+   * `accounts × perAccountConcurrency` (300 by default) encoding jobs, and
+   * firing 300 status requests at Bunny every 10 s invites throttling and a
+   * poll backlog that outlives the interval. A small pool drains the list
+   * quickly without hammering the API.
+   */
   async pollNow(): Promise<void> {
     const active = this.store.jobs.filter(
       (job) => job.status === 'encoding' && job.accountId && (job.bunnyVideoId || this.needsAdoption(job)),
     );
-    await Promise.all(active.map((job) => this.pollJob(job.id)));
+    await this.runPool(active.map((job) => () => this.pollJob(job.id)), 8);
     // A Bunny pull that died leaves its relay (and spool file) behind; this is
     // where it is noticed. The download is over either way — nobody is waiting
     // on those bytes any more.
     for (const jobId of this.relay.sweepIdle()) {
       this.store.updateJob(jobId, { relayToken: undefined, detail: 'the relay was released after sitting idle' });
     }
+  }
+
+  /** Runs `tasks` with at most `limit` in flight, resolving once all are done. */
+  private async runPool(tasks: Array<() => Promise<void>>, limit: number): Promise<void> {
+    const queue = [...tasks];
+    const workers = Array.from({ length: Math.max(1, Math.min(limit, queue.length)) }, async () => {
+      for (;;) {
+        const task = queue.shift();
+        if (!task) return;
+        await task().catch(() => undefined);
+      }
+    });
+    await Promise.all(workers);
   }
 
   private async pollJob(jobId: string): Promise<void> {
@@ -496,7 +540,7 @@ export class JobService {
       const progress = Number.isFinite(video.encodeProgress) ? Math.max(0, Math.min(100, Math.round(video.encodeProgress))) : job.progress;
 
       if (outcome === 'ready') {
-        this.store.updateJob(jobId, {
+        const ready = this.store.updateJob(jobId, {
           status: 'ready',
           progress: 100,
           statusCode: video.status,
@@ -504,6 +548,10 @@ export class JobService {
           finishedAt: new Date().toISOString(),
           error: undefined,
         });
+        // The permanent record is written here, not when the job is created —
+        // "published" means Bunny finished encoding it, with everything the
+        // job learned along the way (every source, every quality rung).
+        if (ready) this.publish(ready, account);
         // Bunny has everything it needs from the relay by now.
         this.releaseRelay(job);
         this.cleanupTemp(job);
@@ -532,6 +580,17 @@ export class JobService {
       }
     } finally {
       this.polling.delete(jobId);
+    }
+  }
+
+  /** Records a finished job in the published catalogue, if one is configured. */
+  private publish(job: Job, account: Account): void {
+    if (!this.catalog) return;
+    try {
+      this.catalog.record(job, account);
+    } catch (error) {
+      // Losing the record must never fail a job that is already published.
+      console.error(`[catalog] could not record ${job.id}: ${describeError(error)}`);
     }
   }
 

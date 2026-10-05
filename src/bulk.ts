@@ -13,7 +13,10 @@
  * creates the rest. That keeps "what does this line mean" testable without a
  * store, a queue or a Bunny account.
  */
-import type { Job, JobTarget } from './store';
+import { targetKey, type Job, type JobTarget } from './store';
+
+// Re-exported for callers that already reach for it here (and its tests).
+export { targetKey };
 import { TmdbError, lookupTmdb, type TmdbClient, type TmdbEpisode, type TmdbSearchResult } from './tmdb';
 import { bestMatch, parseReleaseName } from './watch';
 
@@ -46,18 +49,6 @@ function describeError(error: unknown): string {
 
 function pad(value: number): string {
   return String(value).padStart(2, '0');
-}
-
-/**
- * The identity of a target, for "is this already queued?".
- *
- * A movie is its TMDB id; an episode is the show plus the numbers, so queueing
- * season 2 twice is a no-op while season 3 is a new job.
- */
-export function targetKey(target: JobTarget): string {
-  return target.kind === 'movie'
-    ? `movie:${target.tmdbId}`
-    : `episode:${target.tmdbId}:${target.season ?? 0}:${target.episode ?? 0}`;
 }
 
 /**

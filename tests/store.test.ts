@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { Store } from '../src/store';
+import { Store, newJob } from '../src/store';
 import { testConfig } from './helpers';
 
 test('accounts and settings persist across reloads', () => {
@@ -45,4 +45,34 @@ test('a corrupt database is set aside instead of crashing', () => {
   const store = new Store(config);
   assert.equal(store.accounts.length, 0);
   assert.ok(fs.readdirSync(dir).some((name) => name.includes('.corrupt-')));
+});
+
+function storedJob(config: { dbPath: string }, id: string): { progress: number; status: string; bytesIn?: number } | undefined {
+  const db = JSON.parse(fs.readFileSync(config.dbPath, 'utf8')) as { jobs: Array<{ id: string; progress: number; status: string; bytesIn?: number }> };
+  return db.jobs.find((job) => job.id === id);
+}
+
+/**
+ * A busy queue moves byte counters many times a second. Each of those must not
+ * rewrite the whole database, but a status change still has to land at once,
+ * and a clean stop must not lose the last progress tick.
+ */
+test('progress updates coalesce into one write, and flush persists them', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bunny-store-'));
+  const config = testConfig(dir);
+  const store = new Store(config);
+  const job = store.addJob(newJob({ kind: 'movie', tmdbId: 1, title: 'X' }, { kind: 'file', name: 'x.bin' }));
+
+  store.updateJob(job.id, { progress: 10 });
+  store.updateJob(job.id, { progress: 20, bytesIn: 100, bytesOut: 100 });
+  assert.equal(store.hasPendingSave, true, 'byte counters are coalesced, not written per tick');
+  assert.equal(storedJob(config, job.id)?.progress, 0, 'nothing volatile is on disk yet');
+
+  store.flush();
+  assert.equal(store.hasPendingSave, false);
+  assert.equal(storedJob(config, job.id)?.progress, 20, 'flush writes the coalesced progress');
+
+  store.updateJob(job.id, { status: 'failed', error: 'boom' });
+  assert.equal(store.hasPendingSave, false, 'a status change is written immediately');
+  assert.equal(storedJob(config, job.id)?.status, 'failed');
 });

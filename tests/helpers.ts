@@ -29,6 +29,11 @@ export function testConfig(dataDir: string, overrides: Partial<AppConfig> = {}):
     tunnelDownload: false,
     networkTimeoutMs: 30_000,
     networkRetries: 3,
+    scrapeMinIntervalMs: 0,
+    scrapeCooldownMs: 60_000,
+    scrapeEgress: {},
+    subtitleUpload: true,
+    subtitleTargetLanguage: 'ar',
     ...overrides,
   };
 }

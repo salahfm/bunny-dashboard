@@ -8,6 +8,7 @@
  * browser (vidfast, cinesrc). Those two keep their plain page scan here, which
  * is exactly the fallback ogaro itself runs when no browser is configured.
  */
+import { HostGuard, hostOf, looksLikeChallenge } from './hostguard';
 import { fetchWithPolicy } from './net';
 import type { JobTarget } from './store';
 
@@ -89,14 +90,87 @@ export function streamHeaders(referer?: string, extra: Record<string, string> = 
  * `fetch` with a hard timeout and one retry, so a slow or flaky host cannot
  * stall a resolve and a single dropped connection does not lose a whole source.
  * The provider's own cap still bounds the total: retries here never extend it.
+ *
+ * This is the raw transport (candidate probes and media downloads use it too),
+ * so it is deliberately not throttled per host — see [scrapeFetch].
  */
 export async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs = 9000): Promise<Response> {
   return fetchWithPolicy(url, init, { timeoutMs, retries: 1, backoffMs: 400, what: 'the host' });
 }
 
+/* ------------------------------------------------------------------ */
+/* Outbound policy for the scraping hosts                              */
+/* ------------------------------------------------------------------ */
+
+/** Raised when a host is in cooldown and the request was not even attempted. */
+export class HostBlockedError extends Error {
+  host: string;
+
+  constructor(message: string, host: string) {
+    super(message);
+    this.name = 'HostBlockedError';
+    this.host = host;
+  }
+}
+
+let egressMap: Record<string, string> = {};
+let hostGuard: HostGuard | undefined;
+
+/** Wires the shared guard and the host → base rewrite map into the scraper. */
+export function configureScraper(options: { egress?: Record<string, string>; guard?: HostGuard }): void {
+  if (options.egress) egressMap = options.egress;
+  if (options.guard) hostGuard = options.guard;
+}
+
+/** The guard in use, so the dashboard can show which hosts are cooling down. */
+export function scraperGuard(): HostGuard | undefined {
+  return hostGuard;
+}
+
+/**
+ * Where a request for `url` actually goes.
+ *
+ * With a host in `SCRAPER_EGRESS` the request is re-aimed at that base instead —
+ * the intended use is a bunny.net pull zone whose origin is the host, so the
+ * request leaves from Bunny's edge rather than this machine. `origin` stays the
+ * host the operator is really asking, which is what cooldowns and reports name.
+ */
+export function egressFor(url: string): { request: string; origin: string; via?: string } {
+  const origin = hostOf(url);
+  const base = egressMap[origin];
+  if (!base) return { request: url, origin };
+  try {
+    const rewritten = new URL(base);
+    const original = new URL(url);
+    rewritten.pathname = original.pathname;
+    rewritten.search = original.search;
+    return { request: rewritten.toString(), origin, via: rewritten.host.toLowerCase() };
+  } catch {
+    return { request: url, origin };
+  }
+}
+
+/**
+ * One scrape-layer request: paced and serialised per host, refused early while
+ * the host is cooling down, and observed so a refusal starts a cooldown.
+ */
+async function scrapeFetch(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const egress = egressFor(url);
+  const cooling = hostGuard?.cooling(egress.origin);
+  if (cooling) {
+    const left = Math.max(1, Math.ceil((cooling.until - Date.now()) / 1000));
+    throw new HostBlockedError(`${egress.origin} is cooling down for another ${left}s (${cooling.reason})`, egress.origin);
+  }
+  const target = hostOf(egress.request);
+  const send = (): Promise<Response> => fetchWithTimeout(egress.request, init, timeoutMs);
+  const response = hostGuard ? await hostGuard.run(target, send) : await send();
+  hostGuard?.observe(egress.origin, response.status, response.headers);
+  return response;
+}
+
 export async function fetchJson<T = unknown>(url: string, referer?: string, timeoutMs = 9000): Promise<T | null> {
   try {
-    const response = await fetchWithTimeout(
+    const response = await scrapeFetch(
       url,
       { headers: baseHeaders(referer, { Accept: 'application/json, text/plain, */*' }) },
       timeoutMs,
@@ -105,23 +179,59 @@ export async function fetchJson<T = unknown>(url: string, referer?: string, time
     const text = await response.text();
     if (!text || text.length < 2 || text.trimStart().startsWith('<')) return null;
     return JSON.parse(text) as T;
-  } catch {
+  } catch (error) {
+    if (error instanceof HostBlockedError) throw error;
     return null;
   }
 }
 
 export async function fetchText(url: string, referer?: string, timeoutMs = 10000): Promise<string | null> {
   try {
-    const response = await fetchWithTimeout(
+    const response = await scrapeFetch(
       url,
       { headers: baseHeaders(referer, { Accept: 'text/html,application/json,*/*' }) },
       timeoutMs,
     );
     if (!response.ok) return null;
-    return await response.text();
-  } catch {
+    const text = await response.text();
+    // A 200 that is a bot wall is a refusal too: cool the host instead of
+    // reporting "no playable URL found" and asking it again immediately.
+    if (looksLikeChallenge(text)) {
+      const egress = egressFor(url);
+      hostGuard?.penalize(hostOf(egress.request), 'a bot challenge');
+      throw new HostBlockedError(`${egress.origin} answered a bot challenge instead of the page`, egress.origin);
+    }
+    return text;
+  } catch (error) {
+    if (error instanceof HostBlockedError) throw error;
     return null;
   }
+}
+
+/**
+ * A scrape-side text fetch with explicit headers.
+ *
+ * Subtitle tracks come from the same hosts, in the same request shape, as the
+ * page that declared them — so they go through the same guard, the same egress
+ * rewrite and the same bot-wall check. A host that starts refusing subtitles
+ * cools down exactly like one that refuses a page. Unlike [fetchText] this
+ * throws, because a missing subtitle is worth a note on the job rather than a
+ * silent null.
+ */
+export async function fetchScrapeText(
+  url: string,
+  headers: Record<string, string> = {},
+  timeoutMs = 15_000,
+): Promise<string> {
+  const response = await scrapeFetch(url, { headers: { ...baseHeaders(headers.Referer), ...headers } }, timeoutMs);
+  if (!response.ok) throw new Error(`the subtitle request failed (HTTP ${response.status})`);
+  const body = await response.text();
+  if (looksLikeChallenge(body)) {
+    const egress = egressFor(url);
+    hostGuard?.penalize(hostOf(egress.request), 'a bot challenge');
+    throw new HostBlockedError(`${egress.origin} answered a bot challenge instead of the file`, egress.origin);
+  }
+  return body;
 }
 
 /** enc-dec.app encryptor, used by hosts that only accept an encrypted id. */

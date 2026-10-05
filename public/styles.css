@@ -371,6 +371,11 @@ button.link {
   text-overflow: ellipsis;
 }
 
+.list-item button.is-selected {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
 /* ----------------------------------------------------------------- tables */
 
 .table {
@@ -399,6 +404,21 @@ button.link {
 
 .table tr:hover td {
   background: var(--panel);
+}
+
+/* The row whose detail panel is open, so the click has a visible anchor. */
+.table tr.is-selected td {
+  background: var(--panel-2);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+#jobs-table tbody tr {
+  cursor: pointer;
+}
+
+.table td.actions button,
+.table td.actions a {
+  cursor: pointer;
 }
 
 .table td.mono,

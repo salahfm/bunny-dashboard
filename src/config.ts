@@ -51,6 +51,33 @@ export interface AppConfig {
   /** Login for the dashboard itself; absent when no password is configured. */
   dashboardUser?: string;
   dashboardPassword?: string;
+  /** Smallest gap between two scrape requests to the same host. */
+  scrapeMinIntervalMs: number;
+  /** Base cooldown after a host refuses (403/429/5xx or a bot challenge). */
+  scrapeCooldownMs: number;
+  /**
+   * Rewrite requests aimed at these hosts through a replacement base first.
+   * The intended use is a bunny.net pull zone whose origin is the host: the
+   * request then leaves from Bunny's edge instead of this machine.
+   */
+  scrapeEgress: Record<string, string>;
+  /** Carry a stream's subtitle tracks into Bunny as caption tracks. */
+  subtitleUpload: boolean;
+  /** The language a title should end up with; when it is missing, one is translated. */
+  subtitleTargetLanguage: string;
+  /**
+   * The text translator used to fill in the target language.
+   *
+   * Absent means no translation happens at all — the dashboard only carries the
+   * subtitle tracks the stream already had. Configure it and an English track
+   * becomes Arabic whenever a title arrives without one.
+   */
+  translator?: {
+    provider: 'openai' | 'deepl';
+    apiKey: string;
+    baseUrl?: string;
+    model?: string;
+  };
 }
 
 export function clampConcurrency(value: unknown, fallback = DEFAULT_CONCURRENCY): number {
@@ -70,6 +97,47 @@ export function clampIntervalMs(value: unknown, fallback: number, min = 0): numb
   const n = Number(value);
   if (!Number.isFinite(n) || n < min) return fallback;
   return Math.floor(n);
+}
+
+/**
+ * `SCRAPER_EGRESS` — `host=base` pairs, comma separated, e.g.
+ * `vidfast.vc=https://vz-abc.b-cdn.net,movish.to=https://vz-def.b-cdn.net`.
+ *
+ * A host with no entry is contacted directly. The base must be absolute; a
+ * malformed pair is ignored rather than silently rewriting requests elsewhere.
+ */
+export function parseEgressMap(value: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (typeof value !== 'string' || !value.trim()) return out;
+  for (const pair of value.split(',')) {
+    const trimmed = pair.trim();
+    if (!trimmed) continue;
+    const separator = trimmed.indexOf('=');
+    if (separator <= 0) continue;
+    const host = trimmed.slice(0, separator).trim().toLowerCase();
+    const base = trimmed.slice(separator + 1).trim().replace(/\/+$/, '');
+    if (!host || !/^https?:\/\//i.test(base)) continue;
+    out[host] = base;
+  }
+  return out;
+}
+
+/**
+ * `SUBTITLE_TRANSLATOR` plus its key — the text engine that makes an Arabic
+ * track when a title has none. Only `openai` (any OpenAI-compatible endpoint)
+ * and `deepl` are understood; anything else, or a missing key, disables it.
+ */
+export function parseTranslator(env: NodeJS.ProcessEnv): AppConfig['translator'] {
+  const provider = (env.SUBTITLE_TRANSLATOR ?? '').trim().toLowerCase();
+  if (provider !== 'openai' && provider !== 'deepl') return undefined;
+  const apiKey = (env.SUBTITLE_TRANSLATOR_KEY ?? '').trim();
+  if (!apiKey) return undefined;
+  return {
+    provider,
+    apiKey,
+    ...(env.SUBTITLE_TRANSLATOR_URL ? { baseUrl: env.SUBTITLE_TRANSLATOR_URL.trim() } : {}),
+    ...(env.SUBTITLE_TRANSLATOR_MODEL ? { model: env.SUBTITLE_TRANSLATOR_MODEL.trim() } : {}),
+  };
 }
 
 export function parseUploadMode(value: unknown, fallback: UploadMode = 'tus'): UploadMode {
@@ -132,6 +200,12 @@ export function loadConfig(argv = process.argv.slice(2), env = process.env): App
     ...(env.DASHBOARD_PASSWORD
       ? { dashboardPassword: env.DASHBOARD_PASSWORD, dashboardUser: env.DASHBOARD_USER?.trim() || 'index' }
       : {}),
+    scrapeMinIntervalMs: clampIntervalMs(env.SCRAPER_MIN_INTERVAL_MS, 350, 0),
+    scrapeCooldownMs: clampIntervalMs(env.SCRAPER_COOLDOWN_MS, 60_000, 1_000),
+    scrapeEgress: parseEgressMap(env.SCRAPER_EGRESS),
+    subtitleUpload: envFlag(env.SUBTITLES, true),
+    subtitleTargetLanguage: (env.SUBTITLE_TARGET_LANG ?? 'ar').trim().toLowerCase() || 'ar',
+    ...(parseTranslator(env) ? { translator: parseTranslator(env) } : {}),
   };
 }
 

@@ -9,14 +9,17 @@ import fs from 'node:fs';
 import path from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { authGate } from './auth';
+import { Autopilot, AutopilotError } from './autopilot';
 import { DEFAULT_MAX_BULK_JOBS, planBulk, planShow, queuedKeys, withoutQueued, type BulkOptions, type BulkPlan } from './bulk';
 import { BunnyClient, BunnyError } from './bunny';
+import { Catalog, type CatalogEntry } from './catalog';
 import { MAX_UPLOAD_BYTES, loadConfig } from './config';
 import { decryptSecret, encryptSecret, loadOrCreateSecret, maskSecret } from './crypto';
 import { runDiagnostics } from './diagnostics';
-import { JobService, sourceNameFromUrl } from './jobs';
+import { JobService, jobTitle, sourceNameFromUrl } from './jobs';
+import { HostGuard } from './hostguard';
 import { DEFAULT_MIN_HEIGHT, previewScrape } from './stream';
-import { providerCatalog, targetFromEmbedUrl } from './providers';
+import { configureScraper, providerCatalog, targetFromEmbedUrl } from './providers';
 import { queueStats } from './queue';
 import { RelayHub } from './relay';
 import { Store, type Job, type JobSource, type JobTarget } from './store';
@@ -27,6 +30,21 @@ import { FolderWatcher } from './watch';
 const config = loadConfig();
 const secret = loadOrCreateSecret(config.secretPath);
 const store = new Store(config);
+/** The permanent record of everything that finished publishing. */
+const catalog = new Catalog(config);
+
+/**
+ * The outbound policy for the scraping hosts: paced requests and a cooldown
+ * after a refusal, so a sweep (or a whole top-rated list) cannot hammer a host
+ * into blocking this machine. `SCRAPER_EGRESS` can route a host's requests
+ * through a bunny.net pull zone instead, so they leave from Bunny's edge.
+ */
+const hostGuard = new HostGuard({
+  minIntervalMs: config.scrapeMinIntervalMs,
+  baseCooldownMs: config.scrapeCooldownMs,
+  log: (message) => console.log(message),
+});
+configureScraper({ egress: config.scrapeEgress, guard: hostGuard });
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -63,8 +81,27 @@ const tunnel = new TunnelManager({
   log: (message) => console.log(message),
 });
 
-const jobs = new JobService({ store, config, clientFactory: clientForAccount, relay, tunnel });
+const jobs = new JobService({ store, config, clientFactory: clientForAccount, relay, tunnel, catalog });
 jobs.recover();
+
+/**
+ * The autopilot: walk TMDB's top-rated lists and queue what clears the rating
+ * floor, then retry what failed, then look again.
+ */
+const autopilot = new Autopilot({
+  config,
+  store,
+  jobs,
+  tmdb: tmdbClient,
+  // A title is "done" when it is in the queue (not failed/cancelled) or already
+  // in the published catalogue, which is what keeps a re-read page free.
+  doneKeys: () => {
+    const keys = queuedKeys(store.jobs);
+    for (const entry of catalog.all()) keys.add(entry.key);
+    return keys;
+  },
+  log: (message) => console.log(message),
+});
 
 /** New files in the watched folder become jobs automatically. */
 const watcher = new FolderWatcher({
@@ -99,7 +136,23 @@ function accountView(account: { id: string; name: string; libraryId: string; api
 
 function jobView(job: Job) {
   const account = job.accountId ? store.account(job.accountId) : undefined;
-  return { ...job, accountName: account?.name ?? null };
+  // The name the video carries inside Bunny — its TMDB id — so the library can
+  // be joined back to a title without reading the queue.
+  return { ...job, accountName: account?.name ?? null, libraryName: jobTitle(job.target) };
+}
+
+/**
+ * One row of the queue list.
+ *
+ * The list is polled every couple of seconds and can hold hundreds of jobs, so
+ * it carries only what a row renders: the candidate ladder (up to 24 URLs a job)
+ * and the per-source request headers are left out and fetched with the single
+ * job the operator opens. Those two fields are what turned a 300-job queue into
+ * megabytes of JSON per refresh.
+ */
+function jobSummaryView(job: Job) {
+  const { candidates: _candidates, ...rest } = jobView(job);
+  return { ...rest, source: { ...job.source, headers: undefined } };
 }
 
 function settingsView() {
@@ -123,8 +176,30 @@ function settingsView() {
       tunnelUrl: config.tunnelPublicUrl ?? null,
       cloudflaredPath: config.cloudflaredPath ?? null,
       providers: providerCatalog(),
+      // The scraping hosts' outbound policy: how politely we ask, and which
+      // hosts are routed somewhere else (a bunny.net pull zone, typically).
+      egress: config.scrapeEgress,
+      minIntervalMs: config.scrapeMinIntervalMs,
+      cooldownMs: config.scrapeCooldownMs,
+      cooling: hostGuard.snapshot(),
+    },
+    // Subtitles: whether a scrape carries the stream's caption tracks into
+    // Bunny, and the text engine that fills in the target language when the
+    // stream did not have it (never speech recognition).
+    subtitles: {
+      enabled: config.subtitleUpload,
+      targetLanguage: config.subtitleTargetLanguage,
+      translator: config.translator
+        ? {
+            provider: config.translator.provider,
+            model: config.translator.model ?? null,
+            endpoint: config.translator.baseUrl ?? null,
+          }
+        : null,
     },
     limits: { maxAccounts: 30, perAccountConcurrency: 10, maxUploadBytes: MAX_UPLOAD_BYTES },
+    catalogEntries: catalog.size,
+    catalogPath: catalog.path,
   };
 }
 
@@ -540,7 +615,13 @@ app.post('/api/jobs/remote', (req, res) => {
 /* --------------------------- scrape & sources --------------------------- */
 
 app.get('/api/sources/providers', (_req, res) => {
-  res.json({ providers: providerCatalog(), minHeight: DEFAULT_MIN_HEIGHT });
+  res.json({
+    providers: providerCatalog(),
+    minHeight: DEFAULT_MIN_HEIGHT,
+    // Hosts that refused us and are serving a cooldown, with the reason and the
+    // time they become usable again.
+    cooling: hostGuard.snapshot(),
+  });
 });
 
 /** What a scrape would pick, without downloading anything. */
@@ -598,13 +679,14 @@ app.post('/api/jobs/source', (req, res) => {
     ? body.only.filter((id): id is string => typeof id === 'string')
     : undefined;
   const minHeight = Number(body.minHeight ?? DEFAULT_MIN_HEIGHT);
-  const name = typeof body.name === 'string' && body.name.trim() ? body.name.trim() : url ? sourceNameFromUrl(url) : jobTitleOf(target);
+  const name = typeof body.name === 'string' && body.name.trim() ? body.name.trim() : url ? sourceNameFromUrl(url) : jobTitle(target);
 
   const job = jobs.createStreamJob(target, {
     mode,
     ...(url ? { input: url } : {}),
     ...(only && only.length ? { only } : {}),
-    minHeight: Number.isFinite(minHeight) && minHeight > 0 ? minHeight : DEFAULT_MIN_HEIGHT,
+    // `0` is meaningful ("whatever the host has"), so only a nonsense value falls back.
+    minHeight: Number.isFinite(minHeight) && minHeight >= 0 ? minHeight : DEFAULT_MIN_HEIGHT,
     name,
   });
   res.status(201).json({ job: jobView(job) });
@@ -643,7 +725,7 @@ function bulkOptions(body: Record<string, unknown>): BulkOptions {
  */
 function queuePlan(plan: BulkPlan, body: Record<string, unknown>) {
   const declared = Number(body.minHeight ?? DEFAULT_MIN_HEIGHT);
-  const minHeight = Number.isFinite(declared) && declared > 0 ? declared : DEFAULT_MIN_HEIGHT;
+  const minHeight = Number.isFinite(declared) && declared >= 0 ? declared : DEFAULT_MIN_HEIGHT;
   const only = Array.isArray(body.only) ? body.only.filter((id): id is string => typeof id === 'string') : [];
   const { fresh, skipped: duplicates } =
     body.skipQueued === false
@@ -722,9 +804,16 @@ app.get('/api/jobs', (req, res) => {
   const all = [...store.jobs].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   const filtered = status ? all.filter((job) => job.status === status) : all;
   res.json({
-    jobs: filtered.slice(0, limit).map(jobView),
+    jobs: filtered.slice(0, limit).map(jobSummaryView),
     stats: queueStats(store.jobs, store.accounts, store.settings.perAccountConcurrency),
   });
+});
+
+/** The full job — its candidate ladder included — for the row the operator opens. */
+app.get('/api/jobs/:id', (req, res) => {
+  const job = store.job(param(req, 'id'));
+  if (!job) return void res.status(404).json({ error: 'job not found' });
+  res.json({ job: jobView(job) });
 });
 
 app.post('/api/jobs/:id/retry', (req, res) => {
@@ -755,17 +844,81 @@ app.get('/api/queue/stats', (_req, res) => {
   res.json(queueStats(store.jobs, store.accounts, store.settings.perAccountConcurrency));
 });
 
+/* ---------------------------- catalogue ---------------------------- */
+
+/**
+ * A list row of the published catalogue: the entry minus its per-source detail.
+ *
+ * `tiers` (a handful of rungs) stays; `sources` (every probed URL, with headers)
+ * is left to the single entry, exactly the way the queue list works.
+ */
+function catalogSummary(entry: CatalogEntry) {
+  const { sources, ...rest } = entry;
+  return { ...rest, sourceCount: sources.length };
+}
+
+app.get('/api/catalog/stats', (_req, res) => {
+  res.json(catalog.stats());
+});
+
+/** Everything that finished publishing, newest first, with a free-text search. */
+app.get('/api/catalog', (req, res) => {
+  const query = typeof req.query.q === 'string' ? req.query.q : '';
+  const kind = typeof req.query.kind === 'string' ? req.query.kind : '';
+  const limit = Math.min(2000, Math.max(1, Math.floor(Number(req.query.limit ?? 500)) || 500));
+  const matched = catalog.search(query).filter((entry) => !kind || entry.kind === kind);
+  res.json({
+    items: matched.slice(0, limit).map(catalogSummary),
+    total: catalog.size,
+    matched: matched.length,
+    stats: catalog.stats(),
+  });
+});
+
+/** One entry in full: every quality rung and every source URL it was found at. */
+app.get('/api/catalog/:key', (req, res) => {
+  const entry = catalog.get(param(req, 'key'));
+  if (!entry) return void res.status(404).json({ error: 'no such catalogue entry' });
+  res.json({ entry });
+});
+
+app.delete('/api/catalog/:key', (req, res) => {
+  if (!catalog.remove(param(req, 'key'))) return void res.status(404).json({ error: 'no such catalogue entry' });
+  res.json({ ok: true, stats: catalog.stats() });
+});
+
+/* ---------------------------- autopilot ---------------------------- */
+
+app.get('/api/autopilot', (_req, res) => {
+  res.json(autopilot.stateView());
+});
+
+app.put('/api/autopilot', (req, res) => {
+  try {
+    res.json(autopilot.updateConfig((req.body ?? {}) as Record<string, unknown>));
+  } catch (error) {
+    if (error instanceof AutopilotError) return void res.status(400).json({ error: error.message });
+    throw error;
+  }
+});
+
+/** One cycle right now, whatever the schedule says. */
+app.post('/api/autopilot/run', handle(async (_req, res) => {
+  const report = await autopilot.runCycle();
+  res.json({ report, state: autopilot.stateView() });
+}));
+
+app.post('/api/autopilot/reset', (_req, res) => {
+  res.json(autopilot.reset());
+});
+
+app.post('/api/autopilot/log/clear', (_req, res) => {
+  res.json(autopilot.clearLog());
+});
+
 app.use('/api', (_req, res) => {
   res.status(404).json({ error: 'not found' });
 });
-
-/** The job title as the pipeline would write it (kept beside `jobTitle` in jobs.ts). */
-function jobTitleOf(target: JobTarget): string {
-  if (target.kind === 'movie') return target.year ? `${target.title} (${target.year})` : target.title;
-  const season = String(target.season ?? 1).padStart(2, '0');
-  const episode = String(target.episode ?? 1).padStart(2, '0');
-  return `${target.title} S${season}E${episode}`;
-}
 
 /* ------------------------------ static ----------------------------- */
 
@@ -786,6 +939,8 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
 
 jobs.start();
 watcher.start();
+// The scheduler is always up; a cycle only runs while the autopilot is enabled.
+autopilot.start();
 const loopback = ['127.0.0.1', 'localhost', '::1'].includes(config.host);
 if (!config.dashboardPassword && !loopback) {
   console.warn(
@@ -805,6 +960,8 @@ const server = app.listen(config.port, config.host, () => {
 
 function shutdown(): void {
   jobs.stop();
+  autopilot.stop();
+  store.flush();
   watcher.stop();
   tunnel.stop();
   server.close(() => process.exit(0));

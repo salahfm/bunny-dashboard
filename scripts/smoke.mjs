@@ -204,12 +204,17 @@ const mediaPlaylist = [
 ].join('\n');
 const masterPlaylist = [
   '#EXTM3U',
+  // Two subtitle renditions, so the pipeline's caption path is exercised too.
+  '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",LANGUAGE="en",DEFAULT=YES,URI="subs/en.vtt"',
+  '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="العربية",LANGUAGE="ar",URI="subs/ar.vtt"',
   '#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=1280x720',
   'v720/index.m3u8',
   '#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080',
   'v1080/index.m3u8',
   '',
 ].join('\n');
+const englishVtt = ['WEBVTT', '', '00:00:01.000 --> 00:00:03.000', 'Smoke subtitle', ''].join('\n');
+const arabicVtt = ['WEBVTT', '', '00:00:01.000 --> 00:00:03.000', 'ترجمة', ''].join('\n');
 
 const origin = http.createServer((req, res) => {
   const url = new URL(req.url ?? '/', 'http://127.0.0.1');
@@ -220,6 +225,10 @@ const origin = http.createServer((req, res) => {
   if (url.pathname === '/v1080/index.m3u8' || url.pathname === '/v720/index.m3u8') {
     res.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' });
     return void res.end(mediaPlaylist);
+  }
+  if (url.pathname === '/subs/en.vtt' || url.pathname === '/subs/ar.vtt') {
+    res.writeHead(200, { 'content-type': 'text/vtt' });
+    return void res.end(url.pathname.endsWith('ar.vtt') ? arabicVtt : englishVtt);
   }
   const segment = /^\/v(?:1080|720)\/seg(\d)\.ts$/.exec(url.pathname);
   if (segment) {
@@ -249,8 +258,11 @@ check('the tunnel reports its state', typeof result.json?.status?.state === 'str
 result = await request('POST', '/api/jobs/source', { url: 'not-a-url' });
 check('a nonsense source URL is rejected', result.status === 400, `status ${result.status}`);
 
+// A target of its own (the 13 remote jobs all publish `movie:27205`), so the
+// catalogue record this job writes — subtitles, ladder and all — is not later
+// overwritten by another job for the same title.
 result = await request('POST', '/api/jobs/source', {
-  target: { kind: 'movie', tmdbId: 27205, title: 'Inception', year: '2010' },
+  target: { kind: 'movie', tmdbId: 603, title: 'The Matrix', year: '1999' },
   url: `${originBase}/master.m3u8`,
   minHeight: 1080,
 });
@@ -323,9 +335,26 @@ check(
 );
 check('the relay is released once a job is done', streamJob?.relayToken === undefined);
 check(
-  'the scraper kept the candidate ladder on the job',
-  Array.isArray(streamJob?.candidates) && streamJob.candidates.some((candidate) => candidate.chosen),
-  `${streamJob?.candidates?.length ?? 0} candidate(s)`,
+  'the video is named by its TMDB id, not its title',
+  streamJob?.libraryName === 'tmdb:603',
+  String(streamJob?.libraryName),
+);
+check(
+  'both subtitle tracks the stream declared were attached to the video',
+  (streamJob?.subtitles ?? []).filter((track) => track.uploaded).map((track) => track.srclang).sort().join(',') === 'ar,en',
+  JSON.stringify((streamJob?.subtitles ?? []).map((track) => `${track.srclang}:${track.uploaded}`)),
+);
+check(
+  'the queue list omits the per-source detail only the opened job needs',
+  streamJob?.candidates === undefined,
+);
+// The list is deliberately lean; the full record (candidates and all) is one call.
+const detail = await request('GET', `/api/jobs/${streamJobId}`);
+const detailJob = detail.json?.job;
+check(
+  'opening a job returns its full record, candidate ladder included',
+  Array.isArray(detailJob?.candidates) && detailJob.candidates.some((candidate) => candidate.chosen),
+  `${detailJob?.candidates?.length ?? 0} candidate(s)`,
 );
 check(
   'playback URLs use the pull-zone host',
@@ -333,6 +362,131 @@ check(
 );
 const leftover = fs.readdirSync(path.join(dataDir, 'uploads')).filter((name) => /\.(bin|ts|mp4)$/i.test(name));
 check('no staged or spool file was left behind', leftover.length === 0, leftover.join(', '));
+
+/* the published catalogue --------------------------------------------- */
+// The permanent record: every finished job is written here, and a title
+// published many times is still one record (the publishes count goes up).
+result = await request('GET', '/api/catalog');
+const catalogItems = result.json?.items ?? [];
+check('finished jobs are recorded in the published catalogue', catalogItems.length >= 2, `${catalogItems.length} record(s)`);
+check(
+  'every catalogue record carries its playback URL',
+  catalogItems.every((entry) => typeof entry.playbackUrl === 'string' && entry.playbackUrl.length > 0),
+);
+const inception = catalogItems.find((entry) => entry.key === 'movie:27205');
+check(
+  'a title published repeatedly is one record with a publish count',
+  typeof inception?.publishes === 'number' && inception.publishes >= 13,
+  `movie:27205 published ${inception?.publishes} time(s)`,
+);
+check(
+  'the uploaded file is recorded with its own origin',
+  catalogItems.some((entry) => entry.key === 'episode:1396:1:1' && entry.origin?.kind === 'file'),
+);
+const matrix = catalogItems.find((entry) => entry.key === 'movie:603');
+check(
+  'the catalogue keeps the subtitle tracks a title was published with',
+  (matrix?.subtitles ?? []).map((track) => track.srclang).sort().join(',') === 'ar,en' &&
+    (matrix?.subtitles ?? []).every((track) => track.uploaded),
+  JSON.stringify((matrix?.subtitles ?? []).map((track) => `${track.srclang}:${track.uploaded}`)),
+);
+
+// The stream job's own record (its key is not shared with the remote jobs): the
+// only one that carries a candidate ladder, a tier ladder and byte counts.
+if (matrix) {
+  const full = await request('GET', `/api/catalog/${encodeURIComponent(matrix.key)}`);
+  const record = full.json?.entry;
+  check(
+    'opening a catalogue record returns every source and the sizes',
+    Array.isArray(record?.sources) && record.sources.length >= 1 && Array.isArray(record?.tiers) && record.tiers.length >= 2 && record?.bytes !== undefined,
+    `${record?.sources?.length ?? 0} source(s), ${record?.tiers?.length ?? 0} tier(s)`,
+  );
+}
+
+/* autopilot ------------------------------------------------------------- */
+// The autopilot walks TMDB's top-rated lists. The rating floor is raised to
+// 9.2 here so the canned list stays small: only the two synthetic 9.5/9.3
+// titles clear it, everything else is counted as below the floor.
+// Reset to the documented defaults first: this makes the round-trip check below
+// deterministic, so the smoke can be run twice against the same data directory.
+const autopilotDefaults = {
+  enabled: false,
+  minRating: 3,
+  kinds: ['movie', 'tv'],
+  minHeight: 1080,
+  expandSeries: true,
+  maxJobsPerCycle: 25,
+  maxAttempts: 5,
+  maxQueueDepth: 300,
+  intervalMs: 300000,
+};
+result = await request('PUT', '/api/autopilot', autopilotDefaults);
+check(
+  'the autopilot holds its configured state',
+  result.status === 200 &&
+    result.json?.config?.minRating === 3 &&
+    result.json?.config?.enabled === false &&
+    result.json?.config?.kinds?.join(',') === 'movie,tv' &&
+    result.json?.cursors?.movie === 1,
+  `status ${result.status}, minRating ${result.json?.config?.minRating}`,
+);
+
+result = await request('PUT', '/api/autopilot', { minRating: 42 });
+check('a rating floor outside 0–10 is refused', result.status === 400, `status ${result.status}`);
+
+result = await request('PUT', '/api/autopilot', {
+  enabled: true,
+  minRating: 9.2,
+  kinds: ['movie'],
+  expandSeries: false,
+  maxJobsPerCycle: 5,
+  minHeight: 1080,
+  intervalMs: 600000,
+});
+check(
+  'the autopilot settings are validated and saved',
+  result.status === 200 && result.json?.config?.enabled === true && result.json?.config?.minRating === 9.2,
+  `status ${result.status}`,
+);
+
+const autopilotCycle = await request('POST', '/api/autopilot/run');
+const cycleReport = autopilotCycle.json?.report;
+check(
+  'a cycle walks the top-rated list, queues what clears the floor and skips the rest',
+  autopilotCycle.status === 200 &&
+    (cycleReport?.scanned ?? 0) > 0 &&
+    (cycleReport?.created ?? 0) >= 1 &&
+    (cycleReport?.belowRating ?? 0) >= 1,
+  `scanned ${cycleReport?.scanned}, created ${cycleReport?.created}, below ${cycleReport?.belowRating}`,
+);
+check(
+  'a cycle that reaches the end of the list restarts it from page one',
+  cycleReport?.wrapped === true && autopilotCycle.json?.state?.cursors?.movie === 1,
+  `wrapped ${cycleReport?.wrapped}, cursor ${autopilotCycle.json?.state?.cursors?.movie}`,
+);
+
+// The cycle queued real jobs; drop exactly those, then switch the autopilot
+// back off so a smoke run never leaves it walking lists in the background.
+const autopilotJobIds = ((await request('GET', '/api/jobs?limit=500')).json?.jobs ?? [])
+  .filter((job) => job.target?.title?.startsWith('Top movie') && job.source?.mode === 'scrape')
+  .map((job) => job.id);
+await dropJobs(autopilotJobIds);
+check('the cycle created real jobs, all cleaned up', autopilotJobIds.length >= 1, `${autopilotJobIds.length} job(s)`);
+
+result = await request('PUT', '/api/autopilot', { enabled: false });
+check('the autopilot can be switched off again', result.json?.config?.enabled === false, `enabled ${result.json?.config?.enabled}`);
+await request('POST', '/api/autopilot/reset', {});
+await request('POST', '/api/autopilot/log/clear', {});
+
+/* host cooldowns ---------------------------------------------------------- */
+result = await request('GET', '/api/settings');
+check(
+  'settings report the scraping pace and egress policy',
+  typeof result.json?.source?.minIntervalMs === 'number' &&
+    typeof result.json?.source?.cooldownMs === 'number' &&
+    Array.isArray(result.json?.source?.cooling),
+  `interval ${result.json?.source?.minIntervalMs} ms, cooldown ${result.json?.source?.cooldownMs} ms`,
+);
 
 /* watched folder ------------------------------------------------------- */
 const watchRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke-watch-'));

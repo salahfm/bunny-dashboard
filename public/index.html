@@ -19,8 +19,10 @@
     <div class="layout">
       <nav class="nav" id="nav">
         <button class="nav-item is-active" data-tab="titles">Titles</button>
+        <button class="nav-item" data-tab="autopilot">Autopilot</button>
         <button class="nav-item" data-tab="source">Source URL</button>
         <button class="nav-item" data-tab="queue">Queue</button>
+        <button class="nav-item" data-tab="library">Library</button>
         <button class="nav-item" data-tab="accounts">Accounts</button>
         <button class="nav-item" data-tab="watch">Watched folder</button>
         <button class="nav-item" data-tab="settings">Settings</button>
@@ -120,6 +122,88 @@
           </div>
         </section>
 
+        <!-- ------------------------------------------------------- autopilot -->
+        <section class="panel" id="tab-autopilot">
+          <h1>Autopilot</h1>
+          <p class="muted">
+            Walk TMDB's top-rated lists and queue what is worth queueing, with nobody clicking. Each page is read
+            highest rating first, and a title is only queued when it clears the rating floor — a missing rating counts
+            as failing, because a title nobody has rated is not what “top rated” means. Titles already queued or already
+            published are stepped over. When a cycle finds nothing new it retries the failed jobs; when there is nothing
+            to retry either, it starts the list over from page one.
+          </p>
+
+          <div class="box">
+            <div class="box-head">
+              <strong>Status</strong>
+              <span id="autopilot-state" class="badge">…</span>
+            </div>
+            <table class="table" id="autopilot-status-table"><tbody></tbody></table>
+          </div>
+
+          <div class="box">
+            <div class="box-head">
+              <strong>Settings</strong>
+              <span class="muted small">applies from the next cycle</span>
+            </div>
+            <div class="grid2">
+              <label class="inline"><input id="autopilot-enabled" type="checkbox" /> switched on</label>
+              <label>
+                Rating floor (0–10) — under this, or unrated, is skipped
+                <input id="autopilot-minrating" type="number" min="0" max="10" step="0.1" />
+              </label>
+              <label>
+                Minimum tier for scraping
+                <select id="autopilot-minheight">
+                  <option value="2160">4K</option>
+                  <option value="1440">2K / 1440p</option>
+                  <option value="1080">1080p</option>
+                  <option value="720">720p</option>
+                  <option value="480">480p</option>
+                  <option value="0">whatever is available</option>
+                </select>
+              </label>
+              <label>
+                Jobs one cycle may create
+                <input id="autopilot-maxjobs" type="number" min="1" max="500" />
+              </label>
+              <label>
+                Retry a failed job up to (attempts)
+                <input id="autopilot-maxattempts" type="number" min="1" max="20" />
+              </label>
+              <label>
+                Pause while the queue holds (unfinished jobs)
+                <input id="autopilot-maxdepth" type="number" min="1" max="10000" />
+              </label>
+              <label>
+                Run every (minutes)
+                <input id="autopilot-interval" type="number" min="0.2" step="0.1" />
+              </label>
+              <label class="inline"><input id="autopilot-expand" type="checkbox" /> expand shows into every episode</label>
+              <label class="inline"><input id="autopilot-movies" type="checkbox" /> top-rated movies</label>
+              <label class="inline"><input id="autopilot-tv" type="checkbox" /> top-rated shows</label>
+            </div>
+            <div class="row">
+              <button id="autopilot-save" class="primary">Save</button>
+              <button id="autopilot-run">Run a cycle now</button>
+              <button id="autopilot-reset">Reset to page 1</button>
+              <button id="autopilot-clear">Clear log</button>
+            </div>
+          </div>
+
+          <div class="box">
+            <div class="box-head">
+              <strong>Last cycle</strong>
+              <span id="autopilot-report-head" class="muted small"></span>
+            </div>
+            <table class="table" id="autopilot-report-table"><tbody></tbody></table>
+            <div id="autopilot-skipped" class="muted small"></div>
+          </div>
+
+          <h2>Log</h2>
+          <pre id="autopilot-log" class="output"></pre>
+        </section>
+
         <!-- ---------------------------------------------------------- source -->
         <section class="panel" id="tab-source">
           <h1>Source URL</h1>
@@ -204,6 +288,46 @@
             <tbody></tbody>
           </table>
           <div id="job-detail" class="box hidden"></div>
+        </section>
+
+        <!-- --------------------------------------------------------- library -->
+        <section class="panel" id="tab-library">
+          <h1>Library</h1>
+          <p class="muted">
+            Every title that finished publishing, kept on disk in full — the tier that was downloaded,
+            every quality the source offered, every URL it was found at (with the headers each one
+            needed), and every subtitle track it was published with. This is the permanent record: it
+            outlives the queue and cannot be rebuilt from Bunny. Videos are named in Bunny by TMDB id
+            (<code>tmdb:27205</code>, <code>tv:1396:S01E02</code>), so a library stays joinable to a title.
+          </p>
+          <div class="row">
+            <input id="library-search" type="search" placeholder="filter by title, TMDB id, quality, host or account" />
+            <select id="library-kind">
+              <option value="">movies and episodes</option>
+              <option value="movie">movies</option>
+              <option value="episode">episodes</option>
+            </select>
+            <button id="library-refresh">Refresh</button>
+            <span id="library-summary" class="muted small"></span>
+          </div>
+          <table class="table" id="library-table">
+            <thead>
+              <tr>
+                <th>Title</th>
+                <th>Type</th>
+                <th>Quality</th>
+                <th>Tiers</th>
+                <th>Sources</th>
+                <th>Size</th>
+                <th>Account</th>
+                <th>Playback</th>
+                <th>Published</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+          <div id="library-detail" class="box hidden"></div>
         </section>
 
         <!-- -------------------------------------------------------- accounts -->
@@ -331,12 +455,30 @@
           </p>
 
           <h2>Scraping hosts</h2>
+          <p class="muted small">
+            Requests to one host are spaced out, and a host that answers 401/403/429/503 — or with a bot
+            challenge — is put on ice until it will talk again, instead of being retried into a permanent ban.
+            Point a host at a bunny.net pull zone with <code>SCRAPER_EGRESS</code> to make it see Bunny's IPs
+            rather than this machine's.
+          </p>
           <table class="table" id="providers-table">
             <thead>
               <tr>
                 <th>Host</th>
                 <th>Kind</th>
                 <th>How it is resolved</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+          <h2>Cooling down</h2>
+          <p class="muted small">Hosts that refused us and are waiting out their cooldown.</p>
+          <table class="table" id="cooling-table">
+            <thead>
+              <tr>
+                <th>Host</th>
+                <th>Reason</th>
+                <th>Recovers</th>
               </tr>
             </thead>
             <tbody></tbody>

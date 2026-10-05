@@ -20,9 +20,19 @@
     seasons: [],
     episodes: [],
     selectedJobId: null,
+    /** The full job behind the selected row (candidates included), fetched on demand. */
+    jobDetail: null,
+    library: [],
+    libraryStats: null,
+    libraryMatched: null,
+    librarySelectedKey: null,
+    libraryEntry: null,
     tunnel: null,
+    autopilot: null,
     only: new Set(),
     autoRefresh: true,
+    activeTab: 'titles',
+    diagnosticsRan: false,
   };
 
   /* ---------------------------------------------------------------- dom */
@@ -111,9 +121,19 @@
     return date.toLocaleTimeString();
   }
 
+  function fmtDuration(ms) {
+    const seconds = Math.max(0, Math.round(Number(ms) / 1000));
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+    const hours = Math.floor(minutes / 60);
+    return `${hours}h ${minutes % 60}m`;
+  }
+
   /* --------------------------------------------------------------- tabs */
 
   function showTab(name) {
+    state.activeTab = name;
     for (const button of document.querySelectorAll('.nav-item')) {
       button.classList.toggle('is-active', button.dataset.tab === name);
     }
@@ -121,11 +141,20 @@
       panel.classList.toggle('is-active', panel.id === `tab-${name}`);
     }
     if (name === 'queue') void refreshJobs();
+    if (name === 'autopilot') void refreshAutopilot();
+    if (name === 'library') void refreshLibrary();
     if (name === 'accounts') void refreshAccounts();
     if (name === 'watch') void refreshWatch();
-    if (name === 'settings') void refreshSettings();
-    if (name === 'settings') void runNetworkCheck();
     if (name === 'source') void refreshTunnel();
+    if (name === 'settings') {
+      void refreshSettings();
+      // The network check probes every host and takes seconds; do it once when
+      // the tab is first opened and leave the rest to the button.
+      if (!state.diagnosticsRan) {
+        state.diagnosticsRan = true;
+        void runNetworkCheck();
+      }
+    }
   }
 
   $('#nav').addEventListener('click', (event) => {
@@ -181,6 +210,7 @@
     state.target = { mediaType: result.mediaType, tmdbId: result.tmdbId, title: result.title, year: result.year };
     state.episode = null;
     state.episodes = [];
+    state.seasons = [];
     $('#target-panel').classList.remove('hidden');
     $('#target-title').textContent = `${result.title}${result.year ? ` (${result.year})` : ''}`;
     $('#target-meta').textContent = `${result.mediaType === 'tv' ? 'TV show' : 'Movie'} · TMDB ${result.tmdbId}`;
@@ -211,39 +241,54 @@
     }
   }
 
-  async function loadSeason(seasonNumber) {
+  /**
+   * Draws the episode picker from the season already loaded. Selecting an episode
+   * only re-renders these rows — it must not refetch the season, and the
+   * selection is keyed on season *and* episode so switching seasons cannot leave
+   * a stale pick from the previous one in place.
+   */
+  function renderEpisodes(seasonNumber) {
     const list = clear($('#episode-list'));
+    for (const episode of state.episodes) {
+      const selected = state.episode?.season === seasonNumber && state.episode?.episode === episode.episodeNumber;
+      list.append(
+        h(
+          'div',
+          { class: 'list-item' },
+          h(
+            'div',
+            { class: 'grow' },
+            h('span', { class: 'title', text: `E${String(episode.episodeNumber).padStart(2, '0')} · ${episode.name}` }),
+            h('span', { class: 'muted small', text: episode.airDate ?? '' }),
+          ),
+          h('button', {
+            class: selected ? 'is-selected' : '',
+            text: selected ? 'selected' : 'select',
+            onclick: () => {
+              state.episode = { season: seasonNumber, episode: episode.episodeNumber, name: episode.name };
+              renderEpisodes(seasonNumber);
+            },
+          }),
+        ),
+      );
+    }
+  }
+
+  async function loadSeason(seasonNumber) {
     if (!state.target) return;
+    // A different season invalidates the episode picked from the old one.
+    if (state.episode && state.episode.season !== seasonNumber) state.episode = null;
+    const list = clear($('#episode-list'));
+    list.append(h('div', { class: 'list-item' }, h('span', { class: 'muted small', text: 'loading episodes…' })));
     try {
       const data = await api('GET', `/api/tmdb/tv/${state.target.tmdbId}/season/${seasonNumber}`);
       state.episodes = data.episodes ?? [];
-      for (const episode of state.episodes) {
-        list.append(
-          h(
-            'div',
-            { class: 'list-item' },
-            h(
-              'div',
-              { class: 'grow' },
-              h('span', { class: 'title', text: `E${String(episode.episodeNumber).padStart(2, '0')} · ${episode.name}` }),
-              h('span', { class: 'muted small', text: episode.airDate ?? '' }),
-            ),
-            h('button', {
-              text: state.episode?.episode === episode.episodeNumber ? 'selected' : 'select',
-              onclick: () => {
-                state.episode = { season: seasonNumber, episode: episode.episodeNumber, name: episode.name };
-                void loadSeason(seasonNumber);
-              },
-            }),
-          ),
-        );
-      }
       if (!state.episode && state.episodes.length) {
         state.episode = { season: seasonNumber, episode: state.episodes[0].episodeNumber, name: state.episodes[0].name };
-        void loadSeason(seasonNumber);
       }
+      renderEpisodes(seasonNumber);
     } catch (error) {
-      list.append(h('div', { class: 'list-item' }, h('span', { class: 'small', text: describeError(error) })));
+      clear(list).append(h('div', { class: 'list-item' }, h('span', { class: 'small', text: describeError(error) })));
     }
   }
 
@@ -522,17 +567,34 @@
     return h('span', { class: 'mono', text: parts.filter(Boolean).join(' · ') });
   }
 
-  async function refreshJobs() {
+  async function refreshJobs(options = {}) {
+    const quiet = options.quiet === true;
+    let data;
     try {
-      const data = await api('GET', `/api/jobs?limit=200${$('#queue-filter').value ? `&status=${$('#queue-filter').value}` : ''}`);
-      state.jobs = data.jobs ?? [];
-      state.stats = data.stats ?? null;
+      data = await api('GET', `/api/jobs?limit=200${$('#queue-filter').value ? `&status=${$('#queue-filter').value}` : ''}`);
     } catch (error) {
-      toast(describeError(error), 'bad');
+      // A background refresh must not shout every 2s while the server restarts.
+      if (!quiet) toast(describeError(error), 'bad');
       return;
     }
+    state.jobs = data.jobs ?? [];
+    state.stats = data.stats ?? null;
     renderJobs();
     renderCounts();
+    if (state.selectedJobId) void refreshSelectedDetail({ quiet: true });
+  }
+
+  /**
+   * The queue counters, without the job list. Polled while the Queue tab is not
+   * on screen so the header badge stays live without downloading every row.
+   */
+  async function refreshStats() {
+    try {
+      state.stats = await api('GET', '/api/queue/stats');
+      renderCounts();
+    } catch {
+      /* keep the last known counts while the server is unreachable */
+    }
   }
 
   function renderCounts() {
@@ -566,35 +628,98 @@
 
       const detail = job.status === 'failed' && job.error ? h('span', { class: 'small', style: 'color:var(--bad)', text: job.error }) : null;
 
-      body.append(
+      const row = h(
+        'tr',
+        { onclick: (event) => (event.target.closest('button,a') ? undefined : selectJob(job.id)) },
         h(
-          'tr',
-          { onclick: (event) => (event.target.closest('button,a') ? undefined : selectJob(job.id)) },
-          h(
-            'td',
-            {},
-            h('span', { text: job.target?.kind === 'episode' ? `${job.target.title} S${String(job.target.season).padStart(2, '0')}E${String(job.target.episode).padStart(2, '0')}` : `${job.target?.title ?? '—'}${job.target?.year ? ` (${job.target.year})` : ''}` }),
-            detail,
-          ),
-          h('td', {}, statusBadge(job.status)),
-          h('td', {}, progressBar(job), h('span', { class: 'small muted', text: job.detail ?? '' })),
-          h('td', { class: 'mono' }, job.stage ?? (job.status === 'encoding' ? `encoding${job.statusCode !== undefined ? ` · bunny ${job.statusCode}` : ''}` : '—')),
-          h('td', {}, sourceCell(job), h('span', { class: 'small muted', text: job.source?.kind === 'stream' ? `${bytes(job.bytesIn)} in · ${bytes(job.bytesOut)} out${job.totalBytes ? ` of ${bytes(job.totalBytes)}` : ''}` : '' })),
-          h('td', { class: 'mono', text: job.accountName ?? '—' }),
-          actions,
+          'td',
+          {},
+          h('span', { text: job.target?.kind === 'episode' ? `${job.target.title} S${String(job.target.season).padStart(2, '0')}E${String(job.target.episode).padStart(2, '0')}` : `${job.target?.title ?? '—'}${job.target?.year ? ` (${job.target.year})` : ''}` }),
+          detail,
         ),
+        h('td', {}, statusBadge(job.status)),
+        h('td', {}, progressBar(job), h('span', { class: 'small muted', text: job.detail ?? '' })),
+        h('td', { class: 'mono' }, job.stage ?? (job.status === 'encoding' ? `encoding${job.statusCode !== undefined ? ` · bunny ${job.statusCode}` : ''}` : '—')),
+        h('td', {}, sourceCell(job), h('span', { class: 'small muted', text: job.source?.kind === 'stream' ? `${bytes(job.bytesIn)} in · ${bytes(job.bytesOut)} out${job.totalBytes ? ` of ${bytes(job.totalBytes)}` : ''}` : '' })),
+        h('td', { class: 'mono', text: job.accountName ?? '—' }),
+        actions,
       );
+      if (job.id === state.selectedJobId) row.classList.add('is-selected');
+      body.append(row);
     }
   }
 
   function selectJob(jobId) {
-    state.selectedJobId = state.selectedJobId === jobId ? null : jobId;
+    if (state.selectedJobId === jobId) {
+      state.selectedJobId = null;
+      state.jobDetail = null;
+      renderJobs();
+      renderJobDetail();
+      return;
+    }
+    state.selectedJobId = jobId;
+    state.jobDetail = null;
+    renderJobs();
     renderJobDetail();
+    void refreshSelectedDetail({ quiet: true });
+  }
+
+  /** Fetches the selected job's full record (its candidate ladder included). */
+  async function refreshSelectedDetail(options = {}) {
+    const jobId = state.selectedJobId;
+    if (!jobId) return;
+    try {
+      const data = await api('GET', `/api/jobs/${jobId}`);
+      if (state.selectedJobId !== jobId) return;
+      state.jobDetail = data.job ?? null;
+      renderJobDetail();
+    } catch (error) {
+      if (options.quiet !== true) toast(describeError(error), 'bad');
+    }
+  }
+
+  /** The subtitle tracks a job or a catalogue record was published with. */
+  function subtitlesTable(tracks) {
+    return h(
+      'table',
+      { class: 'table' },
+      h(
+        'thead',
+        {},
+        h(
+          'tr',
+          {},
+          h('th', { text: 'Lang' }),
+          h('th', { text: 'Label' }),
+          h('th', { text: 'State' }),
+          h('th', { text: 'Cues' }),
+          h('th', { text: 'Came from' }),
+          h('th', { text: 'Note' }),
+        ),
+      ),
+      h(
+        'tbody',
+        {},
+        ...tracks.map((track) =>
+          h(
+            'tr',
+            {},
+            h('td', { class: 'mono', text: track.srclang ?? '—' }),
+            h('td', { text: track.label ?? '—' }),
+            h('td', { class: 'small', text: track.uploaded ? (track.translated ? 'translated' : 'uploaded') : 'not attached' }),
+            h('td', { class: 'mono small', text: track.cues !== undefined ? String(track.cues) : '—' }),
+            h('td', { class: 'mono small', text: track.translatedFrom ? `${track.translatedFrom} → ${track.srclang}` : track.url ? 'scraped' : '—' }),
+            h('td', { class: 'muted small', text: track.note ?? '' }),
+          ),
+        ),
+      ),
+    );
   }
 
   function renderJobDetail() {
     const box = clear($('#job-detail'));
-    const job = state.jobs.find((entry) => entry.id === state.selectedJobId);
+    const loaded = state.jobDetail && state.jobDetail.id === state.selectedJobId ? state.jobDetail : null;
+    const job = loaded ?? state.jobs.find((entry) => entry.id === state.selectedJobId);
     if (!job) {
       box.classList.add('hidden');
       return;
@@ -606,6 +731,7 @@
     );
     const rows = [
       ['status', job.status + (job.error ? ` — ${job.error}` : '')],
+      ['library name', job.libraryName ?? '—'],
       ['stage', job.stage ?? '—'],
       ['detail', job.detail ?? '—'],
       ['source', job.source?.url ?? job.source?.input ?? job.source?.tempPath ?? '—'],
@@ -622,6 +748,7 @@
         h('tbody', {}, ...rows.map(([label, value]) => h('tr', {}, h('th', { text: label }), h('td', { class: 'mono', text: String(value) })))),
       ),
     );
+    if (!loaded) box.append(h('div', { class: 'muted small', text: 'loading the full job…' }));
     if (Array.isArray(job.candidates) && job.candidates.length) {
       box.append(h('h2', { text: 'Sources found' }));
       box.append(
@@ -647,12 +774,20 @@
         ),
       );
     }
+    const subtitles = Array.isArray(job.subtitles) ? job.subtitles : [];
+    box.append(h('h2', { text: `Subtitles${subtitles.length ? ` (${subtitles.length})` : ''}` }));
+    if (subtitles.length) box.append(subtitlesTable(subtitles));
+    else box.append(h('div', { class: 'muted small', text: 'no subtitle track was carried for this job' }));
   }
 
   async function jobAction(jobId, action) {
     try {
       if (action === 'delete') await api('DELETE', `/api/jobs/${jobId}`);
       else await api('POST', `/api/jobs/${jobId}/${action}`);
+      if (action === 'delete' && state.selectedJobId === jobId) {
+        state.selectedJobId = null;
+        state.jobDetail = null;
+      }
       await refreshJobs();
       renderJobDetail();
     } catch (error) {
@@ -670,6 +805,261 @@
     } catch (error) {
       toast(describeError(error), 'bad');
     }
+  });
+
+  /* ------------------------------------------------------------- library */
+
+  /** The size that best describes a published title (declared, or the bytes that moved). */
+  function librarySize(entry) {
+    return entry.bytes?.declared ?? entry.bytes?.file ?? entry.bytes?.downloaded ?? 0;
+  }
+
+  function formatHeaders(headers) {
+    const entries = Object.entries(headers ?? {});
+    if (!entries.length) return '—';
+    return entries.map(([key, value]) => `${key}: ${value}`).join('\n');
+  }
+
+  async function refreshLibrary(options = {}) {
+    const quiet = options.quiet === true;
+    const params = new URLSearchParams();
+    const query = $('#library-search').value.trim();
+    const kind = $('#library-kind').value;
+    if (query) params.set('q', query);
+    if (kind) params.set('kind', kind);
+    let data;
+    try {
+      data = await api('GET', `/api/catalog${params.toString() ? `?${params}` : ''}`);
+    } catch (error) {
+      if (!quiet) toast(describeError(error), 'bad');
+      return;
+    }
+    state.library = data.items ?? [];
+    state.libraryStats = data.stats ?? null;
+    state.libraryMatched = typeof data.matched === 'number' ? data.matched : null;
+    renderLibrary();
+    if (state.librarySelectedKey && !state.library.some((entry) => entry.key === state.librarySelectedKey)) {
+      state.librarySelectedKey = null;
+      state.libraryEntry = null;
+    }
+    renderLibraryDetail();
+  }
+
+  function titleCell(entry, index) {
+    if (index === 0 && entry.kind === 'episode') {
+      return `${entry.title} S${String(entry.season ?? 0).padStart(2, '0')}E${String(entry.episode ?? 0).padStart(2, '0')}`;
+    }
+    return `${entry.title}${entry.year ? ` (${entry.year})` : ''}`;
+  }
+
+  function renderLibrary() {
+    const stats = state.libraryStats;
+    $('#library-summary').textContent = stats
+      ? `${stats.total} title(s) · ${stats.movies} movie(s) · ${stats.episodes} episode(s) · ${bytes(stats.bytes)} published` +
+        (state.libraryMatched !== null && state.libraryMatched !== stats.total ? ` · ${state.libraryMatched} match the filter` : '')
+      : '';
+    const body = clear($('#library-table tbody'));
+    if (!state.library.length) {
+      body.append(h('tr', {}, h('td', { colspan: '10', class: 'muted', text: 'nothing published yet' })));
+      return;
+    }
+    for (const entry of state.library) {
+      const row = h(
+        'tr',
+        { onclick: (event) => (event.target.closest('a,button') ? undefined : selectLibraryEntry(entry.key)) },
+        h(
+          'td',
+          {},
+          h('span', { text: titleCell(entry, 0) }),
+          entry.episodeTitle ? h('div', { class: 'muted small', text: entry.episodeTitle }) : null,
+        ),
+        h('td', { class: 'mono small', text: entry.kind }),
+        h('td', { class: 'mono', text: entry.quality ?? '—' }),
+        h('td', { class: 'mono small', text: entry.tiers?.length ? entry.tiers.map((tier) => tier.label).join(', ') : '—' }),
+        h('td', { class: 'mono small', text: String(entry.sourceCount ?? 0) }),
+        h('td', { class: 'mono small', text: bytes(librarySize(entry)) }),
+        h('td', { class: 'mono small', text: entry.accountName ?? '—' }),
+        h(
+          'td',
+          {},
+          entry.playbackUrl
+            ? h('a', { href: entry.playbackUrl, target: '_blank', rel: 'noreferrer', text: 'play' })
+            : h('span', { class: 'muted small', text: '—' }),
+        ),
+        h('td', { class: 'mono small', text: shortTime(entry.updatedAt) }),
+        h(
+          'td',
+          { class: 'actions' },
+          h('button', { text: 'forget', onclick: () => void forgetLibraryEntry(entry.key, titleCell(entry, 0)) }),
+        ),
+      );
+      if (entry.key === state.librarySelectedKey) row.classList.add('is-selected');
+      body.append(row);
+    }
+  }
+
+  function selectLibraryEntry(key) {
+    if (state.librarySelectedKey === key) {
+      state.librarySelectedKey = null;
+      state.libraryEntry = null;
+      renderLibrary();
+      renderLibraryDetail();
+      return;
+    }
+    state.librarySelectedKey = key;
+    state.libraryEntry = null;
+    renderLibrary();
+    renderLibraryDetail();
+    void refreshLibraryDetail(key);
+  }
+
+  async function refreshLibraryDetail(key) {
+    try {
+      const data = await api('GET', `/api/catalog/${encodeURIComponent(key)}`);
+      if (state.librarySelectedKey !== key) return;
+      state.libraryEntry = data.entry ?? null;
+      renderLibraryDetail();
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    }
+  }
+
+  async function forgetLibraryEntry(key, label) {
+    if (!confirm(`Forget “${label}” in the library? Bunny keeps the video; only this record is removed.`)) return;
+    try {
+      await api('DELETE', `/api/catalog/${encodeURIComponent(key)}`);
+      if (state.librarySelectedKey === key) {
+        state.librarySelectedKey = null;
+        state.libraryEntry = null;
+      }
+      toast('record removed', 'ok');
+      await refreshLibrary();
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    }
+  }
+
+  function renderLibraryDetail() {
+    const box = clear($('#library-detail'));
+    const entry = state.libraryEntry && state.libraryEntry.key === state.librarySelectedKey ? state.libraryEntry : null;
+    if (!state.librarySelectedKey) {
+      box.classList.add('hidden');
+      return;
+    }
+    box.classList.remove('hidden');
+    if (!entry) {
+      box.append(h('div', { class: 'muted small', text: 'loading the full record…' }));
+      return;
+    }
+    box.append(
+      h(
+        'div',
+        { class: 'box-head' },
+        h('strong', { text: `${titleCell(entry, 0)}${entry.episodeTitle ? ` · ${entry.episodeTitle}` : ''}` }),
+        h('button', { class: 'link', text: 'close', onclick: () => selectLibraryEntry(entry.key) }),
+      ),
+      h('div', {
+        class: 'muted small',
+        text:
+          `key ${entry.key} · first published ${shortTime(entry.firstPublishedAt)}` +
+          ` · published ${entry.publishes} time(s) · updated ${shortTime(entry.updatedAt)}`,
+      }),
+    );
+
+    const rows = [
+      ['playback', entry.playbackUrl ?? '—'],
+      ['video id', entry.videoId ?? '—'],
+      ['account', entry.accountName ? `${entry.accountName} (library ${entry.libraryId ?? '—'})` : '—'],
+      ['pull zone', entry.pullZoneHost ?? '—'],
+      ['transport', entry.transport ?? '—'],
+      ['bunny status', entry.bunnyStatus !== undefined ? String(entry.bunnyStatus) : '—'],
+      ['quality', entry.quality ?? '—'],
+      ['provider', entry.provider ?? '—'],
+      ['source url', entry.sourceUrl ?? '—'],
+      ['source headers', formatHeaders(entry.sourceHeaders)],
+      ['sizes', `declared ${bytes(entry.bytes?.declared)} · downloaded ${bytes(entry.bytes?.downloaded)} · handed over ${bytes(entry.bytes?.handedOver)}${entry.bytes?.file ? ` · file ${bytes(entry.bytes.file)}` : ''}`],
+      ['origin', `${entry.origin?.kind ?? '—'}${entry.origin?.mode ? ` (${entry.origin.mode})` : ''} · ${entry.origin?.name ?? '—'}${entry.origin?.input ? ` · input ${entry.origin.input}` : ''}`],
+      ['scrape options', `min tier ${entry.origin?.minHeight !== undefined ? `${entry.origin.minHeight || 'any'}p` : 'default'}${entry.origin?.only?.length ? ` · hosts ${entry.origin.only.join(', ')}` : ' · every host'}`],
+      ['subtitles', entry.subtitles?.length ? entry.subtitles.map((track) => `${track.srclang}${track.translated ? ' (translated)' : ''}${track.uploaded ? '' : ' (not attached)'}`).join(', ') : 'none carried'],
+      ['job', entry.jobId],
+    ];
+    box.append(
+      h(
+        'table',
+        { class: 'table' },
+        h('tbody', {}, ...rows.map(([label, value]) => h('tr', {}, h('th', { text: label }), h('td', { class: 'mono small', text: String(value) })))),
+      ),
+    );
+
+    box.append(h('h2', { text: `Qualities the source offered${entry.tiers?.length ? ` (${entry.tiers.length})` : ''}` }));
+    if (entry.tiers?.length) {
+      box.append(
+        h(
+          'table',
+          { class: 'table' },
+          h('thead', {}, h('tr', {}, h('th', { text: '' }), h('th', { text: 'Tier' }), h('th', { text: 'Height' }), h('th', { text: 'Bandwidth' }), h('th', { text: 'URL' }))),
+          h(
+            'tbody',
+            {},
+            ...entry.tiers.map((tier) =>
+              h(
+                'tr',
+                {},
+                h('td', { text: tier.label === entry.quality ? 'published' : '' }),
+                h('td', { class: 'mono', text: tier.label }),
+                h('td', { class: 'mono small', text: tier.height ? `${tier.height}p` : '—' }),
+                h('td', { class: 'mono small', text: tier.bandwidth ? `${Math.round(tier.bandwidth / 1000)} kbps` : '—' }),
+                h('td', { class: 'mono small', text: tier.url }),
+              ),
+            ),
+          ),
+        ),
+      );
+    } else {
+      box.append(h('div', { class: 'muted small', text: 'this job was not a scrape, so no ladder was recorded' }));
+    }
+
+    box.append(h('h2', { text: `Sources found${entry.sources?.length ? ` (${entry.sources.length})` : ''}` }));
+    if (entry.sources?.length) {
+      box.append(
+        h(
+          'table',
+          { class: 'table' },
+          h('thead', {}, h('tr', {}, h('th', { text: '' }), h('th', { text: 'Host' }), h('th', { text: 'Quality' }), h('th', { text: 'Type' }), h('th', { text: 'URL' }), h('th', { text: 'Headers' }), h('th', { text: 'Note' }))),
+          h(
+            'tbody',
+            {},
+            ...entry.sources.map((source) =>
+              h(
+                'tr',
+                {},
+                h('td', { text: source.chosen ? 'chosen' : '' }),
+                h('td', { text: source.provider }),
+                h('td', { class: 'mono small', text: `${source.quality}${source.height ? ` (${source.height}p)` : ''}` }),
+                h('td', { class: 'mono small', text: source.directFile ? 'file' : (source.type ?? '—') }),
+                h('td', { class: 'mono small', text: source.url }),
+                h('td', { class: 'mono small', text: formatHeaders(source.headers) }),
+                h('td', { class: 'muted small', text: source.note ?? '' }),
+              ),
+            ),
+          ),
+        ),
+      );
+    } else {
+      box.append(h('div', { class: 'muted small', text: 'no candidate ladder was recorded for this job' }));
+    }
+
+    box.append(h('h2', { text: `Subtitles carried${entry.subtitles?.length ? ` (${entry.subtitles.length})` : ''}` }));
+    if (entry.subtitles?.length) box.append(subtitlesTable(entry.subtitles));
+    else box.append(h('div', { class: 'muted small', text: 'none — this title was published without subtitle tracks' }));
+  }
+
+  $('#library-refresh').addEventListener('click', () => void refreshLibrary());
+  $('#library-kind').addEventListener('change', () => void refreshLibrary());
+  let librarySearchTimer;
+  $('#library-search').addEventListener('input', () => {
+    clearTimeout(librarySearchTimer);
+    librarySearchTimer = setTimeout(() => void refreshLibrary({ quiet: true }), 250);
   });
 
   /* ------------------------------------------------------------ accounts */
@@ -874,9 +1264,26 @@
       ['segment downloads', `${settings.streamConcurrency} at a time`],
       ['tunnel', settings.source?.tunnelEnabled ? settings.source.tunnelPublicUrl ?? 'quick tunnel (cloudflared)' : 'disabled'],
       ['scrape floor', `${settings.source?.minHeight ?? 1080}p`],
+      [
+        'subtitles',
+        settings.subtitles?.enabled
+          ? `carried to Bunny` +
+            (settings.subtitles.translator
+              ? ` · ${settings.subtitles.translator.provider}${settings.subtitles.translator.model ? ` (${settings.subtitles.translator.model})` : ''} fills in ${settings.subtitles.targetLanguage}`
+              : ` · no translator configured, so ${settings.subtitles.targetLanguage} is never invented`)
+          : 'off',
+      ],
+      ['scrape pace', `${settings.source?.minIntervalMs ?? 350} ms between hits to one host · first cooldown ${fmtDuration(settings.source?.cooldownMs ?? 60_000)}`],
+      [
+        'scrape egress',
+        Object.keys(settings.source?.egress ?? {}).length
+          ? Object.entries(settings.source.egress).map(([host, base]) => `${host} → ${base}`).join(', ')
+          : 'direct (no proxy)',
+      ],
       ['watched folder', settings.watchEnabled ? settings.watchDir || '(not set)' : 'off'],
       ['limits', `≤${settings.limits.maxAccounts} accounts · ≤${settings.limits.perAccountConcurrency} uploads each · ${bytes(settings.limits.maxUploadBytes)} per file`],
       ['network calls', `${settings.network?.timeoutMs ?? 30000} ms per attempt · ${settings.network?.retries ?? 3} retries`],
+      ['library', `${settings.catalogEntries ?? 0} published title(s) · ${settings.catalogPath ?? '—'}`],
     ];
     for (const [label, value] of rows) {
       runtime.append(h('tr', {}, h('th', { text: label }), h('td', { class: 'mono', text: String(value) })));
@@ -887,6 +1294,24 @@
       providers.append(
         h('tr', {}, h('td', { text: provider.name }), h('td', { class: 'mono small', text: provider.kind }), h('td', { class: 'small', text: HOW[provider.id] ?? '—' })),
       );
+    }
+
+    const cooling = clear($('#cooling-table tbody'));
+    const coolingList = settings.source?.cooling ?? [];
+    if (!coolingList.length) {
+      cooling.append(h('tr', {}, h('td', { colspan: '3', class: 'muted small', text: 'every host is answering' })));
+    } else {
+      for (const entry of coolingList) {
+        cooling.append(
+          h(
+            'tr',
+            {},
+            h('td', { class: 'mono small', text: entry.host }),
+            h('td', { class: 'small', text: entry.reason }),
+            h('td', { class: 'mono small', text: `in ${fmtDuration(entry.until - Date.now())} · ${entry.failures} refusal(s)` }),
+          ),
+        );
+      }
     }
   }
 
@@ -915,6 +1340,146 @@
       await api('PUT', '/api/settings', { clearTmdb: true });
       toast('TMDB credential forgotten', 'ok');
       await refreshSettings();
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    }
+  });
+
+  /* ----------------------------------------------------------- autopilot */
+
+  function autopilotPatch() {
+    const kinds = [];
+    if ($('#autopilot-movies').checked) kinds.push('movie');
+    if ($('#autopilot-tv').checked) kinds.push('tv');
+    return {
+      enabled: $('#autopilot-enabled').checked,
+      minRating: Number($('#autopilot-minrating').value),
+      minHeight: Number($('#autopilot-minheight').value),
+      maxJobsPerCycle: Number($('#autopilot-maxjobs').value),
+      maxAttempts: Number($('#autopilot-maxattempts').value),
+      maxQueueDepth: Number($('#autopilot-maxdepth').value),
+      intervalMs: Math.round(Number($('#autopilot-interval').value) * 60_000),
+      expandSeries: $('#autopilot-expand').checked,
+      kinds,
+    };
+  }
+
+  function renderAutopilot(ap, options = {}) {
+    const badge = $('#autopilot-state');
+    badge.textContent = ap.running ? 'running a cycle…' : ap.config.enabled ? 'on' : 'off';
+
+    const status = clear($('#autopilot-status-table tbody'));
+    const statusRows = [
+      ['state', ap.config.enabled ? (ap.running ? 'a cycle is running' : 'on') : 'off'],
+      ['cycles run', String(ap.cycle)],
+      ['titles already queued or published', String(ap.done)],
+      ['unfinished jobs right now', String(ap.queueDepth)],
+      ['page cursor', `movies ${ap.cursors.movie} · shows ${ap.cursors.tv}`],
+      ['last cycle', ap.lastRunAt ? shortTime(ap.lastRunAt) : 'never'],
+      ['next cycle', !ap.config.enabled ? '—' : ap.running ? 'after this one' : shortTime(ap.nextRunAt)],
+    ];
+    for (const [label, value] of statusRows) status.append(h('tr', {}, h('th', { text: label }), h('td', { class: 'mono', text: value })));
+
+    // A background refresh (the 10 s poll) must not clobber a half-typed form.
+    if (!options.skipConfig) {
+      $('#autopilot-enabled').checked = ap.config.enabled;
+      $('#autopilot-minrating').value = String(ap.config.minRating);
+      $('#autopilot-minheight').value = String(ap.config.minHeight);
+      $('#autopilot-maxjobs').value = String(ap.config.maxJobsPerCycle);
+      $('#autopilot-maxattempts').value = String(ap.config.maxAttempts);
+      $('#autopilot-maxdepth').value = String(ap.config.maxQueueDepth);
+      $('#autopilot-interval').value = String(Math.round((ap.config.intervalMs / 60_000) * 100) / 100);
+      $('#autopilot-expand').checked = ap.config.expandSeries;
+      $('#autopilot-movies').checked = ap.config.kinds.includes('movie');
+      $('#autopilot-tv').checked = ap.config.kinds.includes('tv');
+    }
+
+    const report = ap.lastReport;
+    $('#autopilot-report-head').textContent = report ? `cycle ${report.cycle} · ${shortTime(report.finishedAt)}` : '';
+    const body = clear($('#autopilot-report-table tbody'));
+    if (!report) {
+      body.append(h('tr', {}, h('td', { class: 'muted', text: 'no cycle has run yet' })));
+    } else {
+      const rows = [
+        ['queued', String(report.created)],
+        ['titles scanned', String(report.scanned)],
+        ['below the rating floor', String(report.belowRating)],
+        ['already done', String(report.alreadyDone)],
+        ['failed jobs retried', String(report.retried)],
+        ['given up on', String(report.abandoned)],
+        ['list restarted', report.wrapped ? 'yes' : 'no'],
+      ];
+      rows.push(report.paused ? ['paused', report.note] : ['note', report.note || '—']);
+      for (const [label, value] of rows) body.append(h('tr', {}, h('th', { text: label }), h('td', { class: 'mono small', text: value })));
+    }
+
+    const skipped = clear($('#autopilot-skipped'));
+    if (report?.skipped?.length) {
+      skipped.append(h('div', { text: 'stepped over:' }));
+      for (const item of report.skipped) skipped.append(h('div', { class: 'mono small', text: `· ${item.title} — ${item.reason}` }));
+    }
+
+    const log = clear($('#autopilot-log'));
+    log.textContent = ap.log?.length ? ap.log.join('\n') : 'nothing logged yet';
+  }
+
+  async function refreshAutopilot(options = {}) {
+    const quiet = options.quiet === true;
+    let data;
+    try {
+      data = await api('GET', '/api/autopilot');
+    } catch (error) {
+      if (!quiet) toast(describeError(error), 'bad');
+      return;
+    }
+    state.autopilot = data;
+    renderAutopilot(data, { skipConfig: quiet });
+  }
+
+  $('#autopilot-save').addEventListener('click', async () => {
+    try {
+      const data = await api('PUT', '/api/autopilot', autopilotPatch());
+      state.autopilot = data;
+      renderAutopilot(data);
+      toast(data.config.enabled ? 'autopilot saved and switched on' : 'autopilot saved', 'ok');
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    }
+  });
+
+  $('#autopilot-run').addEventListener('click', async () => {
+    const button = $('#autopilot-run');
+    button.disabled = true;
+    button.textContent = 'running…';
+    try {
+      const data = await api('POST', '/api/autopilot/run');
+      state.autopilot = data.state;
+      renderAutopilot(data.state);
+      const report = data.report;
+      toast(report.paused ? `paused: ${report.note}` : `cycle ${report.cycle}: queued ${report.created}, retried ${report.retried}`, 'ok');
+      await refreshJobs({ quiet: true });
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    } finally {
+      button.disabled = false;
+      button.textContent = 'Run a cycle now';
+    }
+  });
+
+  $('#autopilot-reset').addEventListener('click', async () => {
+    try {
+      state.autopilot = await api('POST', '/api/autopilot/reset');
+      renderAutopilot(state.autopilot);
+      toast('cursors reset to page 1', 'ok');
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    }
+  });
+
+  $('#autopilot-clear').addEventListener('click', async () => {
+    try {
+      state.autopilot = await api('POST', '/api/autopilot/log/clear');
+      renderAutopilot(state.autopilot);
     } catch (error) {
       toast(describeError(error), 'bad');
     }
@@ -963,10 +1528,23 @@
     await refreshJobs();
     await refreshSettings();
     await refreshTunnel();
+    let tick = 0;
     setInterval(() => {
       if (!state.autoRefresh) return;
-      void refreshJobs();
-      void refreshHealth();
+      tick += 1;
+      // Only the visible tab is worth refreshing in full; everywhere else the
+      // header counts are enough. Health (and with it the tunnel badge) is a
+      // slow-moving thing, so it is checked every fifth tick (about 10 s).
+      if (state.activeTab === 'queue') void refreshJobs({ quiet: true });
+      else void refreshStats();
+      if (tick % 5 === 0) {
+        void refreshHealth();
+        // A title published while the Library tab is open should appear without a click.
+        if (state.activeTab === 'library') void refreshLibrary({ quiet: true });
+        // The autopilot's own cycle is minutes apart; a slow poll keeps the
+        // status and the queue it just filled current.
+        if (state.activeTab === 'autopilot') void refreshAutopilot({ quiet: true });
+      }
     }, 2000);
   }
 

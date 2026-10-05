@@ -118,6 +118,55 @@ export function parseMasterPlaylist(text: string, baseUrl: string): HlsVariant[]
   return variants.sort((a, b) => (b.height ?? 0) - (a.height ?? 0) || (b.bandwidth ?? 0) - (a.bandwidth ?? 0));
 }
 
+/**
+ * A subtitle track a master playlist declares.
+ *
+ * HLS carries subtitles as `#EXT-X-MEDIA:TYPE=SUBTITLES` renditions: a URI
+ * (usually a WebVTT playlist or file) with the language and a label. They are
+ * the one place a stream honestly lists "what subtitles come with this", which
+ * is why the scrape reads them from the master rather than guessing at file
+ * names on the host.
+ */
+export interface HlsSubtitleRendition {
+  url: string;
+  /** The manifest's LANGUAGE attribute, lower-cased (e.g. `en`, `ar`). */
+  language?: string;
+  /** The manifest's NAME attribute — the label a player shows. */
+  name?: string;
+  isDefault?: boolean;
+  forced?: boolean;
+}
+
+/** `#EXT-X-MEDIA:TYPE=SUBTITLES` renditions of a master playlist, in order. */
+export function parseSubtitleRenditions(text: string, baseUrl: string): HlsSubtitleRendition[] {
+  if (!text || !/#EXT-X-MEDIA/i.test(text)) return [];
+  const renditions: HlsSubtitleRendition[] = [];
+  const seen = new Set<string>();
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!/^#EXT-X-MEDIA:/i.test(line)) continue;
+    const attributes = attributeList(line.slice(line.indexOf(':') + 1));
+    if ((attributes.get('TYPE') ?? '').toUpperCase() !== 'SUBTITLES') continue;
+    const uri = attributes.get('URI');
+    if (!uri) continue;
+    const url = absolutize(uri, baseUrl);
+    if (!url.startsWith('http') || seen.has(url)) continue;
+    seen.add(url);
+
+    const rendition: HlsSubtitleRendition = { url };
+    const language = attributes.get('LANGUAGE');
+    if (language) rendition.language = language.toLowerCase();
+    const name = attributes.get('NAME');
+    if (name) rendition.name = name;
+    if ((attributes.get('DEFAULT') ?? '').toUpperCase() === 'YES') rendition.isDefault = true;
+    if ((attributes.get('FORCED') ?? '').toUpperCase() === 'YES') rendition.forced = true;
+    renditions.push(rendition);
+  }
+
+  return renditions;
+}
+
 function absolutize(url: string, base: string): string {
   if (url.startsWith('http')) return url;
   try {
@@ -269,6 +318,8 @@ export interface ResolvedPlaylist {
   variantLabel?: string;
   variantHeight?: number;
   variants: HlsVariant[];
+  /** Subtitle tracks the master declared (empty for a bare media playlist). */
+  subtitles: HlsSubtitleRendition[];
 }
 
 /**
@@ -282,18 +333,21 @@ export async function resolvePlaylist(
 ): Promise<ResolvedPlaylist> {
   const first = await fetchPlaylist(url, options);
   if (!hasMasterPlaylist(first)) {
-    return { text: first, url, variants: [] };
+    return { text: first, url, variants: [], subtitles: [] };
   }
 
+  // Read the subtitle renditions off the master before walking its ladder: the
+  // media playlist the ladder leads to never mentions them.
+  const subtitles = parseSubtitleRenditions(first, url);
   const variants = parseMasterPlaylist(first, url);
-  if (!variants.length) return { text: first, url, variants: [] };
+  if (!variants.length) return { text: first, url, variants: [], subtitles };
 
   const cap = options.maxHeight ?? 2160;
   const withinCap = variants.filter((variant) => (variant.height ?? cap) <= cap);
   const chosen = (withinCap.length ? withinCap : variants)[0];
-  if (!chosen) return { text: first, url, variants };
+  if (!chosen) return { text: first, url, variants, subtitles };
   const text = await fetchPlaylist(chosen.url, options);
-  const resolved: ResolvedPlaylist = { text, url: chosen.url, variants };
+  const resolved: ResolvedPlaylist = { text, url: chosen.url, variants, subtitles };
   if (chosen.height) resolved.variantHeight = chosen.height;
   resolved.variantLabel = chosen.label;
   return resolved;
@@ -303,11 +357,25 @@ export async function resolvePlaylist(
 /* Segment fetching                                                    */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Decryption keys, cached across the segments that share one.
+ *
+ * Bounded on purpose: the cache is module-level and a long-lived dashboard may
+ * download hundreds of streams, so an unbounded map would hold a key URL (and a
+ * key) for every stream it ever touched. A small LRU is plenty — every segment
+ * of one playlist is fetched within seconds of the others.
+ */
+const KEY_CACHE_LIMIT = 64;
 const keyCache = new Map<string, Promise<Buffer>>();
 
 async function fetchKey(key: HlsKey, options: FetchOptions): Promise<Buffer> {
   const cached = keyCache.get(key.url);
-  if (cached) return cached;
+  if (cached) {
+    // Refresh recency so a still-active playlist keeps its key.
+    keyCache.delete(key.url);
+    keyCache.set(key.url, cached);
+    return cached;
+  }
   const pending = (async () => {
     const response = await fetchWithTimeout(key.url, options);
     if (!response.ok) throw new Error(`the decryption key request failed (HTTP ${response.status})`);
@@ -316,6 +384,11 @@ async function fetchKey(key: HlsKey, options: FetchOptions): Promise<Buffer> {
     return buffer;
   })();
   keyCache.set(key.url, pending);
+  while (keyCache.size > KEY_CACHE_LIMIT) {
+    const oldest = keyCache.keys().next().value;
+    if (oldest === undefined || oldest === key.url) break;
+    keyCache.delete(oldest);
+  }
   try {
     return await pending;
   } catch (error) {
@@ -366,6 +439,9 @@ async function probeLength(url: string, options: FetchOptions): Promise<number |
     const response = await fetchWithTimeout(url, { ...options, headers: { ...(options.headers ?? {}), Range: 'bytes=0-0' } });
     const range = response.headers.get('content-range');
     const length = range ? Number(range.split('/')[1]) : Number(response.headers.get('content-length') ?? 0);
+    // A server that ignores Range would stream the whole file at us; only the
+    // headers are needed, so cancel the body and hand the socket back.
+    void response.body?.cancel().catch(() => undefined);
     return Number.isFinite(length) && length > 0 ? length : undefined;
   } catch {
     return undefined;
@@ -646,7 +722,9 @@ export async function downloadSegments(
       } catch (error) {
         lastError = error;
         if (signal?.aborted) throw error;
-        await new Promise((resolve) => setTimeout(resolve, Math.min(5_000, 500 * attempt)));
+        // Back off between attempts only — sleeping after the last one just
+        // delays the failure for no retry.
+        if (attempt < attempts) await new Promise((resolve) => setTimeout(resolve, Math.min(5_000, 500 * attempt)));
       }
     }
     throw lastError instanceof Error ? lastError : new Error(String(lastError));
@@ -656,7 +734,15 @@ export async function downloadSegments(
   try {
     while (next < segments.length) {
       for (let index = next; index < Math.min(segments.length, next + window); index += 1) {
-        if (!inflight.has(index)) inflight.set(index, load(index));
+        if (inflight.has(index)) continue;
+        const pending = load(index);
+        // The window keeps several segments in flight, but only the one being
+        // awaited has a handler attached. Without this, a later segment failing
+        // while an earlier one is being awaited is an unhandled rejection — and
+        // Node ends the process over one of those. The original promise is kept,
+        // so the `await` below (and the `allSettled` below that) still see it.
+        pending.catch(() => undefined);
+        inflight.set(index, pending);
       }
       const buffer = await inflight.get(next);
       inflight.delete(next);
@@ -666,6 +752,10 @@ export async function downloadSegments(
     }
   } catch (error) {
     spool.markFailed(error instanceof Error ? error.message : String(error));
+    // Drain the rest of the window so no in-flight fetch keeps running (or
+    // rejects) after this function has given up.
+    await Promise.allSettled([...inflight.values()]);
+    inflight.clear();
     throw error;
   }
 }

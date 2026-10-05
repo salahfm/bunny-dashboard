@@ -17,13 +17,29 @@ import type { AppConfig } from './config';
 import {
   StreamSpool,
   downloadSegments,
+  looksLikePlaylist,
   measureSegments,
   parseMediaPlaylist,
   resolvePlaylist,
   type HlsSegment,
+  type HlsSubtitleRendition,
+  type HlsVariant,
 } from './hls';
 import {
+  cueTexts,
+  languageLabel,
+  normalizeLanguage,
+  parseSubtitle,
+  parseTimestampOffset,
+  shiftCues,
+  toWebVtt,
+  withTranslatedText,
+  type SubtitleCue,
+} from './subtitles';
+import { createTranslator } from './translate';
+import {
   contextFor,
+  fetchScrapeText,
   fetchWithTimeout,
   providerCatalog,
   qualityHeight,
@@ -33,7 +49,7 @@ import {
   type ProviderStream,
 } from './providers';
 import { relayMasterUrl, relayStreamUrl, type RelayHub } from './relay';
-import type { Job, JobCandidate, JobSource, JobTarget, Store } from './store';
+import type { Job, JobCandidate, JobSource, JobTarget, SourceTier, Store, SubtitleTrack } from './store';
 import type { TunnelManager } from './tunnel';
 
 /** The tier a scrape must reach before it settles, unless the job asks otherwise. */
@@ -68,8 +84,18 @@ function clampConcurrency(value: number | undefined): number {
   return Math.max(1, Math.min(16, Math.floor(n)));
 }
 
+/**
+ * The tier a scrape must reach, given the job's `minHeight`.
+ *
+ * `undefined` means "the default floor" (1080p). An explicit `0` means "no
+ * floor" — take the best the hosts have — which is what the dashboard's
+ * *whatever is available* option sends. Any other positive number is used as-is.
+ */
 export function floorFor(minHeight: number | undefined): number {
-  return minHeight && minHeight > 0 ? Math.floor(minHeight) : DEFAULT_MIN_HEIGHT;
+  if (minHeight === undefined || minHeight === null) return DEFAULT_MIN_HEIGHT;
+  const value = Math.floor(Number(minHeight));
+  if (!Number.isFinite(value) || value < 0) return DEFAULT_MIN_HEIGHT;
+  return value;
 }
 
 /* ------------------------------------------------------------------ */
@@ -175,6 +201,10 @@ export interface Probe {
   label: string;
   /** The chosen variant's declared bitrate, when the master playlist had one. */
   bandwidth?: number;
+  /** Every rung the master playlist offered, best first (empty for a media playlist). */
+  variants: HlsVariant[];
+  /** Subtitle tracks the master declared, to be carried into Bunny. */
+  subtitles: HlsSubtitleRendition[];
 }
 
 /**
@@ -201,17 +231,33 @@ export async function probeCandidate(
     label: `${candidate.provider}${candidate.height ? ` ${candidate.height}p` : ''}`,
   };
 
+  // A plain media file is a ladder of one; a playlist replaces this below.
+  const soleVariant: HlsVariant = { label: base.quality, url: candidate.url, ...(base.height ? { height: base.height } : {}) };
   const declaredPlaylist = candidate.type === 'hls' || /m3u8/i.test(candidate.url);
   if (!declaredPlaylist) {
-    const head = await fetchWithTimeout(candidate.url, { headers, method: 'HEAD' }, PROBE_TIMEOUT_MS);
-    const contentType = (head.headers.get('content-type') ?? '').toLowerCase();
-    if (/mpegurl|m3u8/.test(contentType)) {
-      // It called itself a file and is really a playlist.
+    const head = await fetchWithTimeout(candidate.url, { headers, method: 'HEAD' }, PROBE_TIMEOUT_MS).catch(() => undefined);
+    if (head && head.ok && /mpegurl|m3u8/.test((head.headers.get('content-type') ?? '').toLowerCase())) {
+      // It called itself a file and is really a playlist; fall through.
     } else {
-      if (!head.ok) throw new Error(`the media request failed (HTTP ${head.status})`);
-      const bytes = Number(head.headers.get('content-length') ?? 0);
-      if (!Number.isFinite(bytes) || bytes <= 0) throw new Error('the source did not report its size');
-      return { ...base, directFile: true, segments: [], sizes: [bytes], totalBytes: bytes };
+      const headBytes = Number(head?.headers.get('content-length') ?? 0);
+      if (head?.ok && Number.isFinite(headBytes) && headBytes > 0) {
+        return { ...base, directFile: true, segments: [], sizes: [headBytes], totalBytes: headBytes, variants: [soleVariant], subtitles: [] };
+      }
+      // The host refuses HEAD (405 is common) or answers it without a length.
+      // A one-byte ranged GET proves the file exists and reports its real size
+      // through `Content-Range`, so a good source is not written off over a
+      // request that was never going to work.
+      const ranged = await fetchWithTimeout(candidate.url, { headers: { ...headers, Range: 'bytes=0-0' } }, PROBE_TIMEOUT_MS);
+      const rangeHeader = ranged.headers.get('content-range');
+      const rangedBytes = rangeHeader ? Number(rangeHeader.split('/')[1]) : Number(ranged.headers.get('content-length') ?? 0);
+      // Only the headers are wanted here; the downloader fetches the media for
+      // real. Cancelling the body frees the socket instead of parking it.
+      void ranged.body?.cancel().catch(() => undefined);
+      if (!/mpegurl|m3u8/.test((ranged.headers.get('content-type') ?? '').toLowerCase())) {
+        if (!ranged.ok && ranged.status !== 206) throw new Error(`the media request failed (HTTP ${ranged.status})`);
+        if (!Number.isFinite(rangedBytes) || rangedBytes <= 0) throw new Error('the source did not report its size');
+        return { ...base, directFile: true, segments: [], sizes: [rangedBytes], totalBytes: rangedBytes, variants: [soleVariant], subtitles: [] };
+      }
     }
   }
 
@@ -247,6 +293,8 @@ export async function probeCandidate(
     segments: media.segments,
     sizes: measured.sizes.map((size) => size ?? 0),
     totalBytes: measured.bytes,
+    variants: playlist.variants,
+    subtitles: playlist.subtitles,
     ...(chosenVariant?.bandwidth ? { bandwidth: chosenVariant.bandwidth } : {}),
   };
 }
@@ -259,7 +307,7 @@ export async function chooseCandidate(
   candidates: JobCandidate[],
   options: { floor?: number; onProgress?: (detail: string) => void; maxProbes?: number } = {},
 ): Promise<{ probe: Probe; candidates: JobCandidate[]; note: string; belowFloor: boolean }> {
-  const floor = options.floor && options.floor > 0 ? Math.floor(options.floor) : DEFAULT_MIN_HEIGHT;
+  const floor = floorFor(options.floor);
   const ordered = [...candidates].sort((a, b) => b.height - a.height);
   const probes = Math.min(options.maxProbes ?? MAX_PROBES, ordered.length);
   const annotated = ordered.map((candidate) => ({ ...candidate }));
@@ -347,6 +395,155 @@ async function downloadDirect(
 }
 
 /* ------------------------------------------------------------------ */
+/* Subtitles                                                           */
+/* ------------------------------------------------------------------ */
+
+/** Ceiling for one subtitle request: a caption file is small. */
+const SUBTITLE_TIMEOUT_MS = 20_000;
+
+/**
+ * The cues behind one subtitle URL, however the host wrapped them.
+ *
+ * A rendition URI is usually a plain `.vtt`/`.srt` file, but HLS may also offer
+ * a *subtitle playlist* whose segments are WebVTT chunks on their own timeline.
+ * Both shapes end up as one list of cues, because everything downstream works
+ * on cues.
+ */
+async function fetchSubtitleCues(url: string, headers: Record<string, string>): Promise<SubtitleCue[]> {
+  const text = await fetchScrapeText(url, headers, SUBTITLE_TIMEOUT_MS);
+  if (!looksLikePlaylist(text)) return parseSubtitle(text).cues;
+
+  const media = parseMediaPlaylist(text, url);
+  if (!media.segments.length) return parseSubtitle(text).cues;
+
+  const cues: SubtitleCue[] = [];
+  for (const segment of media.segments) {
+    const chunk = await fetchScrapeText(segment.url, headers, SUBTITLE_TIMEOUT_MS);
+    // Each chunk's timeline is local to it; the map says where it sits.
+    cues.push(...shiftCues(parseSubtitle(chunk).cues, parseTimestampOffset(chunk)));
+  }
+  return cues;
+}
+
+/**
+ * Carries the stream's subtitle tracks into Bunny — and, when the language the
+ * dashboard is told to want is missing, translates one from the text it has.
+ *
+ * The translation is text→text: the English cue lines go to a translation
+ * engine and the Arabic comes back against the **same timings**. Bunny's own
+ * transcribe/translate is deliberately not used here, because it runs speech
+ * recognition over the audio first, which is a different (and much more
+ * expensive, and less accurate for this purpose) thing.
+ *
+ * Nothing in here fails the job: a subtitle that cannot be fetched or uploaded
+ * becomes a noted track on the job, and the video is still published.
+ */
+async function carrySubtitles(
+  deps: StreamDeps,
+  handles: StreamRunHandles,
+  options: { client: BunnyClient; videoId: string | undefined; renditions: HlsSubtitleRendition[]; headers: Record<string, string> },
+): Promise<SubtitleTrack[]> {
+  const config = deps.config;
+  const tracks: SubtitleTrack[] = [];
+  if (!options.videoId) {
+    deps.log?.('[stream] the Bunny video is not identified yet — subtitle tracks were not attached');
+    return tracks;
+  }
+  const videoId = options.videoId;
+
+  // Only build a translator when one is actually configured: with none, the
+  // dashboard still carries the tracks the stream had, it just never invents a
+  // language.
+  const translator = config.translator
+    ? createTranslator({ ...config.translator, timeoutMs: config.networkTimeoutMs, retries: config.networkRetries })
+    : undefined;
+
+  const seen = new Set<string>();
+  const sources: Array<{ srclang: string; label: string; language?: string; url: string; cues: SubtitleCue[] }> = [];
+
+  for (const rendition of options.renditions) {
+    const srclang = normalizeLanguage(rendition.language, rendition.name);
+    const label = rendition.name || (srclang ? languageLabel(srclang) : 'Subtitle');
+    if (!srclang) {
+      tracks.push({ srclang: 'und', label, url: rendition.url, uploaded: false, note: 'the stream did not say which language this track is' });
+      continue;
+    }
+    if (seen.has(srclang)) continue;
+    seen.add(srclang);
+    try {
+      const cues = await fetchSubtitleCues(rendition.url, options.headers);
+      if (!cues.length) throw new Error('the subtitle file held no cues');
+      sources.push({ srclang, label, url: rendition.url, cues, ...(rendition.language ? { language: rendition.language } : {}) });
+    } catch (error) {
+      tracks.push({ srclang, label, url: rendition.url, uploaded: false, note: describeError(error) });
+    }
+  }
+
+  for (const source of sources) {
+    const body = toWebVtt(source.cues);
+    try {
+      await options.client.addCaption(videoId, source.srclang, source.label, body);
+      tracks.push({
+        srclang: source.srclang,
+        label: source.label,
+        url: source.url,
+        uploaded: true,
+        cues: source.cues.length,
+        bytes: Buffer.byteLength(body),
+        ...(source.language ? { language: source.language } : {}),
+      });
+    } catch (error) {
+      tracks.push({ srclang: source.srclang, label: source.label, url: source.url, uploaded: false, note: describeError(error) });
+    }
+  }
+
+  const target = config.subtitleTargetLanguage;
+  const haveTarget = tracks.some((track) => track.uploaded && track.srclang === target);
+  if (!haveTarget && sources.length) {
+    const pivot = sources.find((source) => source.srclang === 'en') ?? sources[0];
+    if (!pivot) return tracks;
+    if (!translator) {
+      tracks.push({
+        srclang: target,
+        label: languageLabel(target),
+        uploaded: false,
+        translated: true,
+        translatedFrom: pivot.srclang,
+        note: 'no text translator is configured (set SUBTITLE_TRANSLATOR and its key to fill this in)',
+      });
+      return tracks;
+    }
+    try {
+      const translated = await translator.translate(cueTexts(pivot.cues), target, pivot.srclang);
+      const body = toWebVtt(withTranslatedText(pivot.cues, translated), `translated from ${languageLabel(pivot.srclang)} (${translator.provider})`);
+      const label = `${languageLabel(target)} (translated)`;
+      await options.client.addCaption(videoId, target, label, body);
+      tracks.push({
+        srclang: target,
+        label,
+        uploaded: true,
+        translated: true,
+        translatedFrom: pivot.srclang,
+        cues: pivot.cues.length,
+        bytes: Buffer.byteLength(body),
+      });
+      deps.log?.(`[stream] translated ${pivot.cues.length} ${pivot.srclang} cues into ${target} with ${translator.provider}`);
+    } catch (error) {
+      tracks.push({
+        srclang: target,
+        label: languageLabel(target),
+        uploaded: false,
+        translated: true,
+        translatedFrom: pivot.srclang,
+        note: describeError(error),
+      });
+    }
+  }
+
+  return tracks;
+}
+
+/* ------------------------------------------------------------------ */
 /* The pipeline                                                        */
 /* ------------------------------------------------------------------ */
 
@@ -413,9 +610,23 @@ export async function runStreamJob(
     if (!current) return;
     handles.update({ source: { ...current.source, ...patch } });
   };
+  // The whole ladder the chosen source declared, so the published catalogue can
+  // report every quality that was on offer and not only the one downloaded.
+  const tiers: SourceTier[] = probe.variants.map((variant) => ({
+    label: variant.label,
+    height: variant.height ?? qualityHeight(variant.label),
+    url: variant.url,
+    ...(variant.bandwidth ? { bandwidth: variant.bandwidth } : {}),
+  }));
   // The *resolved* URL is stored, not the input: a retry then downloads the very
   // same tier instead of re-deciding it, while `source.input` keeps the original.
-  updateSource({ url: probe.resolvedUrl, headers: probe.headers, quality, provider: probe.provider });
+  updateSource({
+    url: probe.resolvedUrl,
+    headers: probe.headers,
+    quality,
+    provider: probe.provider,
+    ...(tiers.length ? { tiers } : {}),
+  });
   handles.update({
     candidates: choice.candidates.slice(0, 24),
     detail: choice.note,
@@ -554,6 +765,10 @@ export async function runStreamJob(
       // The video object is created here, not at the start of the job: a source
       // that never resolved must not leave an empty video in the library.
       const videoId = await target.ensureVideo();
+      // Recorded on the job even though `ensureVideo` usually does it too: the
+      // subtitles below need the id, and the pipeline must not depend on a
+      // caller's side effect for that.
+      handles.update({ bunnyVideoId: videoId });
       upload = (async () => {
         if (encrypted) {
           // With AES padding the declared length can never be met mid-download,
@@ -593,6 +808,41 @@ export async function runStreamJob(
       if (downloadOutcome.status === 'rejected') throw downloadOutcome.reason;
       deps.relay.release(relayToken);
       handles.update({ relayToken: undefined });
+    }
+
+    // 5. The subtitle tracks the stream declared, carried into Bunny — and the
+    // one language the dashboard is told to want, translated from them when the
+    // stream did not have it. Text only: no audio is ever transcribed.
+    if (deps.config.subtitleUpload && probe.subtitles.length) {
+      handles.update({ stage: 'subtitles' });
+      try {
+        // Bunny's own fetch creates the video itself, and it can take a moment
+        // to show up in the library. Nothing can be attached without its id, so
+        // it is worth a few seconds of patience before giving up on subtitles.
+        let videoId = deps.store.job(jobId)?.bunnyVideoId;
+        for (let attempt = 0; !videoId && attempt < 3; attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 2_000));
+          const adopted = await target.adoptFetchedVideo().catch(() => undefined);
+          if (adopted) {
+            handles.update({ bunnyVideoId: adopted });
+            videoId = adopted;
+          }
+        }
+        const tracks = await carrySubtitles(deps, handles, {
+          client,
+          videoId,
+          renditions: probe.subtitles,
+          headers: probe.headers,
+        });
+        if (tracks.length) handles.update({ subtitles: tracks });
+        const attached = tracks.filter((track) => track.uploaded).length;
+        deps.log?.(`[stream] ${jobId}: ${attached} of ${tracks.length} subtitle track(s) attached`);
+      } catch (error) {
+        // Subtitles are a bonus. A host that will not hand them over, or a
+        // translator that is down, must not take the video down with it.
+        deps.log?.(`[stream] ${jobId}: subtitles failed (${describeError(error)})`);
+      }
+      handles.update({ stage: 'encoding' });
     }
 
     return {

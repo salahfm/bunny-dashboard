@@ -10,6 +10,12 @@ import fs from 'node:fs';
 import { DEFAULT_FETCH_RETRIES, DEFAULT_FETCH_TIMEOUT_MS, NetworkError, fetchWithPolicy } from './net';
 import { TusError, TusUploadAborted, fileTusSource, tusUpload, type TusSource, type TusUploadResult } from './tus';
 
+export interface BunnyCaption {
+  srclang: string;
+  label: string;
+  version?: number;
+}
+
 export interface BunnyVideo {
   guid: string;
   title: string;
@@ -20,6 +26,8 @@ export interface BunnyVideo {
   thumbnailUrl?: string;
   availableResolutions?: string;
   errorMessage?: string;
+  /** The caption tracks the video carries, as Bunny reports them. */
+  captions?: BunnyCaption[] | null;
   [key: string]: unknown;
 }
 
@@ -253,6 +261,58 @@ export class BunnyClient {
     return this.request(`/videos?page=1&itemsPerPage=${Math.max(1, Math.floor(limit))}`);
   }
 
+  /**
+   * Attaches a caption track to a video.
+   *
+   * Bunny takes the subtitle text base64-encoded in JSON, keyed by the SRCLANG
+   * route segment, and answers `200` even when it decided the file was invalid —
+   * the real verdict is in `data.valid`/`data.errorList`. A rejected caption is
+   * therefore raised here rather than reported as success.
+   */
+  async addCaption(videoId: string, srclang: string, label: string, content: string | Buffer): Promise<void> {
+    const code = srclang.trim().toLowerCase();
+    if (!code) throw new BunnyError('a caption needs a language code');
+    if (this.mock) {
+      mockAddCaption(videoId, code, label);
+      return;
+    }
+    const captionsFile = Buffer.isBuffer(content) ? content.toString('base64') : Buffer.from(content, 'utf8').toString('base64');
+    const response = await this.send(`${this.base}/videos/${encodeURIComponent(videoId)}/captions/${encodeURIComponent(code)}`, {
+      method: 'POST',
+      headers: { AccessKey: this.apiKey, accept: 'application/json', 'content-type': 'application/json' },
+      body: JSON.stringify({ srclang: code, label, captionsFile }),
+    });
+    await this.ensureOk(response);
+    const body = (await response.json().catch(() => ({}))) as {
+      success?: boolean;
+      message?: string;
+      data?: { valid?: boolean; errorList?: string[]; warningList?: string[] };
+    };
+    if (body.success === false || body.data?.valid === false) {
+      const detail = body.data?.errorList?.join('; ') || body.message || 'Bunny rejected the caption file';
+      throw new BunnyError(`Bunny rejected the ${code} caption: ${detail}`, response.status);
+    }
+  }
+
+  /** The caption tracks Bunny already holds for a video. */
+  async listCaptions(videoId: string): Promise<BunnyCaption[]> {
+    const video = await this.getVideo(videoId);
+    return Array.isArray(video.captions) ? video.captions : [];
+  }
+
+  async deleteCaption(videoId: string, srclang: string): Promise<void> {
+    const code = srclang.trim().toLowerCase();
+    if (this.mock) {
+      MOCK_CAPTIONS.get(videoId)?.delete(code);
+      return;
+    }
+    const response = await this.send(`${this.base}/videos/${encodeURIComponent(videoId)}/captions/${encodeURIComponent(code)}`, {
+      method: 'DELETE',
+      headers: { AccessKey: this.apiKey, accept: 'application/json' },
+    });
+    await this.ensureOk(response);
+  }
+
   async deleteVideo(videoId: string): Promise<void> {
     if (this.mock) {
       MOCK_LIBRARY.delete(videoId);
@@ -271,7 +331,16 @@ export class BunnyClient {
 /* ------------------------------------------------------------------ */
 
 const MOCK_LIBRARY = new Map<string, { title: string; started: number }>();
+/** Caption tracks the mock library has been handed, per video. */
+const MOCK_CAPTIONS = new Map<string, Map<string, BunnyCaption>>();
 const MOCK_ENCODE_MS = 20_000;
+
+function mockAddCaption(videoId: string, srclang: string, label: string): void {
+  const tracks = MOCK_CAPTIONS.get(videoId) ?? new Map<string, BunnyCaption>();
+  const previous = tracks.get(srclang);
+  tracks.set(srclang, { srclang, label, version: (previous?.version ?? 0) + 1 });
+  MOCK_CAPTIONS.set(videoId, tracks);
+}
 
 function mockCreate(title: string): BunnyVideo {
   const guid = `mock-${Math.random().toString(36).slice(2, 10)}`;
@@ -300,6 +369,7 @@ function mockGet(videoId: string): BunnyVideo {
     status: ratio >= 1 ? 4 : 3,
     encodeProgress: Math.round(ratio * 100),
     length: 90,
+    captions: [...(MOCK_CAPTIONS.get(videoId)?.values() ?? [])],
   };
 }
 

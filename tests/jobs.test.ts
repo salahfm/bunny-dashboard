@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import type { BunnyClient, BunnyVideo } from '../src/bunny';
+import { Catalog } from '../src/catalog';
 import type { AppConfig } from '../src/config';
 import { JobService } from '../src/jobs';
 import { Store } from '../src/store';
@@ -105,20 +106,22 @@ class FakeBunny {
   }
 }
 
-function setup(overrides: Partial<AppConfig> = {}): { config: AppConfig; store: Store; fake: FakeBunny; service: JobService } {
+function setup(overrides: Partial<AppConfig> = {}): { config: AppConfig; store: Store; fake: FakeBunny; service: JobService; catalog: Catalog } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bunny-jobs-'));
   const config = testConfig(dir, overrides);
   fs.mkdirSync(config.uploadsDir, { recursive: true });
   const store = new Store(config);
   store.updateSettings({ perAccountConcurrency: 10, maxAccounts: 30 });
   const fake = new FakeBunny();
+  const catalog = new Catalog(config);
   const service = new JobService({
     store,
     config,
     clientFactory: () => fake as unknown as BunnyClient,
+    catalog,
     ...testStreamDeps(dir),
   });
-  return { config, store, fake, service };
+  return { config, store, fake, service, catalog };
 }
 
 test('a file job flows queued → encoding → ready and cleans up its temp file', async () => {
@@ -141,6 +144,30 @@ test('a file job flows queued → encoding → ready and cleans up its temp file
   assert.equal(store.job(job.id)?.status, 'ready');
   assert.equal(store.job(job.id)?.progress, 100);
   assert.equal(fs.existsSync(clip), false);
+});
+
+test('a published job is written to the permanent catalogue when it turns ready', async () => {
+  const { store, fake, service, catalog } = setup();
+  store.addAccount({ name: 'a', libraryId: '1', apiKeyEnc: 'x' });
+  const job = service.createUrlJob({ kind: 'movie', tmdbId: 27205, title: 'Inception', year: '2010' }, 'https://example.com/inception.mp4');
+
+  service.tickNow();
+  await waitFor(() => store.job(job.id)?.status === 'encoding', 'the fetch to complete');
+  assert.equal(catalog.size, 0, 'nothing is recorded until Bunny has actually finished');
+
+  for (const guid of fake.created) fake.statuses.set(guid, 4);
+  await service.pollNow();
+  assert.equal(store.job(job.id)?.status, 'ready');
+
+  const entry = catalog.get('movie:27205');
+  assert.ok(entry, 'the published movie has a catalogue record');
+  assert.equal(entry?.title, 'Inception');
+  assert.equal(entry?.year, '2010');
+  assert.equal(entry?.videoId, store.job(job.id)?.bunnyVideoId);
+  assert.equal(entry?.accountName, 'a');
+  assert.equal(entry?.libraryId, '1');
+  assert.equal(entry?.jobId, job.id);
+  assert.equal(entry?.publishes, 1);
 });
 
 test('a remote-URL job asks Bunny to fetch and never touches disk', async () => {
@@ -331,4 +358,27 @@ test('a failed upload in put mode still discards its temp file', async () => {
 
   const retried = service.retry(job.id);
   assert.equal(retried?.bunnyVideoId, undefined, 'a put-mode retry starts a new video object');
+});
+
+test('a video is named by its TMDB id, so one library stays joinable', async () => {
+  const { store, fake, service } = setup();
+  store.addAccount({ name: 'a', libraryId: '1', apiKeyEnc: 'x' });
+
+  // Bunny creates the video for a fetch itself, so the title it was given is
+  // observable in the fake library.
+  const movie = service.createUrlJob({ kind: 'movie', tmdbId: 27205, title: 'Inception', year: '2010' }, 'https://example.com/inception.mp4');
+  service.tickNow();
+  await waitFor(() => store.job(movie.id)?.status === 'encoding', 'the movie fetch to complete');
+  assert.equal(fake.library[0]?.title, 'tmdb:27205');
+
+  const episode = service.createUrlJob(
+    { kind: 'episode', tmdbId: 1396, title: 'Breaking Bad', season: 1, episode: 2, episodeTitle: 'Pilot' },
+    'https://example.com/bb.mp4',
+  );
+  service.tickNow();
+  await waitFor(() => store.job(episode.id)?.status === 'encoding', 'the episode fetch to complete');
+  assert.equal(fake.library[1]?.title, 'tv:1396:S01E02');
+  // The readable title still travels with the job — only the library name is an id.
+  assert.equal(store.job(episode.id)?.target.title, 'Breaking Bad');
+  assert.equal(store.job(episode.id)?.target.episodeTitle, 'Pilot');
 });
