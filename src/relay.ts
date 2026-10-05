@@ -225,6 +225,10 @@ export class RelayHub {
     const end = range?.end ?? total;
     res.statusCode = range ? 206 : 200;
     res.setHeader('Content-Type', entry.contentType);
+    // A CDN sits in front of this when the dashboard is its own tunnel (a Magic
+    // Containers endpoint, say), and a file that is still being written must not
+    // be cached: the truncated copy would be served to Bunny forever after.
+    res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Content-Length', String(Math.max(0, end - start)));
     if (range) res.setHeader('Content-Range', `bytes ${start}-${end - 1}/${total}`);

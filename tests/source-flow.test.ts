@@ -259,6 +259,7 @@ test('a relay serves the bytes that exist, not the sizes the playlist promised',
     // The whole-file path (a direct source) is only as long as what was downloaded.
     const file = await fetch(`${server.url}/relay/${token}/stream.ts`);
     assert.equal(Number(file.headers.get('content-length')), first.length + second.length);
+    assert.equal(file.headers.get('cache-control'), 'no-store', 'a CDN in front must not cache a file that is still being written');
     assert.ok(Buffer.from(await file.arrayBuffer()).equals(Buffer.concat([first, second])));
 
     relay.release(token);
