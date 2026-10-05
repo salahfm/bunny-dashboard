@@ -360,7 +360,26 @@ async function fetchInitBuffer(initUrl: string, options: FetchOptions): Promise<
   return Buffer.from(await response.arrayBuffer());
 }
 
-/** Content-Length of every segment, so an uploader can declare a total upfront. */
+/** Total length of one URL, asked for with a one-byte range. */
+async function probeLength(url: string, options: FetchOptions): Promise<number | undefined> {
+  try {
+    const response = await fetchWithTimeout(url, { ...options, headers: { ...(options.headers ?? {}), Range: 'bytes=0-0' } });
+    const range = response.headers.get('content-range');
+    const length = range ? Number(range.split('/')[1]) : Number(response.headers.get('content-length') ?? 0);
+    return Number.isFinite(length) && length > 0 ? length : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Content-Length of every segment, so an uploader can declare a total upfront.
+ *
+ * The init segment counts: an fMP4 playlist's segments share one, the downloader
+ * prepends it to the first, and its bytes end up in the published file. Leaving
+ * them out made every such download look a little longer than its playlists
+ * promised, which is a size the uploader can never match.
+ */
 export async function measureSegments(
   segments: HlsSegment[],
   options: FetchOptions & { concurrency?: number; onProgress?: (done: number, total: number) => void } = {},
@@ -378,14 +397,7 @@ export async function measureSegments(
       if (segment.declaredBytes !== undefined) {
         sizes[index] = segment.declaredBytes;
       } else {
-        try {
-          const response = await fetchWithTimeout(segment.url, { ...options, headers: { ...(options.headers ?? {}), Range: 'bytes=0-0' } });
-          const range = response.headers.get('content-range');
-          const length = range ? Number(range.split('/')[1]) : Number(response.headers.get('content-length') ?? 0);
-          sizes[index] = Number.isFinite(length) && length > 0 ? length : undefined;
-        } catch {
-          sizes[index] = undefined;
-        }
+        sizes[index] = await probeLength(segment.url, options);
       }
       done += 1;
       options.onProgress?.(done, segments.length);
@@ -393,6 +405,12 @@ export async function measureSegments(
   };
 
   await Promise.all(Array.from({ length: Math.min(concurrency, Math.max(1, segments.length)) }, worker));
+
+  // Only the first segment carries the init bytes (the downloader prepends them
+  // there and nowhere else), so that is the only size the init adds to.
+  const initBytes = segments[0]?.initUrl ? await probeLength(segments[0].initUrl, options) : undefined;
+  if (initBytes !== undefined && sizes[0] !== undefined) sizes[0] += initBytes;
+
   const unknown = sizes.filter((size) => size === undefined).length;
   if (unknown > 0) return { bytes: undefined, sizes, measured: sizes.length - unknown, unknown };
   const bytes = sizes.reduce<number>((sum, size) => sum + (size ?? 0), 0);

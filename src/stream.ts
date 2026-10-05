@@ -497,12 +497,21 @@ export async function runStreamJob(
       // A source that delivered less than its playlists promised would leave
       // Bunny with a truncated file under a length it can never fulfil — and
       // say only "upload failed" afterwards. Refuse it here, with numbers.
-      if (!encrypted && spool.bytes !== probe.totalBytes) {
+      // More than promised is not a failure: a CDN rounds its ranged totals and
+      // a playlist can under-state a segment. The file is complete, so it is
+      // published at the length it really has (the relay serves real spans).
+      if (!encrypted && spool.bytes < probe.totalBytes) {
         throw new Error(
           `the source delivered ${spool.bytes} of the ${probe.totalBytes} bytes its playlists declared — refusing to publish an incomplete file`,
         );
       }
     })();
+    // Nothing awaits this until the transport is decided, and that decision can
+    // take a while (Bunny's own fetch, then the video it created). A download
+    // that fails in that window would be an unhandled rejection — which Node
+    // ends the process over, rather than failing the job. The later `await` and
+    // `allSettled` still see this rejection.
+    void download.catch(() => undefined);
 
     // 4. Bunny takes it from here when the tunnel is up; otherwise we upload it.
     const publicBase = await deps.tunnel.ensure();

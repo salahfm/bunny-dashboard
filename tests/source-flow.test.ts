@@ -40,7 +40,9 @@ interface Origin {
 }
 
 /** An origin CDN: master playlist, one media playlist, ranged segment responses. */
-async function startOrigin(options: { delayMs?: number; includeInit?: boolean } = {}): Promise<Origin> {
+async function startOrigin(
+  options: { delayMs?: number; includeInit?: boolean; overdeliver?: number; shortfall?: number } = {},
+): Promise<Origin> {
   const delayMs = options.delayMs ?? 0;
   const init = Buffer.from('INITSEGMENT');
   const media = [
@@ -69,18 +71,28 @@ async function startOrigin(options: { delayMs?: number; includeInit?: boolean } 
     '',
   ].join('\n');
 
-  const expected = Buffer.concat([...(options.includeInit ? [init] : []), ...SEGMENT_BYTES.map((_, index) => segmentBuffer(index))]);
+  // `overdeliver`/`shortfall` make what a full response carries disagree with
+  // what the sizing step is told: the ranged answer keeps declaring the
+  // playlist's size while the body is longer (a rounded Content-Range) or
+  // shorter (a truncated transfer).
+  const servedSegment = (index: number): Buffer => {
+    const body = segmentBuffer(index);
+    if (options.overdeliver) return Buffer.concat([body, Buffer.alloc(options.overdeliver, 0xee)]);
+    if (options.shortfall) return body.subarray(0, Math.max(0, body.length - options.shortfall));
+    return body;
+  };
+  const expected = Buffer.concat([...(options.includeInit ? [init] : []), ...SEGMENT_BYTES.map((_, index) => servedSegment(index))]);
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1');
-    const send = (body: Buffer, type: string) => {
+    const send = (body: Buffer, type: string, declaredTotal = body.length) => {
       const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range ?? '');
       if (range) {
         const start = range[1] ? Number(range[1]) : 0;
         const end = range[2] ? Math.min(Number(range[2]) + 1, body.length) : body.length;
         res.writeHead(206, {
           'Content-Type': type,
-          'Content-Range': `bytes ${start}-${end - 1}/${body.length}`,
+          'Content-Range': `bytes ${start}-${end - 1}/${declaredTotal}`,
           'Content-Length': String(end - start),
         });
         res.end(body.subarray(start, end));
@@ -99,7 +111,10 @@ async function startOrigin(options: { delayMs?: number; includeInit?: boolean } 
       return send(init, 'video/mp4');
     }
     const segment = /^\/v(?:1080|720)\/seg(\d)\.ts$/.exec(url.pathname);
-    if (segment) return delay(() => send(segmentBuffer(Number(segment[1])), 'video/mp2t'));
+    if (segment) {
+      const index = Number(segment[1]);
+      return delay(() => send(servedSegment(index), 'video/mp2t', SEGMENT_BYTES[index] ?? 1_000));
+    }
     res.writeHead(404).end('nope');
   });
 
@@ -487,5 +502,148 @@ test('without a tunnel the dashboard uploads the bytes itself, as they arrive', 
   } finally {
     await origin.close();
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/** Bunny's fetching half: walks the relay's HLS ladder and records the bytes. */
+function pullingBunny(pulls: Buffer[]): BunnyClient {
+  return {
+    async fetchFromUrl(url: string) {
+      const master = await fetch(url);
+      assert.equal(master.status, 200);
+      const playlistPath = (await master.text()).split('\n').find((line) => line.startsWith('playlist'));
+      assert.ok(playlistPath, 'the master playlist must point at a media playlist');
+      const playlistUrl = new URL(playlistPath, url);
+      const playlist = await fetch(playlistUrl);
+      assert.equal(playlist.status, 200);
+      const parts: Buffer[] = [];
+      for (const line of (await playlist.text()).split('\n').filter((entry) => entry.startsWith('seg/'))) {
+        const response = await fetch(new URL(line, playlistUrl));
+        assert.equal(response.status, 200);
+        parts.push(Buffer.from(await response.arrayBuffer()));
+      }
+      pulls.push(Buffer.concat(parts));
+      return { success: true, statusCode: 200 };
+    },
+    async uploadVideoResumable(): Promise<never> {
+      throw new Error('the tunnel transport must not fall back to an upload');
+    },
+  } as unknown as BunnyClient;
+}
+
+/** One stream job against a local tunnel, with the relay a fake Bunny pulls from. */
+async function startTunnelJob(
+  id: string,
+  title: string,
+  origin: Origin,
+): Promise<{ dir: string; store: Store; relay: RelayHub; pulls: Buffer[]; deps: Parameters<typeof runStreamJob>[1]; target: Parameters<typeof runStreamJob>[3]; close(): Promise<void> }> {
+  const dir = tempDir();
+  const config = testConfig(dir, { streamConcurrency: 2 });
+  const store = new Store(config);
+  const relay = new RelayHub();
+  const relayServer = await startRelayServer(relay);
+  const tunnel = new TunnelManager({ root: dir, port: 0, enabled: true, allowDownload: false, externalUrl: relayServer.url });
+  const pulls: Buffer[] = [];
+
+  store.addJob({
+    id,
+    target: { kind: 'episode', tmdbId: 27205, title },
+    source: { kind: 'stream', mode: 'source', name: 'pasted.m3u8', input: origin.masterUrl },
+    status: 'uploading',
+    progress: 0,
+    polls: 0,
+    attempts: 1,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
+
+  return {
+    dir,
+    store,
+    relay,
+    pulls,
+    deps: { config, store, relay, tunnel, log: () => undefined },
+    target: {
+      title,
+      client: pullingBunny(pulls),
+      ensureVideo: async () => {
+        throw new Error('a Bunny-side fetch creates its own video object');
+      },
+      adoptFetchedVideo: async () => 'bunny-made-this',
+    },
+    async close() {
+      relay.release(store.job(id)?.relayToken);
+      await relayServer.close();
+      await origin.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+test('an fMP4 source publishes the whole file, init segment included', async () => {
+  // The production shape of this failure (Lanterns S01E01): an #EXT-X-MAP
+  // playlist whose init segment is prepended to segment 0. Those bytes are part
+  // of the published file, but the sizing step left them out of what it
+  // declared — so a complete download was longer than its playlists promised and
+  // was refused as an incomplete file.
+  const origin = await startOrigin({ delayMs: 20, includeInit: true });
+  const rig = await startTunnelJob('job-init', 'Lanterns S01E01', origin);
+  try {
+    const result = await runStreamJob(
+      'job-init',
+      rig.deps,
+      { update: (patch) => void rig.store.updateJob('job-init', patch), isRunning: () => true },
+      rig.target,
+    );
+    assert.equal(result.transport, 'tunnel');
+    assert.equal(result.bytes, origin.expected.length, 'the whole file is published, init included');
+    assert.equal(rig.store.job('job-init')?.totalBytes, origin.expected.length, 'the declared total counts the init segment');
+    assert.equal(rig.pulls.length, 1);
+    assert.ok(rig.pulls[0]?.equals(origin.expected), 'Bunny must pull the init segment and every media segment');
+  } finally {
+    await rig.close();
+  }
+});
+
+test('a source that delivers more than its playlists declared still publishes, at its real length', async () => {
+  // A CDN that rounds its ranged totals: the sizing step is told 40,000 bytes
+  // while the full response then carries 1,210 more. The file is complete, so it
+  // must be published at the length it really has, not refused.
+  const origin = await startOrigin({ delayMs: 20, overdeliver: 1_210 });
+  const rig = await startTunnelJob('job-over', 'Lanterns S01E03', origin);
+  try {
+    const result = await runStreamJob(
+      'job-over',
+      rig.deps,
+      { update: (patch) => void rig.store.updateJob('job-over', patch), isRunning: () => true },
+      rig.target,
+    );
+    assert.equal(result.transport, 'tunnel');
+    assert.equal(result.bytes, origin.expected.length, 'the real file is what gets published');
+    assert.ok(result.bytes > (rig.store.job('job-over')?.totalBytes ?? 0), 'this source really did over-deliver');
+    assert.ok(rig.pulls[0]?.equals(origin.expected), 'Bunny must receive every byte that was downloaded');
+  } finally {
+    await rig.close();
+  }
+});
+
+test('a short delivery is still refused, with the numbers', async () => {
+  // The guard exists for this: every segment arrives 500 bytes short of what its
+  // ranged total promised, so publishing would leave Bunny with a truncated file
+  // under an Upload-Length it can never fulfil.
+  const origin = await startOrigin({ delayMs: 20, shortfall: 500 });
+  const rig = await startTunnelJob('job-short', 'Lanterns S01E02', origin);
+  try {
+    await assert.rejects(
+      runStreamJob(
+        'job-short',
+        rig.deps,
+        { update: (patch) => void rig.store.updateJob('job-short', patch), isRunning: () => true },
+        rig.target,
+      ),
+      /refusing to publish an incomplete file/,
+    );
+  } finally {
+    await rig.close();
   }
 });
