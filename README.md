@@ -55,6 +55,17 @@ Paste that URL into **Source URL** and press **Download & upload**.
   TMDB link; pick a movie, or a show → season → episode. The selected target then
   has four actions: *Direct scraping → upload*, *Preview sources*, *Bunny fetch*
   (a direct URL Bunny pulls itself) and *Upload file*.
+- **Add a whole list**: paste one entry per line — a title (`Inception (2010)`),
+  a TMDB id (`27205`), an IMDb id (`tt1375666`), a TMDB link, or a show. Movies and
+  shows can be mixed, `#` comments a line out, and anything already in the queue is
+  skipped rather than queued twice, so re-pasting a list is safe. A show expands to
+  every episode of every season; `Breaking Bad S03` pins one season and
+  `Breaking Bad S02E05` a single episode. One click queues the lot (up to
+  `DEFAULT_MAX_BULK_JOBS = 200` per paste) and the report says what was created and
+  what was skipped, and why.
+- **Whole series / one season**: with a show selected, *Queue this season* queues
+  every episode of the season the picker has open, and *Queue whole series* every
+  episode of every season — one job per episode, no further clicking.
 - **Source URL**: paste one URL and click once — the backend resolves it,
   downloads the TS and hands it to Bunny. The same tab owns the **tunnel** panel
   (state, public URL, start/stop, cloudflared log).
@@ -230,6 +241,9 @@ How it behaves:
 | `POST` | `/api/jobs/upload?meta=<json>&name=` | raw binary body → job |
 | `POST` | `/api/jobs/remote` | `{ target, url }` → Bunny fetch job |
 | `POST` | `/api/jobs/source` | `{ target?, url?, title?, only?, minHeight? }` → the dashboard downloads it (`url` empty ⇒ scrape the target) |
+| `POST` | `/api/jobs/bulk` | `{ text \| lines[], expandSeries?, seasons?, maxJobs?, skipQueued?, only?, minHeight? }` → one job per movie, every episode per show; answers `{ created, skipped, counts, truncated }` |
+| `POST` | `/api/jobs/series` | `{ target: { tmdbId, title? }, seasons?, maxJobs?, only?, minHeight? }` → every episode of the show (`seasons` narrows it) |
+| `POST` | `/api/jobs/retry-failed` | retry every failed job in one call |
 | `GET` | `/api/sources/providers` | the scraping hosts + default tier floor |
 | `POST` | `/api/sources/preview` | `{ target, only?, minHeight? }` → what a scrape would pick |
 | `GET` | `/api/tunnel` | tunnel state + recent cloudflared log |

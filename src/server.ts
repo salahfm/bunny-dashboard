@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { authGate } from './auth';
+import { DEFAULT_MAX_BULK_JOBS, planBulk, planShow, queuedKeys, withoutQueued, type BulkOptions, type BulkPlan } from './bulk';
 import { BunnyClient, BunnyError } from './bunny';
 import { MAX_UPLOAD_BYTES, loadConfig } from './config';
 import { decryptSecret, encryptSecret, loadOrCreateSecret, maskSecret } from './crypto';
@@ -607,6 +608,112 @@ app.post('/api/jobs/source', (req, res) => {
     name,
   });
   res.status(201).json({ job: jobView(job) });
+});
+
+/* ------------------------------- bulk ------------------------------- */
+
+function bulkLines(body: Record<string, unknown>): string[] {
+  const source = Array.isArray(body.lines)
+    ? body.lines.filter((line): line is string => typeof line === 'string')
+    : typeof body.text === 'string'
+      ? body.text.split(/\r?\n/)
+      : [];
+  return source.map((line) => line.trim()).filter((line) => Boolean(line) && !line.startsWith('#'));
+}
+
+function bulkOptions(body: Record<string, unknown>): BulkOptions {
+  const seasons = Array.isArray(body.seasons)
+    ? body.seasons.map((value) => Math.floor(Number(value))).filter((value) => Number.isFinite(value) && value > 0)
+    : [];
+  const maxJobs = Number(body.maxJobs);
+  return {
+    expandSeries: body.expandSeries !== false,
+    ...(seasons.length ? { seasons } : {}),
+    ...(Number.isFinite(maxJobs) && maxJobs > 0 ? { maxJobs: Math.floor(maxJobs) } : {}),
+  };
+}
+
+/**
+ * Creates the planned jobs, minus the targets that are already in the queue.
+ *
+ * One call can be hundreds of jobs (a whole series), so the report is what the
+ * caller gets back: how many were created, which lines were skipped and why, and
+ * whether the cap stopped the list short. Failed and cancelled jobs do not block
+ * a title — queueing it again is how a batch is retried.
+ */
+function queuePlan(plan: BulkPlan, body: Record<string, unknown>) {
+  const declared = Number(body.minHeight ?? DEFAULT_MIN_HEIGHT);
+  const minHeight = Number.isFinite(declared) && declared > 0 ? declared : DEFAULT_MIN_HEIGHT;
+  const only = Array.isArray(body.only) ? body.only.filter((id): id is string => typeof id === 'string') : [];
+  const { fresh, skipped: duplicates } =
+    body.skipQueued === false
+      ? { fresh: plan.queued, skipped: [] as Array<{ line: string; reason: string }> }
+      : withoutQueued(plan.queued, queuedKeys(store.jobs));
+  const created: Job[] = [];
+  const skipped = [...plan.skipped, ...duplicates];
+  let movies = 0;
+  let episodes = 0;
+
+  for (const entry of fresh) {
+    created.push(
+      jobs.createStreamJob(entry.target, {
+        mode: 'scrape',
+        minHeight,
+        ...(only.length ? { only } : {}),
+      }),
+    );
+    if (entry.target.kind === 'movie') movies += 1;
+    else episodes += 1;
+  }
+
+  return {
+    created: created.map(jobView),
+    skipped: skipped.slice(0, 100),
+    counts: { movies, episodes },
+    truncated: plan.truncated,
+  };
+}
+
+/**
+ * One call, one list: names, TMDB ids, IMDb ids or themoviedb.org links, one per
+ * line, movies and shows mixed. Shows become every episode — or the season a
+ * line pins (`Breaking Bad S03`) or the single episode it names (`Show S02E05`).
+ */
+app.post('/api/jobs/bulk', handle(async (req, res) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const lines = bulkLines(body);
+  if (!lines.length) return void res.status(400).json({ error: 'paste at least one title, id or link' });
+  const plan = await planBulk(tmdbClient(), lines, bulkOptions(body));
+  res.status(201).json(queuePlan(plan, body));
+}));
+
+/** Every episode of one show — the season the UI has open, or the whole run. */
+app.post('/api/jobs/series', handle(async (req, res) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const raw = (body.target ?? {}) as Record<string, unknown>;
+  const tmdbId = Math.floor(Number(raw.tmdbId));
+  if (!Number.isFinite(tmdbId) || tmdbId <= 0) return void res.status(400).json({ error: "the show's TMDB id is required" });
+  const options = bulkOptions(body);
+  const targets = await planShow(tmdbClient(), tmdbId, options.seasons?.length ? { seasons: options.seasons } : {});
+  const label = typeof raw.title === 'string' && raw.title.trim() ? raw.title.trim() : `show ${tmdbId}`;
+  const maxJobs = options.maxJobs ?? DEFAULT_MAX_BULK_JOBS;
+  const plan: BulkPlan = {
+    queued: targets.slice(0, maxJobs).map((target) => ({ line: label, target })),
+    skipped: [],
+    truncated: targets.length > maxJobs,
+  };
+  res.status(201).json(queuePlan(plan, body));
+}));
+
+/** Retry every failed job in one click — what a bad night of sources needs. */
+app.post('/api/jobs/retry-failed', (_req, res) => {
+  const failed = [...store.jobs].filter((job) => job.status === 'failed');
+  const retried: Job[] = [];
+  for (const job of failed) {
+    const next = jobs.retry(job.id);
+    if (next) retried.push(next);
+  }
+  res.json({ retried: retried.length, jobs: retried.map(jobView) });
 });
 
 app.get('/api/jobs', (req, res) => {

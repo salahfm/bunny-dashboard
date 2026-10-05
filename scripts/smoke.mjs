@@ -50,6 +50,18 @@ async function request(method, path, body, contentType) {
   return { status: response.status, json, text };
 }
 
+/** Deletes jobs, cancelling any that the queue has already picked up. */
+async function dropJobs(ids) {
+  for (const id of ids ?? []) {
+    if (!id) continue;
+    const removed = await request('DELETE', `/api/jobs/${id}`);
+    if (removed.status !== 200) {
+      await request('POST', `/api/jobs/${id}/cancel`, {});
+      await request('DELETE', `/api/jobs/${id}`);
+    }
+  }
+}
+
 /* health & settings -------------------------------------------------- */
 let result = await request('GET', '/api/health');
 check('health answers and reports mock mode', result.status === 200 && result.json?.mock === true, `status ${result.status}`);
@@ -63,6 +75,77 @@ check(
 result = await request('GET', '/api/settings');
 check('settings expose the hard caps', result.json?.limits?.maxAccounts === 30 && result.json?.limits?.perAccountConcurrency === 10);
 check('settings expose the upload mode', result.json?.uploadMode === 'tus' && result.json?.tusChunkBytes === 8 * 1024 * 1024);
+
+/* bulk queuing -------------------------------------------------------- */
+// These run before any account exists, and that is the point: with nothing to
+// run on, the jobs stay queued, so the checks never reach a real streaming host.
+const bulkJobIds = [];
+const takeBulk = (body) => {
+  for (const job of body?.created ?? []) bulkJobIds.push(job.id);
+  return body;
+};
+
+result = await request('POST', '/api/jobs/bulk', {
+  text: ['# a list may carry comments', 'Inception (2010)', '', 'Breaking Bad S03'].join('\n'),
+});
+let bulk = takeBulk(result.json);
+check(
+  'a pasted list queues the movie and one season of the show',
+  result.status === 201 && bulk?.created?.length === 14 && bulk?.counts?.movies === 1 && bulk?.counts?.episodes === 13,
+  `status ${result.status}, created ${bulk?.created?.length}, counts ${JSON.stringify(bulk?.counts)}`,
+);
+const bulkEpisodes = (bulk?.created ?? []).filter((job) => job.target.kind === 'episode');
+check(
+  'the episodes match the season TMDB lists, in order',
+  bulkEpisodes.length === 13 &&
+    bulkEpisodes.every((job) => job.target.title === 'Breaking Bad' && job.target.season === 3) &&
+    new Set(bulkEpisodes.map((job) => job.target.episode)).size === 13,
+  `${bulkEpisodes.length} episode(s), e.g. ${bulkEpisodes[0]?.target?.episode}`,
+);
+check(
+  'the bulk jobs are scrape jobs, ready to run',
+  (bulk?.created ?? []).every((job) => job.source?.kind === 'stream' && job.source?.mode === 'scrape'),
+  JSON.stringify(bulk?.created?.[0]?.source ?? null),
+);
+
+result = await request('POST', '/api/jobs/bulk', { text: 'Inception (2010)\nBreaking Bad S03' });
+bulk = takeBulk(result.json);
+check(
+  'pasting the same list again queues nothing new',
+  result.status === 201 && (bulk?.created ?? []).length === 0 && (bulk?.skipped ?? []).every((entry) => entry.reason === 'already in the queue'),
+  `created ${(bulk?.created ?? []).length}, skipped ${(bulk?.skipped ?? []).length}`,
+);
+
+result = await request('POST', '/api/jobs/series', { target: { tmdbId: 1396, title: 'Breaking Bad' } });
+bulk = takeBulk(result.json);
+const seriesSeasons = [...new Set((bulk?.created ?? []).map((job) => job.target.season))].sort();
+check(
+  'the whole series is one call: all 62 episodes, minus the 13 already queued',
+  result.status === 201 &&
+    (bulk?.created ?? []).length === 49 &&
+    (bulk?.skipped ?? []).length === 13 &&
+    seriesSeasons.join(',') === '1,2,4,5',
+  `created ${(bulk?.created ?? []).length}, skipped ${(bulk?.skipped ?? []).length}, seasons ${seriesSeasons.join('+')}`,
+);
+
+result = await request('POST', '/api/jobs/series', { target: { tmdbId: 66732, title: 'Stranger Things' }, seasons: [2] });
+bulk = takeBulk(result.json);
+check(
+  'a series call can be narrowed to one season',
+  result.status === 201 && (bulk?.created ?? []).length === 9 && (bulk?.created ?? []).every((job) => job.target.season === 2),
+  `created ${(bulk?.created ?? []).length}`,
+);
+
+result = await request('POST', '/api/jobs/bulk', { text: 'tt9999999\nInception' });
+bulk = takeBulk(result.json);
+check(
+  'a line with nothing behind it is reported, the rest still queues',
+  result.status === 201 && (bulk?.created ?? []).length === 0 && (bulk?.skipped ?? [])[0]?.reason === 'TMDB has nothing for tt9999999',
+  JSON.stringify(bulk?.skipped ?? null),
+);
+
+await dropJobs(bulkJobIds);
+check('the bulk jobs were cleaned up again', bulkJobIds.length > 0, `${bulkJobIds.length} job(s)`);
 
 /* accounts ----------------------------------------------------------- */
 result = await request('POST', '/api/accounts', { name: 'smoke-library', libraryId: '12345', apiKey: 'mock-key-1234', pullZoneHost: 'vz-mock.b-cdn.net' });
@@ -288,10 +371,17 @@ check(
 await request('PUT', '/api/settings', { watchDir: '', watchEnabled: false });
 fs.rmSync(watchRoot, { recursive: true, force: true });
 
+/* retry-all-failed ------------------------------------------------------ */
+const failedBefore = (await request('GET', '/api/jobs?status=failed&limit=500')).json?.jobs?.length ?? 0;
+result = await request('POST', '/api/jobs/retry-failed', {});
+check(
+  'retry-all answers with exactly the failed jobs it picked up',
+  result.status === 200 && result.json?.retried === failedBefore && (result.json?.jobs ?? []).length === failedBefore,
+  `failed ${failedBefore}, retried ${result.json?.retried}`,
+);
+
 /* cleanup -------------------------------------------------------------- */
-for (const jobId of [...jobIds, uploadJobId, watchedJobId]) {
-  if (jobId) await request('DELETE', `/api/jobs/${jobId}`);
-}
+await dropJobs([...jobIds, uploadJobId, watchedJobId, ...(result.json?.jobs ?? []).map((job) => job.id)]);
 await request('DELETE', `/api/accounts/${accountId}`);
 origin.close();
 

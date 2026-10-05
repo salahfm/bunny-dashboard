@@ -189,6 +189,7 @@
     const episodeList = clear($('#episode-list'));
     seasonPicker.classList.add('hidden');
     $('#preview-output').classList.add('hidden');
+    $('#series-buttons').classList.toggle('hidden', result.mediaType !== 'tv');
 
     if (result.mediaType !== 'tv') {
       state.episode = null;
@@ -362,6 +363,76 @@
       toast(describeError(error), 'bad');
     }
   });
+
+  /* ------------------------------------------------------------ bulk add */
+
+  function bulkReport(data) {
+    const created = data.created ?? [];
+    const skipped = data.skipped ?? [];
+    const lines = [`queued ${created.length} job(s) — ${data.counts?.movies ?? 0} movie(s), ${data.counts?.episodes ?? 0} episode(s)`];
+    if (data.truncated) lines.push('the list hit the per-paste cap — the rest was left alone');
+    for (const skip of skipped.slice(0, 25)) lines.push(`  skipped “${skip.line}” — ${skip.reason}`);
+    if (skipped.length > 25) lines.push(`  … and ${skipped.length - 25} more skipped`);
+    return lines.join('\n');
+  }
+
+  $('#bulk-add').addEventListener('click', async () => {
+    const text = $('#bulk-input').value.trim();
+    if (!text) {
+      toast('Paste a list first — one title, id or link per line.', 'bad');
+      return;
+    }
+    const output = $('#bulk-output');
+    output.classList.remove('hidden');
+    output.textContent = 'resolving the list on TMDB…';
+    try {
+      const data = await api('POST', '/api/jobs/bulk', {
+        text,
+        minHeight: Number($('#bulk-min-height').value) || 0,
+        expandSeries: $('#bulk-expand').checked,
+        ...(state.only.size ? { only: [...state.only] } : {}),
+      });
+      output.textContent = bulkReport(data);
+      const created = (data.created ?? []).length;
+      toast(created ? `queued ${created} job(s)` : 'nothing new to queue', created ? 'ok' : '');
+      if (created) showTab('queue');
+    } catch (error) {
+      output.textContent = describeError(error);
+      toast(describeError(error), 'bad');
+    }
+  });
+
+  async function queueSeries(scope) {
+    if (!state.target || state.target.mediaType !== 'tv') {
+      toast('Pick a TV show from the search results first.', 'bad');
+      return;
+    }
+    const seasonNumber = Number($('#season-select').value);
+    if (scope === 'season' && !Number.isFinite(seasonNumber)) {
+      toast('Pick a season first.', 'bad');
+      return;
+    }
+    try {
+      const data = await api('POST', '/api/jobs/series', {
+        target: {
+          tmdbId: state.target.tmdbId,
+          title: state.target.title,
+          ...(state.target.year ? { year: state.target.year } : {}),
+        },
+        ...(scope === 'season' ? { seasons: [seasonNumber] } : {}),
+        ...scrapeOptions(),
+      });
+      const created = (data.created ?? []).length;
+      const skipped = (data.skipped ?? []).length;
+      toast(`queued ${created} episode(s)${skipped ? ` — ${skipped} skipped (${data.skipped[0].reason})` : ''}`, 'ok');
+      showTab('queue');
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    }
+  }
+
+  $('#series-season-button').addEventListener('click', () => void queueSeries('season'));
+  $('#series-all-button').addEventListener('click', () => void queueSeries('all'));
 
   /* --------------------------------------------------------- source input */
 
@@ -590,6 +661,16 @@
   }
 
   $('#queue-filter').addEventListener('change', () => void refreshJobs());
+
+  $('#queue-retry-failed').addEventListener('click', async () => {
+    try {
+      const data = await api('POST', '/api/jobs/retry-failed', {});
+      toast(data.retried ? `retrying ${data.retried} failed job(s)` : 'no failed jobs', data.retried ? 'ok' : '');
+      await refreshJobs();
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    }
+  });
 
   /* ------------------------------------------------------------ accounts */
 

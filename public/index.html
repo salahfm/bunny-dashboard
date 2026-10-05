@@ -30,7 +30,38 @@
         <!-- ---------------------------------------------------------- titles -->
         <section class="panel is-active" id="tab-titles">
           <h1>Titles</h1>
-          <p class="muted">Search TMDB, pick a target, then publish it.</p>
+          <p class="muted">Search TMDB, pick a target, then publish it — or paste a whole list and let it run.</p>
+
+          <div class="box">
+            <div class="box-head">
+              <strong>Add a whole list</strong>
+              <span class="muted small">one paste, one click</span>
+            </div>
+            <p class="muted small">
+              One entry per line: <code>Inception (2010)</code>, a TMDB or IMDb id (<code>27205</code>,
+              <code>tt1375666</code>), a themoviedb.org link, or a show — <code>Breaking Bad</code> queues every
+              episode of every season, <code>Breaking Bad S03</code> one season, <code>Breaking Bad S02E05</code> a single
+              episode. Lines starting with <code>#</code> are ignored, and anything already in the queue is skipped.
+              Movies and shows can be mixed freely.
+            </p>
+            <textarea id="bulk-input" rows="5" placeholder="Inception (2010)&#10;The Matrix&#10;Breaking Bad&#10;https://www.themoviedb.org/tv/1396"></textarea>
+            <div class="row">
+              <label class="inline">
+                minimum tier
+                <select id="bulk-min-height">
+                  <option value="2160">4K</option>
+                  <option value="1440">2K / 1440p</option>
+                  <option value="1080" selected>1080p</option>
+                  <option value="720">720p</option>
+                  <option value="480">480p</option>
+                  <option value="0">whatever is available</option>
+                </select>
+              </label>
+              <label class="inline"><input id="bulk-expand" type="checkbox" checked /> expand shows into every episode</label>
+              <button id="bulk-add" class="primary">Add everything to the queue</button>
+            </div>
+            <pre id="bulk-output" class="output hidden"></pre>
+          </div>
 
           <div class="row">
             <input id="search-input" type="search" placeholder="title, TMDB id (27205) or IMDb id (tt1375666)" />
@@ -76,6 +107,11 @@
                 Upload file
                 <input id="file-input" type="file" />
               </label>
+            </div>
+            <div class="row hidden" id="series-buttons">
+              <button id="series-season-button" class="primary">Queue this season → every episode</button>
+              <button id="series-all-button">Queue whole series → every episode</button>
+              <span class="muted small">one job per episode, queued together</span>
             </div>
             <div class="row">
               <input id="remote-url" type="url" placeholder="https://… direct media URL for Bunny's own fetch" />
@@ -150,6 +186,7 @@
               <option value="cancelled">cancelled</option>
             </select>
             <label class="inline"><input id="queue-autorefresh" type="checkbox" checked /> refresh every 2 s</label>
+            <button id="queue-retry-failed">retry all failed</button>
             <span id="queue-summary" class="muted small"></span>
           </div>
           <table class="table" id="jobs-table">
