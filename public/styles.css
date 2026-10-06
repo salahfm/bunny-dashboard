@@ -210,6 +210,23 @@ input[type='search'] {
   flex: 1;
 }
 
+/* A file input is a button with a caption, not a text field. */
+input[type='file'] {
+  color: var(--text-dim);
+  font: inherit;
+  width: 100%;
+}
+
+input[type='file']::file-selector-button {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--line-strong);
+  padding: 6px 11px;
+  margin-right: 8px;
+  font: inherit;
+  cursor: pointer;
+}
+
 input:focus,
 select:focus,
 textarea:focus {
@@ -509,6 +526,12 @@ button.link {
   white-space: nowrap;
 }
 
+/* The library read-back keeps its verdict and its fix button in one cell, so a
+   narrow window never pushes the action out of reach. */
+.table td.actions .status {
+  margin-right: 8px;
+}
+
 .table td.actions button {
   padding: 3px 7px;
   font-size: 12px;
@@ -542,6 +565,22 @@ button.link {
 }
 
 .status.queued {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+
+/* The library read-back: in sync, drifted from the settings, or unreadable. */
+.status.in-sync {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.status.drifted {
+  color: var(--bad);
+  border-color: var(--bad);
+}
+
+.status.skipped {
   color: var(--warn);
   border-color: var(--warn);
 }

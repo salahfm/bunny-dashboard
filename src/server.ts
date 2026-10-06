@@ -14,6 +14,7 @@ import { SubtitleAutoRepair, SubtitleBackfill, missingTargets } from './backfill
 import { Autopilot, AutopilotError } from './autopilot';
 import { DEFAULT_MAX_BULK_JOBS, planBulk, planShow, queuedKeys, withoutQueued, type BulkOptions, type BulkPlan } from './bulk';
 import { BunnyClient, BunnyError } from './bunny';
+import { ALL_RESOLUTIONS, BunnyCoreClient, libraryDrift, type LibraryFinding } from './bunny-core';
 import { Catalog, type CatalogEntry } from './catalog';
 import { ArchiveCheckSchedule, CheckScheduleError } from './check-schedule';
 import { MAX_UPLOAD_BYTES, loadConfig } from './config';
@@ -26,11 +27,12 @@ import { configureScraper, providerCatalog, targetFromEmbedUrl } from './provide
 import { queueStats } from './queue';
 import { DEFAULT_PRESIGN_SECONDS, R2Client } from './r2';
 import { RelayHub } from './relay';
-import { Store, type Job, type JobChangeKind, type JobSource, type JobTarget } from './store';
+import { Store, type Account, type Job, type JobChangeKind, type JobSource, type JobTarget } from './store';
 import { TmdbClient, TmdbError, lookupTmdb } from './tmdb';
 import { DEEPL_WEB_ENDPOINT } from './translate';
 import { TunnelManager } from './tunnel';
 import { FolderWatcher } from './watch';
+import { WATERMARK_CORNERS, WatermarkError, WatermarkStore, watermarkPlacement } from './watermark';
 
 const config = loadConfig();
 const secret = loadOrCreateSecret(config.secretPath);
@@ -133,6 +135,186 @@ const r2 = config.r2
   : undefined;
 
 /**
+ * The watermark every account shares: one image, one placement, applied to each
+ * library this dashboard creates.
+ *
+ * It is read fresh on every use (an upload made a second ago is visible to the
+ * very next provision), and it is deliberately global — "the same position and
+ * height on all the accounts" is the setting, not a per-account one.
+ */
+const watermark = new WatermarkStore(config);
+
+/**
+ * The account-level client, built from an *account* API key.
+ *
+ * Kept apart from [clientForAccount] on purpose: that one is a Stream library
+ * key and talks to `video.bunnycdn.com`, this one manages the libraries
+ * themselves on `api.bunny.net`. Bunny refuses each key on the other's API.
+ */
+function coreClient(accountApiKey: string): BunnyCoreClient {
+  return new BunnyCoreClient({
+    apiKey: accountApiKey,
+    mock: config.mock,
+    timeoutMs: config.networkTimeoutMs,
+    retries: config.networkRetries,
+  });
+}
+
+/** The account API key stored for an account, if it has one. */
+function accountKeyOf(account: Account): string | undefined {
+  if (!account.accountApiKeyEnc) return undefined;
+  try {
+    return decryptSecret(secret, account.accountApiKeyEnc);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * What every library is supposed to hold, from the dashboard's own settings.
+ *
+ * Read fresh on every use, so a check run after an image upload or a placement
+ * change compares against the settings in force *now* rather than whatever was
+ * saved when the account was added.
+ */
+function libraryExpectation(): { resolutions: string[]; watermark: ReturnType<typeof watermarkPlacement>; expectImage: boolean } {
+  return {
+    resolutions: ALL_RESOLUTIONS,
+    watermark: watermarkPlacement(watermark.settings),
+    expectImage: Boolean(watermark.image()),
+  };
+}
+
+/** One account's read-back verdict. */
+interface LibraryCheckResult {
+  id: string;
+  name: string;
+  libraryId: string;
+  /** Whether Bunny answered at all — false for a refusal or no stored key. */
+  checked: boolean;
+  /** True only when the library was read *and* matched the settings. */
+  ok: boolean;
+  findings: LibraryFinding[];
+  error?: string;
+}
+
+/**
+ * Read every configured library back from bunny.net and compare it with what
+ * this dashboard pushes.
+ *
+ * Nothing else would notice a library drifting: the dashboard's own settings
+ * stay right while Bunny quietly keeps a narrower resolution ladder, a mark in
+ * some other corner from before the watermark existed, or an image that was
+ * replaced by hand. One library failing must not hide the rest, so the answer
+ * is a per-account report — and an account with no stored account key is
+ * reported as such rather than passed over.
+ */
+async function verifyLibraries(): Promise<{
+  results: LibraryCheckResult[];
+  total: number;
+  checked: number;
+  inSync: number;
+  drifted: number;
+  unreachable: number;
+  skipped: number;
+  expected: ReturnType<typeof libraryExpectation>;
+}> {
+  const expected = libraryExpectation();
+  const results: LibraryCheckResult[] = [];
+  for (const account of store.accounts) {
+    const base = { id: account.id, name: account.name, libraryId: account.libraryId };
+    const key = accountKeyOf(account);
+    if (!key) {
+      results.push({
+        ...base,
+        checked: false,
+        ok: false,
+        findings: [],
+        error: 'no account API key is stored for this account — add one (Dashboard → profile → API key) and try again',
+      });
+      continue;
+    }
+    try {
+      const library = await coreClient(key).getVideoLibrary(account.libraryId);
+      const findings = libraryDrift(library, expected);
+      results.push({ ...base, checked: true, ok: findings.length === 0, findings });
+    } catch (error) {
+      results.push({ ...base, checked: false, ok: false, findings: [], error: describeError(error) });
+    }
+  }
+  return {
+    results,
+    total: results.length,
+    checked: results.filter((result) => result.checked).length,
+    inSync: results.filter((result) => result.checked && result.ok).length,
+    drifted: results.filter((result) => result.checked && !result.ok).length,
+    unreachable: results.filter((result) => !result.checked && Boolean(result.error) && !result.error?.startsWith('no account API key')).length,
+    skipped: results.filter((result) => !result.checked && result.error?.startsWith('no account API key')).length,
+    expected,
+  };
+}
+
+/**
+ * Put the shared watermark onto one account's library.
+ *
+ * One account failing must not hide the rest, so the outcome is reported per
+ * account rather than thrown: the dashboard shows which libraries took it and
+ * which need the account key adding first.
+ */
+async function applyWatermarkTo(account: Account): Promise<{
+  id: string;
+  name: string;
+  libraryId: string;
+  ok: boolean;
+  imageUploaded: boolean;
+  placement: ReturnType<typeof watermarkPlacement>;
+  error?: string;
+  note?: string;
+}> {
+  const placement = watermarkPlacement(watermark.settings);
+  const key = accountKeyOf(account);
+  if (!key) {
+    return {
+      id: account.id,
+      name: account.name,
+      libraryId: account.libraryId,
+      ok: false,
+      imageUploaded: false,
+      placement,
+      error: 'no account API key is stored for this account — add one (Dashboard → profile → API key) and try again',
+    };
+  }
+  const image = watermark.image();
+  try {
+    const imageUploaded = await coreClient(key).applyWatermark(
+      account.libraryId,
+      placement,
+      image?.bytes,
+      image?.contentType ?? 'image/png',
+    );
+    return {
+      id: account.id,
+      name: account.name,
+      libraryId: account.libraryId,
+      ok: true,
+      imageUploaded,
+      placement,
+      ...(imageUploaded ? {} : { note: 'no watermark image has been uploaded yet — the position and size are set, but nothing shows until one is' }),
+    };
+  } catch (error) {
+    return {
+      id: account.id,
+      name: account.name,
+      libraryId: account.libraryId,
+      ok: false,
+      imageUploaded: false,
+      placement,
+      error: describeError(error),
+    };
+  }
+}
+
+/**
  * The R2 archive: copy a finished title out of Bunny, verify it, then let Bunny
  * forget the video. `before` waits for the subtitle repair, because the archive
  * is the last thing that ever happens to a title and a caption upload that is
@@ -215,12 +397,21 @@ const watcher = new FolderWatcher({
 /* Views                                                               */
 /* ------------------------------------------------------------------ */
 
-function accountView(account: { id: string; name: string; libraryId: string; apiKeyEnc: string; pullZoneHost?: string; enabled: boolean; createdAt: string; updatedAt: string }) {
+function accountView(account: Account) {
   let masked: string | null = '••••';
   try {
     masked = maskSecret(decryptSecret(secret, account.apiKeyEnc));
   } catch {
     /* key cannot be read back; still show a mask */
+  }
+  let accountKeyMasked: string | null = null;
+  if (account.accountApiKeyEnc) {
+    accountKeyMasked = '••••';
+    try {
+      accountKeyMasked = maskSecret(decryptSecret(secret, account.accountApiKeyEnc));
+    } catch {
+      /* key cannot be read back; still show a mask */
+    }
   }
   return {
     id: account.id,
@@ -229,6 +420,9 @@ function accountView(account: { id: string; name: string; libraryId: string; api
     pullZoneHost: account.pullZoneHost ?? null,
     enabled: account.enabled,
     apiKeyMasked: masked,
+    // Whether this account can be re-watermarked without asking for the key again.
+    accountApiKeyMasked: accountKeyMasked,
+    hasAccountKey: Boolean(account.accountApiKeyEnc),
     createdAt: account.createdAt,
     updatedAt: account.updatedAt,
   };
@@ -323,6 +517,21 @@ function settingsView() {
         };
       })(),
     },
+    // The watermark every account shares: the placement in force, whether an
+    // image is stored, and the corners the dashboard may offer. The Settings tab
+    // reads /api/watermark for the full picture.
+    watermark: (() => {
+      const state = watermark.state();
+      return {
+        corner: state.settings.corner,
+        width: state.settings.width,
+        height: state.settings.height,
+        margin: state.settings.margin,
+        hasImage: state.hasImage,
+        bytes: state.bytes,
+        corners: WATERMARK_CORNERS,
+      };
+    })(),
     limits: { maxAccounts: 30, perAccountConcurrency: 10, maxUploadBytes: MAX_UPLOAD_BYTES },
     catalogEntries: catalog.size,
     catalogPath: catalog.path,
@@ -554,15 +763,23 @@ app.get('/api/accounts', (_req, res) => {
   });
 });
 
+/**
+ * Add an account from details that already exist.
+ *
+ * The Stream library ID and key are the minimum; an account API key is optional
+ * but worth giving, because it is what lets this library be re-watermarked
+ * later without pasting it again.
+ */
 app.post('/api/accounts', (req, res) => {
   const body = (req.body ?? {}) as Record<string, unknown>;
   const name = typeof body.name === 'string' ? body.name.trim() : '';
   const libraryId = typeof body.libraryId === 'string' ? body.libraryId.trim() : String(body.libraryId ?? '').trim();
   const apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
   const pullZoneHost = typeof body.pullZoneHost === 'string' ? body.pullZoneHost.trim() : '';
+  const accountApiKey = typeof body.accountApiKey === 'string' ? body.accountApiKey.trim() : '';
   if (!name) return void res.status(400).json({ error: 'give the account a name' });
-  if (!libraryId) return void res.status(400).json({ error: 'the Stream library ID is required' });
-  if (!apiKey) return void res.status(400).json({ error: 'the Stream library API key is required' });
+  if (!libraryId) return void res.status(400).json({ error: 'the Stream library ID is required — or use the account API key to create a library' });
+  if (!apiKey) return void res.status(400).json({ error: 'the Stream library API key is required — or use the account API key to create a library' });
   if (store.accounts.length >= store.settings.maxAccounts) {
     return void res.status(400).json({ error: `account limit reached (${store.settings.maxAccounts})` });
   }
@@ -570,19 +787,77 @@ app.post('/api/accounts', (req, res) => {
     name,
     libraryId,
     apiKeyEnc: encryptSecret(secret, apiKey),
+    ...(accountApiKey ? { accountApiKeyEnc: encryptSecret(secret, accountApiKey) } : {}),
     ...(pullZoneHost ? { pullZoneHost } : {}),
   });
   res.status(201).json({ account: accountView(account) });
 });
 
+/**
+ * Add an account from nothing but an account API key.
+ *
+ * This is the whole point of the account-level client: Bunny creates the video
+ * library, hands back the Stream key only it knows, and the library comes out
+ * with every resolution enabled and wearing the shared watermark — so the only
+ * two things that ever have to be copied out of the Bunny dashboard are the
+ * account API key (once) and the watermark image (once).
+ *
+ * A failure after the library was made does not lose it: Bunny's error is
+ * reported, and because nothing is stored until the library exists, the
+ * operator can retry with the same name or finish the job by hand.
+ */
+app.post('/api/accounts/provision', handle(async (req, res) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  const accountApiKey = typeof body.accountApiKey === 'string' ? body.accountApiKey.trim() : '';
+  if (!name) return void res.status(400).json({ error: 'give the account a name — it becomes the name of the Bunny Stream library' });
+  if (!accountApiKey) {
+    return void res.status(400).json({ error: 'the account API key is required (Bunny dashboard → profile → Edit account details → API Key)' });
+  }
+  if (store.accounts.length >= store.settings.maxAccounts) {
+    return void res.status(400).json({ error: `account limit reached (${store.settings.maxAccounts})` });
+  }
+  const image = watermark.image();
+  const placement = watermarkPlacement(watermark.settings);
+  let provisioned;
+  try {
+    provisioned = await coreClient(accountApiKey).provisionLibrary({
+      name,
+      watermark: placement,
+      ...(image ? { image: image.bytes, imageContentType: image.contentType } : {}),
+    });
+  } catch (error) {
+    fail(res, error);
+    return;
+  }
+  const account = store.addAccount({
+    name,
+    libraryId: provisioned.libraryId,
+    apiKeyEnc: encryptSecret(secret, provisioned.streamApiKey),
+    accountApiKeyEnc: encryptSecret(secret, accountApiKey),
+    ...(provisioned.pullZoneHost ? { pullZoneHost: provisioned.pullZoneHost } : {}),
+  });
+  res.status(201).json({
+    account: accountView(account),
+    // What the new library ended up as, so the dashboard can say so plainly.
+    library: { id: provisioned.libraryId, name, pullZoneHost: provisioned.pullZoneHost ?? null, resolutions: ALL_RESOLUTIONS },
+    watermark: { applied: provisioned.watermarkApplied, hasImage: Boolean(image), placement },
+  });
+}));
+
 app.patch('/api/accounts/:id', (req, res) => {
   const account = store.account(req.params.id);
   if (!account) return void res.status(404).json({ error: 'account not found' });
   const body = (req.body ?? {}) as Record<string, unknown>;
-  const patch: { name?: string; libraryId?: string; apiKeyEnc?: string; pullZoneHost?: string; enabled?: boolean } = {};
+  const patch: { name?: string; libraryId?: string; apiKeyEnc?: string; accountApiKeyEnc?: string | undefined; pullZoneHost?: string; enabled?: boolean } = {};
   if (typeof body.name === 'string' && body.name.trim()) patch.name = body.name.trim();
   if (typeof body.libraryId === 'string' && body.libraryId.trim()) patch.libraryId = body.libraryId.trim();
   if (typeof body.apiKey === 'string' && body.apiKey.trim()) patch.apiKeyEnc = encryptSecret(secret, body.apiKey.trim());
+  if (typeof body.accountApiKey === 'string' && body.accountApiKey.trim()) {
+    patch.accountApiKeyEnc = encryptSecret(secret, body.accountApiKey.trim());
+  } else if (body.clearAccountApiKey === true) {
+    patch.accountApiKeyEnc = undefined;
+  }
   if (typeof body.pullZoneHost === 'string') patch.pullZoneHost = body.pullZoneHost.trim();
   if (typeof body.enabled === 'boolean') patch.enabled = body.enabled;
   const updated = store.updateAccount(account.id, patch);
@@ -609,6 +884,128 @@ app.post('/api/accounts/:id/test', handle(async (req, res) => {
     res.json({ ok: true, totalItems: list.totalItems ?? 0 });
   } catch (error) {
     res.json({ ok: false, error: describeError(error) });
+  }
+}));
+
+/* ---------------------------- watermark ---------------------------- */
+
+/** The shared watermark: the placement in force, and whether an image is stored. */
+app.get('/api/watermark', (_req, res) => {
+  res.json({ ...watermark.state(), corners: WATERMARK_CORNERS, resolutions: ALL_RESOLUTIONS });
+});
+
+/**
+ * Change the placement.
+ *
+ * Changing it does not touch Bunny by itself — it changes what the *next* apply
+ * (or provision) sends. `POST /api/watermark/apply` is the second half of that
+ * pair, and the dashboard offers both.
+ */
+app.put('/api/watermark', (req, res) => {
+  try {
+    res.json({ ...watermark.updateSettings((req.body ?? {}) as Record<string, unknown>), corners: WATERMARK_CORNERS });
+  } catch (error) {
+    if (error instanceof WatermarkError) return void res.status(400).json({ error: error.message });
+    throw error;
+  }
+});
+
+/**
+ * The image itself, as raw bytes rather than base64 inside JSON.
+ *
+ * It is posted as whatever the browser read the file as (`image/png` and so
+ * on), which also means the route needs its own body parser: the global one
+ * caps JSON at 1 MB, and a watermark is a file, not JSON.
+ */
+app.put('/api/watermark/image', express.raw({ type: () => true, limit: '12mb' }), (req, res) => {
+  const bytes = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+  try {
+    res.json(watermark.saveImage(bytes, String(req.headers['content-type'] ?? 'image/png')));
+  } catch (error) {
+    if (error instanceof WatermarkError) return void res.status(400).json({ error: error.message });
+    throw error;
+  }
+});
+
+app.delete('/api/watermark/image', (_req, res) => {
+  res.json(watermark.clearImage());
+});
+
+/**
+ * Put the shared watermark on every account, or on the ones named.
+ *
+ * Accounts that predate the watermark, or that were added by hand, are the
+ * reason this exists. One failure does not stop the others: the reply is a
+ * per-account report, because "which libraries still need looking at" is the
+ * only useful answer to a batch.
+ */
+app.post('/api/watermark/apply', handle(async (req, res) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const ids = Array.isArray(body.accountIds) ? body.accountIds.filter((id): id is string => typeof id === 'string') : [];
+  const targets = ids.length
+    ? ids.map((id) => store.account(id)).filter((account): account is Account => Boolean(account))
+    : store.accounts;
+  const results = [];
+  for (const account of targets) results.push(await applyWatermarkTo(account));
+  res.json({
+    results,
+    total: results.length,
+    applied: results.filter((result) => result.ok).length,
+    failed: results.filter((result) => !result.ok).length,
+    hasImage: Boolean(watermark.image()),
+  });
+}));
+
+/** Re-apply the shared watermark to one library. */
+app.post('/api/accounts/:id/watermark', handle(async (req, res) => {
+  const account = store.account(param(req, 'id'));
+  if (!account) return void res.status(404).json({ error: 'account not found' });
+  const result = await applyWatermarkTo(account);
+  if (!result.ok) return void res.status(502).json(result);
+  res.json(result);
+}));
+
+/**
+ * Read every library back and report what Bunny actually holds.
+ *
+ * Read-only: it queues nothing, writes nothing and touches no library. Its
+ * whole purpose is to say which libraries no longer match the settings, since
+ * a library that has drifted looks exactly like one that has not from here.
+ */
+app.post('/api/accounts/verify', handle(async (_req, res) => {
+  res.json(await verifyLibraries());
+}));
+
+/**
+ * Put the dashboard's settings back onto one library, then report the result.
+ *
+ * This is the remedy for what the check finds: the resolution ladder and the
+ * placement in one request, the image after it, and then a read-back so the
+ * answer is what Bunny now holds rather than what was just sent.
+ */
+app.post('/api/accounts/:id/settings', handle(async (req, res) => {
+  const account = store.account(param(req, 'id'));
+  if (!account) return void res.status(404).json({ error: 'account not found' });
+  const key = accountKeyOf(account);
+  if (!key) {
+    return void res.status(502).json({
+      ok: false,
+      error: 'no account API key is stored for this account — add one (Dashboard → profile → API key) and try again',
+    });
+  }
+  const expected = libraryExpectation();
+  const image = watermark.image();
+  const client = coreClient(key);
+  try {
+    const imageUploaded = await client.applyLibrarySettings(account.libraryId, {
+      placement: expected.watermark,
+      resolutions: expected.resolutions,
+      ...(image ? { image: image.bytes, imageContentType: image.contentType } : {}),
+    });
+    const findings = libraryDrift(await client.getVideoLibrary(account.libraryId), expected);
+    res.json({ id: account.id, name: account.name, libraryId: account.libraryId, ok: findings.length === 0, imageUploaded, findings, placement: expected.watermark });
+  } catch (error) {
+    res.status(502).json({ id: account.id, name: account.name, libraryId: account.libraryId, ok: false, error: describeError(error) });
   }
 }));
 
@@ -1362,6 +1759,14 @@ app.use((req, res, next) => {
 app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
   if (error instanceof TmdbError || error instanceof BunnyError) {
     fail(res, error);
+    return;
+  }
+  // A body the framework refused (an oversized watermark, malformed JSON) is
+  // the caller's mistake, not a crash, so its own status is the honest answer.
+  const status = (error as { status?: unknown; statusCode?: unknown } | null)?.status;
+  const code = typeof status === 'number' ? status : Number((error as { statusCode?: unknown } | null)?.statusCode);
+  if (Number.isFinite(code) && code >= 400 && code < 500) {
+    res.status(code).json({ error: describeError(error) });
     return;
   }
   console.error('[dashboard] unhandled error:', error);

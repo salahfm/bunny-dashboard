@@ -101,6 +101,19 @@ Paste that URL into **Source URL** and press **Download & upload**.
   anything: every probed candidate with its height, host and note.
 - **Accounts**: add/enable/disable/test/delete Bunny Stream accounts; keys are
   encrypted at rest (AES-256-GCM) and only ever displayed masked. Limit: 30.
+  An account can also be created from **nothing but your bunny.net account API
+  key**: the dashboard makes the Stream library itself, enables **every
+  resolution**, applies the watermark and fills in the library ID, Stream key
+  and pull zone — see [Accounts and the shared
+  watermark](#accounts-and-the-shared-watermark).
+- **Watermark**: one image and one placement, shared by every account, so the
+  mark lands in the same corner at the same size on every library. A new library
+  gets it as it is created; libraries added by hand can be given it afterwards,
+  one at a time or all at once.
+- **Check libraries**: read every library back from Bunny and report the ones
+  that no longer match — a shorter resolution ladder, a mark that moved, an image
+  missing — each with a *fix* that rewrites the settings and re-reads the library
+  to confirm.
 - **Queue engine**: oldest-first, evenly spread across enabled accounts, never
   more than 10 concurrent uploads per account. Retry failed jobs, cancel active
   ones, delete finished ones. Playback links when a pull-zone host is set.
@@ -178,9 +191,11 @@ or not — naming one is a choice, not an accident.
 Open the dashboard (defaults to `http://127.0.0.1:4747`) and:
 
 1. **Settings** → paste a TMDB **v3 API key** or **v4 access token** and save.
-2. **Accounts** → add each Bunny Stream library: a name, the **library ID**,
-   that library's **Stream API key**, and optionally its pull-zone host
-   (`vz-xxxx.b-cdn.net`) so finished jobs get playable links.
+2. **Accounts** → paste your bunny.net **account API key** and a name: the
+   dashboard creates the Stream library, enables every resolution and applies
+   the watermark for you. (Adding a library that already exists by hand — library
+   ID, Stream API key, optionally the pull-zone host `vz-xxxx.b-cdn.net` — is
+   still there behind *Add an existing library instead*.)
 3. **Titles** → search, pick a movie or an episode, then publish it: **Direct
    scraping** (the dashboard downloads it), **Bunny fetch** (Bunny downloads a URL
    you paste), or **Upload file** (a file on this machine). Watch progress in
@@ -240,6 +255,85 @@ at startup and never overrides real environment variables.
 
 Queue limits can also be changed live in the **Settings** tab (validated against
 the hard caps). Uploads are capped at 10 GB per file.
+
+## Accounts and the shared watermark
+
+Bunny splits its API in two, and so does this dashboard:
+
+| | Stream API | Account API |
+| --- | --- | --- |
+| Host | `video.bunnycdn.com/library/<id>` | `api.bunny.net` |
+| Key | the **Stream library API key**, one per library (Stream → your library → API) | the **account API key** (Dashboard → profile → Edit account details → API Key) |
+| Used for | videos, uploads, captions, status | the libraries themselves: creation, resolutions, watermark |
+
+**The two keys are not interchangeable.** Bunny refuses a library key at
+`api.bunny.net` and an account key at `video.bunnycdn.com`, both with a bare
+`401`, which is why the watermark is not something the library key could ever
+have done.
+
+### One account key in, a configured library out
+
+**Accounts → Add an account** takes your **account API key**. From it the
+dashboard:
+
+1. creates a Stream library named after the account,
+2. enables **all seven encoding resolutions** (`240p` … `2160p`),
+3. sets the shared watermark's position and size, and uploads the shared image,
+4. reads the pull zone back to derive the CDN hostname, and
+5. stores the **Stream API key Bunny generated** for that library, encrypted,
+   along with the account key — so nothing has to be copied out of the Bunny
+dashboard by hand.
+
+If Bunny refuses — a wrong key, an account that has hit its library limit — the
+error is shown and **nothing is stored**, so the attempt can simply be repeated.
+
+### The watermark
+
+One image and one placement, kept next to the database and applied to every
+account. The placement is stored as a **corner, a width, a height and a margin**,
+all in percentages of the frame, and turned into the four numbers Bunny takes
+(`WatermarkPositionLeft`/`Top`/`Width`/`Height`) — which is what makes the mark
+land in *exactly* the same place on every library regardless of video size.
+
+- **Save watermark** changes the placement. It does not touch Bunny by itself.
+- **Apply to all accounts** re-sends the placement and re-uploads the image to
+  every library, one at a time, and reports per account.
+- Each account's row also has its own **watermark** button.
+- Accounts added by hand need their **account API key** for this (an optional
+  field on that form); without one they are reported as *no account API key is
+  stored*, not silently skipped.
+
+A library with no image still gets the placement: uploading the image later lands
+exactly where the settings say, and applying again only has to send the image.
+Bunny takes images up to 10 MB.
+
+### Checking what Bunny actually holds
+
+Nothing would notice a library drifting. The dashboard's own settings stay
+correct while Bunny quietly keeps a narrower resolution ladder, a mark in some
+other corner left over from before this feature existed, or no image at all —
+from here the two look identical.
+
+**Accounts → Check libraries** reads every configured library back from
+`api.bunny.net` and compares it with the settings, per account:
+
+| Verdict | Meaning |
+| --- | --- |
+| **in sync** | the ladder, the placement and the image are what the settings say |
+| **drifted** | at least one differs; the report names *what was expected* and *what Bunny holds*, and a **fix** button writes the settings back and re-reads the library to confirm |
+| **not checked** | Bunny was not asked: the account has no stored account API key (or the request failed), and the reason is shown |
+
+Two limits are worth knowing, both because Bunny does not report them:
+
+- The image is checked for **presence** only (`HasWatermark`). Whether the bytes
+  are the same PNG this dashboard holds cannot be answered by the API.
+- One percentage point of slack is allowed on the placement, because Bunny may
+  round what it stores. A mark that has genuinely moved is always further out
+  than that.
+
+The check itself writes nothing — not to Bunny, not to disk — so it is safe to
+run whenever. `POST /api/accounts/:id/settings` is what the **fix** button calls:
+placement and ladder in one request, the image after it.
 
 ## How the queue works
 
@@ -770,6 +864,15 @@ keeps the queue honest.
 | `GET`/`POST` | `/api/accounts` | list / add an account |
 | `PATCH`/`DELETE` | `/api/accounts/:id` | update (incl. `enabled`) / remove |
 | `POST` | `/api/accounts/:id/test` | verify key + library |
+| `POST` | `/api/accounts/provision` | `{ name, accountApiKey }` → create a Stream library with every resolution enabled and the shared watermark applied, and add it as an account |
+| `POST` | `/api/accounts/:id/watermark` | re-apply the shared watermark to one library (`502` with the reason when its account key is missing) |
+| `POST` | `/api/accounts/verify` | **read every library back**: per account, whether its resolution ladder, watermark placement and watermark image match the settings, with `inSync` / `drifted` / `skipped` counts. Read-only |
+| `POST` | `/api/accounts/:id/settings` | **put the settings back** onto one library (ladder + placement, then the image) and read it back to confirm — the remedy for a drifted library |
+| `GET` | `/api/watermark` | the shared watermark: placement in force, whether an image is stored, its size and type |
+| `PUT` | `/api/watermark` | change the placement: `{ corner, width, height, margin }` (percentages, clamped to the frame) |
+| `PUT` | `/api/watermark/image` | the image itself as a raw body (`image/png`, `image/jpeg`, …) — up to 10 MB |
+| `DELETE` | `/api/watermark/image` | forget the image (libraries keep the placement) |
+| `POST` | `/api/watermark/apply` | `{ accountIds? }` → re-apply to every account (or the named ones); answers with a per-account report |
 | `GET` | `/api/tmdb/search?q=` | title search |
 | `GET` | `/api/tmdb/lookup?q=` | TMDB id, IMDb id or TMDB URL |
 | `GET` | `/api/tmdb/movie/:id`, `/api/tmdb/tv/:id`, `/api/tmdb/tv/:id/season/:n` | details |
@@ -830,8 +933,14 @@ keeps the queue honest.
   (and flushed on a clean shutdown) while every structural change — a status, a
   session URL — is written immediately.
 - `DATA_DIR/.secret` — 32-byte AES-256-GCM key, generated on first run, mode
-  `0600`. Account API keys and the TMDB credential are stored encrypted; the API
-  returns them masked (`••••1234`) and the dashboard never renders them.
+  `0600`. The Stream keys, the account API keys and the TMDB credential are
+  stored encrypted; the API returns them masked (`••••1234`) and the dashboard
+  never renders them.
+- `DATA_DIR/watermark.json` + `DATA_DIR/watermark-image` — the shared watermark:
+  the corner, size and margin, and the image itself as raw bytes (kept out of
+  `db.json` so a megabyte of PNG is not rewritten on every progress update).
+  Neither is secret, and neither is required: without them every library is still
+  created, just without an image until one is uploaded.
 - Temporary uploads live in `DATA_DIR/uploads` and are deleted as soon as a job
   turns ready or cancelled. A failed resumable upload keeps its file so Retry can
   resume it; deleting that job removes the file, and strays are swept on startup.
@@ -928,11 +1037,11 @@ right home for the queue. Hosts that build from a git repository only need the
 
 ```bash
 npm run typecheck        # tsc --noEmit
-npm test                 # 266 tests (queue caps, crypto, store + its change hook, catalogue, clients, TUS, watcher, job lifecycle, crash resume, HLS, source pipeline, subtitles, DeepL translation, multi-language targets, subtitle backfill and its automatic repair, the R2 archive background queue with its verification pass and its scheduled weekly sweep, targeted repair, restore and signed-URL playback, and its SigV4 signer/presigner, tunnel, network policy, diagnostics, login, autopilot, host politeness)
+npm test                 # 303 tests (queue caps, crypto, store + its change hook, catalogue, the Stream client, the account client behind library provisioning, watermarks and the library read-back, TUS, watcher, job lifecycle, crash resume, HLS, source pipeline, subtitles, DeepL translation, multi-language targets, subtitle backfill and its automatic repair, the R2 archive background queue with its verification pass and its scheduled weekly sweep, targeted repair, restore and signed-URL playback, and its SigV4 signer/presigner, tunnel, network policy, diagnostics, login, autopilot, host politeness)
 
 # End-to-end against a running mock server:
 npm run mock &           # or in another terminal
-node scripts/smoke.mjs   # TMDB, accounts, uploads, concurrency cap, the live event stream, the source pipeline, the subtitle backfill (two titles repaired, one source fetch each), the autopilot, watched folder, cleanup
+node scripts/smoke.mjs   # TMDB, accounts, provisioning from an account key, the shared watermark and the library read-back (check, drift, fix, re-check), uploads, concurrency cap, the live event stream, the source pipeline, the subtitle backfill (two titles repaired, one source fetch each), the autopilot, watched folder, cleanup
 
 # …when the dashboard runs with a custom DATA_DIR:
 SMOKE_BASE_URL=http://127.0.0.1:4791 SMOKE_DATA_DIR=data-smoke2 node scripts/smoke.mjs

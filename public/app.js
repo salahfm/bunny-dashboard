@@ -47,6 +47,10 @@
     archiveRepair: [],
     /** The scheduled re-check: when it next runs, and what the last sweep found. */
     archiveCheck: null,
+    /** The shared watermark: one image and one placement, used by every account. */
+    watermark: null,
+    /** The last read-back report: what bunny.net holds, per library. */
+    libraryCheck: null,
     tunnel: null,
     autopilot: null,
     only: new Set(),
@@ -1912,19 +1916,159 @@
             h('td', { class: 'mono', text: account.libraryId }),
             h('td', { class: 'mono', text: account.pullZoneHost ?? '—' }),
             h('td', { class: 'mono', text: account.apiKeyMasked ?? '—' }),
+            // The account key is what lets the watermark be re-applied without
+            // pasting it again; an account without one says so here.
+            h('td', {
+              class: 'mono',
+              text: account.accountApiKeyMasked ?? '—',
+              title: account.hasAccountKey ? 'stored — the watermark can be re-applied' : 'not stored: the watermark cannot be applied to this library',
+            }),
             h('td', { class: 'mono', text: `${use.active}/${use.capacity}` }),
             h(
               'td',
               { class: 'actions' },
               h('button', { text: 'test', onclick: () => void testAccount(account.id) }),
+              h('button', { text: 'watermark', onclick: () => void watermarkAccount(account) }),
               h('button', { text: account.enabled ? 'disable' : 'enable', onclick: () => void toggleAccount(account) }),
               h('button', { text: 'delete', onclick: () => void removeAccount(account) }),
             ),
           ),
         );
       }
-      if (!state.accounts.length) body.append(h('tr', {}, h('td', { colspan: '6', class: 'muted', text: 'no accounts yet' })));
+      if (!state.accounts.length) body.append(h('tr', {}, h('td', { colspan: '7', class: 'muted', text: 'no accounts yet' })));
       $('#account-limit').textContent = `${state.accounts.length} of ${data.maxAccounts} accounts · ${data.perAccountConcurrency} uploads each`;
+      // The read-back report is a snapshot of the accounts as they were when it
+      // ran; adding, removing or changing one makes it stale, so it goes with
+      // them rather than lingering over a list it no longer describes.
+      clear($('#accounts-verify-report')).classList.add('hidden');
+      $('#accounts-verify-state').textContent = '';
+      state.libraryCheck = null;
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    }
+    void refreshWatermark();
+  }
+
+  /**
+   * The shared watermark, as the Accounts tab shows it.
+   *
+   * Read through /api/watermark rather than out of the settings payload, so the
+   * panel the upload happens in is also the panel that reflects it.
+   */
+  async function refreshWatermark() {
+    try {
+      const data = await api('GET', '/api/watermark');
+      state.watermark = data;
+      const settings = data.settings ?? {};
+      $('#watermark-corner').value = settings.corner ?? 'bottom-right';
+      $('#watermark-width').value = String(settings.width ?? 12);
+      $('#watermark-height').value = String(settings.height ?? 8);
+      $('#watermark-margin').value = String(settings.margin ?? 2);
+      const placement = data.placement ?? {};
+      $('#watermark-state').textContent = data.hasImage
+        ? `${bytes(data.bytes)} ${data.contentType ?? 'image'} · ${fmtPercent(placement.left)} from the left, ${fmtPercent(placement.top)} from the top`
+        : 'no image yet — the position and size are saved, but nothing shows until one is uploaded';
+      $('#watermark-remove').disabled = !data.hasImage;
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    }
+  }
+
+  function fmtPercent(value) {
+    const number = Number(value);
+    return Number.isFinite(number) ? `${Math.round(number * 100) / 100}%` : '—';
+  }
+
+  /**
+   * Read every configured library back from bunny.net and show the differences.
+   *
+   * Read-only on both sides: nothing is written to Bunny and nothing is stored
+   * here, because the point is to see the libraries as they actually are. A
+   * library that has drifted looks exactly like one that has not until this
+   * runs, so the report is the only place it can turn up.
+   */
+  async function verifyLibraries() {
+    const button = $('#accounts-verify');
+    button.disabled = true;
+    $('#accounts-verify-state').textContent = 'reading every library from bunny.net…';
+    try {
+      const report = await api('POST', '/api/accounts/verify');
+      state.libraryCheck = report;
+      renderLibraryCheck(report);
+    } catch (error) {
+      toast(describeError(error), 'bad');
+      $('#accounts-verify-state').textContent = '';
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  function renderLibraryCheck(report) {
+    const box = clear($('#accounts-verify-report'));
+    box.classList.remove('hidden');
+    const results = report.results ?? [];
+    const placement = report.expected?.placement;
+    $('#accounts-verify-state').textContent =
+      `${report.total} account(s) · ${report.inSync} in sync · ${report.drifted} drifted · ${report.skipped} without an account key` +
+      (report.unreachable ? ` · ${report.unreachable} could not be read` : '') +
+      (placement
+        ? ` · checked against a watermark at ${placement.left}% / ${placement.top}%, ${placement.width}% × ${placement.height}%`
+        : '');
+
+    const body = h('tbody');
+    if (!results.length) body.append(h('tr', {}, h('td', { colspan: '3', class: 'muted', text: 'no accounts to check' })));
+    for (const result of results) {
+      const verdict = result.ok ? 'in sync' : result.checked ? 'drifted' : 'not checked';
+      const cls = result.ok ? 'in-sync' : result.checked ? 'drifted' : 'skipped';
+      const detail = result.checked
+        ? (result.findings ?? []).map((finding) => finding.message).join(' · ') || 'everything matches the settings'
+        : result.error ?? '—';
+      // Only a library that was read can be written back to, and only one that
+      // differs is worth a fix button — kept beside the verdict rather than in
+      // a column of its own, so a narrow window never hides the action.
+      const fix = result.checked && !result.ok ? h('button', { text: 'fix', onclick: () => void fixLibrary(result) }) : undefined;
+      body.append(
+        h(
+          'tr',
+          {},
+          h('td', { text: result.name }),
+          h('td', { class: 'actions' }, h('span', { class: `status ${cls}`, text: verdict }), fix),
+          h('td', { class: 'small', text: detail }),
+        ),
+      );
+    }
+    box.append(
+      h(
+        'table',
+        { class: 'table' },
+        h('thead', {}, h('tr', {}, h('th', { text: 'Account' }), h('th', { text: 'Verdict' }), h('th', { text: 'What Bunny holds' }))),
+        body,
+      ),
+    );
+  }
+
+  /** Put every setting this dashboard owns back onto one library, then re-check. */
+  async function fixLibrary(result) {
+    try {
+      const fixed = await api('POST', `/api/accounts/${result.id}/settings`);
+      if (fixed.ok) {
+        toast(`“${result.name}” now matches the settings`, 'ok');
+      } else {
+        toast(`“${result.name}” still differs: ${(fixed.findings ?? []).map((finding) => finding.message).join(' · ') || fixed.error}`, 'bad');
+      }
+      await verifyLibraries();
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    }
+  }
+
+  $('#accounts-verify').addEventListener('click', () => void verifyLibraries());
+
+  /** Put the saved watermark onto one library straight away. */
+  async function watermarkAccount(account) {
+    try {
+      const result = await api('POST', `/api/accounts/${account.id}/watermark`);
+      toast(`watermark applied to “${account.name}”${result.imageUploaded ? '' : ' (no image uploaded yet)'}`, 'ok');
     } catch (error) {
       toast(describeError(error), 'bad');
     }
@@ -1958,11 +2102,48 @@
     }
   }
 
+  /**
+   * One account API key in, a configured library out.
+   *
+   * The server does the four Bunny calls; the browser only has to say what the
+   * library should be called. The response names what was made so the toast is
+   * worth reading.
+   */
+  $('#account-provision').addEventListener('click', async () => {
+    const name = $('#account-name').value.trim();
+    const accountApiKey = $('#account-apikey').value.trim();
+    if (!name) return void toast('give the account a name', 'bad');
+    if (!accountApiKey) return void toast('the account API key is required', 'bad');
+    const button = $('#account-provision');
+    button.disabled = true;
+    try {
+      const data = await api('POST', '/api/accounts/provision', { name, accountApiKey });
+      $('#account-name').value = '';
+      $('#account-apikey').value = '';
+      const library = data.library ?? {};
+      const mark = data.watermark?.applied ? 'watermark applied' : 'watermark placement saved (no image yet)';
+      toast(
+        `library ${library.id} created for “${name}” · ${(library.resolutions ?? []).length} resolutions · ${mark}`,
+        'ok',
+      );
+      await refreshAccounts();
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  $('#account-toggle-manual').addEventListener('click', () => {
+    $('#account-manual').classList.toggle('hidden');
+  });
+
   $('#account-add').addEventListener('click', async () => {
     const body = {
       name: $('#account-name').value.trim(),
       libraryId: $('#account-library').value.trim(),
       apiKey: $('#account-key').value.trim(),
+      accountApiKey: $('#account-manual-apikey').value.trim(),
       pullZoneHost: $('#account-pullzone').value.trim(),
     };
     try {
@@ -1970,11 +2151,78 @@
       $('#account-name').value = '';
       $('#account-library').value = '';
       $('#account-key').value = '';
+      $('#account-manual-apikey').value = '';
       $('#account-pullzone').value = '';
       toast('account added', 'ok');
       await refreshAccounts();
     } catch (error) {
       toast(describeError(error), 'bad');
+    }
+  });
+
+  /* ------------------------------------------------------------ watermark */
+
+  $('#watermark-save').addEventListener('click', async () => {
+    try {
+      await api('PUT', '/api/watermark', {
+        corner: $('#watermark-corner').value,
+        width: Number($('#watermark-width').value),
+        height: Number($('#watermark-height').value),
+        margin: Number($('#watermark-margin').value),
+      });
+      toast('watermark saved — apply it to put it on your libraries', 'ok');
+      await refreshWatermark();
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    }
+  });
+
+  // The image goes up as raw bytes with its own content type: a watermark is a
+  // file, and base64 inside JSON would just be a third more bytes to move.
+  $('#watermark-file').addEventListener('change', async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+      await api('PUT', '/api/watermark/image', file, file.type || 'image/png');
+      toast(`watermark image saved (${bytes(file.size)})`, 'ok');
+      await refreshWatermark();
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    } finally {
+      event.target.value = '';
+    }
+  });
+
+  $('#watermark-remove').addEventListener('click', async () => {
+    if (!confirm('Remove the watermark image? Libraries keep the placement, but the mark stops showing.')) return;
+    try {
+      await api('DELETE', '/api/watermark/image');
+      toast('watermark image removed', 'ok');
+      await refreshWatermark();
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    }
+  });
+
+  $('#watermark-apply').addEventListener('click', async () => {
+    const button = $('#watermark-apply');
+    button.disabled = true;
+    try {
+      const report = await api('POST', '/api/watermark/apply', {});
+      const failed = (report.results ?? []).filter((result) => !result.ok);
+      const many = (count) => `${count} librar${count === 1 ? 'y' : 'ies'}`;
+      if (report.failed) {
+        // A partial result is a failure worth the long-lived toast: the names
+        // are what the operator has to act on.
+        toast(`${report.applied} of ${many(report.total)} took the watermark — ${failed.map((result) => result.name).join(', ')} did not`, 'bad');
+      } else {
+        toast(`watermark applied to ${many(report.total)}`, 'ok');
+      }
+      await refreshAccounts();
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    } finally {
+      button.disabled = false;
     }
   });
 

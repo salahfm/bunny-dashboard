@@ -154,7 +154,17 @@ export interface Account {
   id: string;
   name: string;
   libraryId: string;
+  /** The Stream library API key, what `BunnyClient` uploads with. */
   apiKeyEnc: string;
+  /**
+   * The *account* API key, when one was given.
+   *
+   * It is deliberately not what publishing uses: the account key is only for
+   * the account-level API, which is where a library's watermark and its enabled
+   * resolutions live. Keeping it lets the dashboard re-apply the shared
+   * watermark to this library later without asking for the key again.
+   */
+  accountApiKeyEnc?: string;
   pullZoneHost?: string;
   enabled: boolean;
   createdAt: string;
@@ -344,7 +354,7 @@ export class Store {
     return this.db.accounts.find((account) => account.id === id);
   }
 
-  addAccount(input: { name: string; libraryId: string; apiKeyEnc: string; pullZoneHost?: string }): Account {
+  addAccount(input: { name: string; libraryId: string; apiKeyEnc: string; accountApiKeyEnc?: string; pullZoneHost?: string }): Account {
     const now = new Date().toISOString();
     const account: Account = {
       id: crypto.randomUUID(),
@@ -355,6 +365,7 @@ export class Store {
       createdAt: now,
       updatedAt: now,
     };
+    if (input.accountApiKeyEnc) account.accountApiKeyEnc = input.accountApiKeyEnc;
     if (input.pullZoneHost) account.pullZoneHost = input.pullZoneHost;
     this.db.accounts.push(account);
     this.save();

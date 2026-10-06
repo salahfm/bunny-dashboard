@@ -405,6 +405,182 @@ check('the API key comes back masked', result.json?.account?.apiKeyMasked === '�
 result = await request('POST', `/api/accounts/${accountId}/test`);
 check('account test reaches the (mock) library', result.json?.ok === true && result.json?.totalItems === 3, JSON.stringify(result.json));
 
+/* watermark ----------------------------------------------------------- */
+// One image and one placement, shared by every account. The image is a file,
+// so it goes up as raw bytes rather than base64 inside JSON — which also means
+// this exercises the route's own body parser rather than the global JSON one.
+result = await request('GET', '/api/watermark');
+check(
+  'the shared watermark starts with the default placement and no image',
+  result.status === 200 &&
+    result.json?.hasImage === false &&
+    result.json?.settings?.corner === 'bottom-right' &&
+    result.json?.placement?.left === 86 &&
+    result.json?.placement?.top === 90 &&
+    result.json?.placement?.width === 12 &&
+    result.json?.placement?.height === 8,
+  JSON.stringify(result.json?.placement),
+);
+
+result = await request('PUT', '/api/watermark', { corner: 'top-left', width: 20, height: 10, margin: 5 });
+check(
+  'the placement is editable and describes a corner as offsets from the top-left',
+  result.status === 200 && result.json?.settings?.corner === 'top-left' && result.json?.placement?.left === 5 && result.json?.placement?.top === 5,
+  JSON.stringify(result.json?.placement),
+);
+result = await request('PUT', '/api/watermark', { corner: 'middle', width: 900, margin: -3 });
+check(
+  'an unknown corner is ignored and the numbers are clamped to the frame',
+  result.status === 200 && result.json?.settings?.corner === 'top-left' && result.json?.settings?.width === 100 && result.json?.settings?.margin === 0,
+  JSON.stringify(result.json?.settings),
+);
+
+const watermarkImage = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00]);
+result = await request('PUT', '/api/watermark/image', watermarkImage, 'image/png');
+check(
+  'the watermark image is stored, with its size and type',
+  result.status === 200 && result.json?.hasImage === true && result.json?.bytes === watermarkImage.length && result.json?.contentType === 'image/png',
+  `status ${result.status}, ${result.json?.bytes} bytes`,
+);
+check('the image is on disk beside the database', fs.existsSync(path.join(dataDir, 'watermark-image')));
+check('the placement is on disk as JSON', fs.existsSync(path.join(dataDir, 'watermark.json')));
+
+result = await request('PUT', '/api/watermark/image', Buffer.alloc(0), 'image/png');
+check('an empty image is refused rather than stored', result.status === 400, result.json?.error ?? '');
+
+result = await request('GET', '/api/settings');
+check(
+  'settings carry the watermark, so the Settings tab can read it without a second call',
+  result.json?.watermark?.corner === 'top-left' && result.json?.watermark?.hasImage === true && Array.isArray(result.json?.watermark?.corners),
+  JSON.stringify(result.json?.watermark),
+);
+
+// The hand-added account above has no account API key, which is exactly the
+// case the report has to name rather than swallow.
+result = await request('POST', '/api/watermark/apply', {});
+check(
+  'apply-to-all reports the account that has no account key',
+  result.status === 200 && result.json?.total === 1 && result.json?.failed === 1 && /account API key/.test(result.json?.results?.[0]?.error ?? ''),
+  result.json?.results?.[0]?.error ?? '',
+);
+result = await request('POST', `/api/accounts/${accountId}/watermark`);
+check(
+  're-applying to one account without a key is refused with the reason',
+  result.status === 502 && result.json?.ok === false && /account API key/.test(result.json?.error ?? ''),
+  `${result.status} ${result.json?.error ?? ''}`,
+);
+
+/* provisioning from the account key ------------------------------------ */
+// The point of the whole feature: one account API key in, a configured Stream
+// library out — every resolution enabled and the watermark already on it.
+result = await request('POST', '/api/accounts/provision', { name: 'provisioned-library', accountApiKey: 'mock-account-key' });
+check(
+  'the account API key creates and configures a library',
+  result.status === 201 && Boolean(result.json?.account?.id) && Boolean(result.json?.account?.libraryId) && result.json?.account?.hasAccountKey === true,
+  `status ${result.status} ${result.json?.error ?? ''}`,
+);
+const provisionedId = result.json?.account?.id;
+check(
+  'the new library got every resolution and wears the watermark',
+  (result.json?.library?.resolutions ?? []).length === 7 && result.json?.watermark?.applied === true,
+  JSON.stringify(result.json?.library),
+);
+check(
+  'the pull zone was filled in for playback',
+  typeof result.json?.account?.pullZoneHost === 'string' && result.json.account.pullZoneHost.endsWith('.b-cdn.net'),
+  result.json?.account?.pullZoneHost ?? '',
+);
+check(
+  'the generated Stream key comes back masked, never in clear text',
+  typeof result.json?.account?.apiKeyMasked === 'string' && result.json.account.apiKeyMasked.startsWith('••••'),
+  result.json?.account?.apiKeyMasked ?? '',
+);
+
+result = await request('POST', `/api/accounts/${provisionedId}/watermark`);
+check(
+  'the provisioned account takes the watermark again on demand, image and all',
+  result.status === 200 && result.json?.ok === true && result.json?.imageUploaded === true,
+  `${result.status} ${result.json?.error ?? ''}`,
+);
+result = await request('POST', '/api/watermark/apply', {});
+check(
+  'apply-to-all reaches the provisioned library and still reports the other one',
+  result.status === 200 && result.json?.total === 2 && result.json?.applied === 1 && result.json?.failed === 1,
+  JSON.stringify({ total: result.json?.total, applied: result.json?.applied, failed: result.json?.failed }),
+);
+
+result = await request('POST', '/api/accounts/provision', { name: '' });
+check('provisioning without a name is refused', result.status === 400, result.json?.error ?? '');
+result = await request('POST', '/api/accounts/provision', { name: 'no-key' });
+check('provisioning without an account API key is refused', result.status === 400 && /account API key/.test(result.json?.error ?? ''), result.json?.error ?? '');
+
+// Put the default back and drop the throwaway account, so the rest of the run
+// sees the single account it expects.
+await request('PUT', '/api/watermark', { corner: 'bottom-right', width: 12, height: 8, margin: 2 });
+await request('DELETE', `/api/accounts/${provisionedId}`);
+result = await request('GET', '/api/accounts');
+check('the throwaway library is gone again', (result.json?.accounts ?? []).length === 1, `${(result.json?.accounts ?? []).length} account(s)`);
+
+/* reading the libraries back ------------------------------------------- */
+// Nothing else would notice a library drifting: the dashboard's own settings
+// stay right while Bunny keeps a narrower ladder, a mark in another corner from
+// before the watermark existed, or no image at all. The check reads each
+// library back and reports the differences; nothing is written.
+result = await request('POST', '/api/accounts/verify');
+check(
+  'a library whose account key was never stored cannot be read back, and says so',
+  result.status === 200 && result.json?.total === 1 && result.json?.checked === 0 && result.json?.skipped === 1 && result.json?.drifted === 0,
+  JSON.stringify({ total: result.json?.total, checked: result.json?.checked, skipped: result.json?.skipped }),
+);
+
+result = await request('POST', '/api/accounts', { name: 'fixable-library', libraryId: '777', apiKey: 'stream-key-777', accountApiKey: 'acct-key-fix' });
+check('a hand-added library can carry an account key for exactly this', result.status === 201 && result.json?.account?.hasAccountKey === true, `status ${result.status}`);
+const fixableId = result.json?.account?.id;
+
+result = await request('POST', '/api/accounts/verify');
+check(
+  'the library that was never configured is reported as drifted',
+  result.status === 200 && result.json?.checked === 1 && result.json?.drifted === 1 && result.json?.inSync === 0,
+  JSON.stringify({ checked: result.json?.checked, drifted: result.json?.drifted, inSync: result.json?.inSync }),
+);
+const reported = (result.json?.results ?? []).find((entry) => entry.id === fixableId) ?? {};
+const reportedFields = (reported.findings ?? []).map((finding) => finding.field).sort();
+check(
+  'it names the resolution ladder, the placement and the missing image',
+  JSON.stringify(reportedFields) === JSON.stringify(['resolutions', 'watermark-image', 'watermark-placement']),
+  JSON.stringify(reportedFields),
+);
+check(
+  'every finding says what was expected and what Bunny holds',
+  (reported.findings ?? []).every((finding) => finding.expected && finding.actual && finding.message),
+  JSON.stringify((reported.findings ?? []).map((finding) => finding.message)),
+);
+
+result = await request('POST', `/api/accounts/${fixableId}/settings`);
+check(
+  're-applying the settings puts the library right, read back from Bunny',
+  result.status === 200 && result.json?.ok === true && (result.json?.findings ?? []).length === 0 && result.json?.imageUploaded === true,
+  `${result.status} ${JSON.stringify(result.json?.findings ?? result.json?.error)}`,
+);
+
+result = await request('POST', '/api/accounts/verify');
+check(
+  'the report now separates the fixed library from the one it cannot read',
+  result.json?.checked === 1 && result.json?.inSync === 1 && result.json?.drifted === 0 && result.json?.skipped === 1,
+  JSON.stringify({ checked: result.json?.checked, inSync: result.json?.inSync, drifted: result.json?.drifted, skipped: result.json?.skipped }),
+);
+
+result = await request('POST', `/api/accounts/${accountId}/settings`);
+check(
+  'fixing a library whose account key is not stored is refused with the reason',
+  result.status === 502 && /account API key/.test(result.json?.error ?? ''),
+  `${result.status} ${result.json?.error ?? ''}`,
+);
+
+await request('DELETE', `/api/accounts/${fixableId}`);
+result = await request('GET', '/api/accounts');
+check('the fixable library is cleaned up again', (result.json?.accounts ?? []).length === 1, `${(result.json?.accounts ?? []).length} account(s)`);
+
 /* TMDB --------------------------------------------------------------- */
 result = await request('GET', '/api/tmdb/search?q=breaking');
 check('search finds Breaking Bad', (result.json?.results ?? []).some((entry) => entry.tmdbId === 1396));
