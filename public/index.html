@@ -376,9 +376,10 @@
           <h2>Add an account</h2>
           <p class="muted small">
             Paste your bunny.net <strong>account API key</strong> (Dashboard → profile → Edit account details → API Key)
-            and this dashboard builds the library for you: a new Stream library with every resolution enabled, the shared
-            watermark below applied, and its library ID, Stream key and pull zone filled in automatically — nothing to copy
-            by hand. This is the account key, not a library key.
+            and this dashboard builds the library for you: a new Stream library with every resolution enabled,
+            <strong>scale video by height and width</strong> switched on, the shared watermark below applied, and its
+            library ID, Stream key and pull zone filled in automatically — nothing to copy by hand. This is the account
+            key, not a library key.
           </p>
           <div class="grid2">
             <label>
@@ -427,8 +428,8 @@
           <h2>Watermark</h2>
           <p class="muted small">
             One image and one placement, shared by every account — a new library gets it the moment it is created, and any
-            library added by hand can be given it afterwards. The corner and the size are kept in percentages, so the mark
-            lands in the same place whatever the video's resolution.
+            library added by hand can be given it afterwards. The position and the size are kept in percentages of the
+            frame, so the mark lands in the same place whatever the video's resolution.
           </p>
           <div class="grid2">
             <label>
@@ -436,6 +437,13 @@
               <input id="watermark-file" type="file" accept="image/png,image/jpeg,image/webp" />
             </label>
             <label>
+              Placement
+              <select id="watermark-anchor">
+                <option value="corner">corner + margin</option>
+                <option value="offset">left &amp; top (by hand)</option>
+              </select>
+            </label>
+            <label id="watermark-corner-field">
               Corner
               <select id="watermark-corner">
                 <option value="bottom-right">bottom right</option>
@@ -443,6 +451,10 @@
                 <option value="top-right">top right</option>
                 <option value="top-left">top left</option>
               </select>
+            </label>
+            <label id="watermark-margin-field">
+              Margin from the edge (%)
+              <input id="watermark-margin" type="number" min="0" max="50" step="1" />
             </label>
             <label>
               Width (% of the video)
@@ -452,11 +464,16 @@
               Height (% of the video)
               <input id="watermark-height" type="number" min="1" max="100" step="1" />
             </label>
-            <label>
-              Margin from the edge (%)
-              <input id="watermark-margin" type="number" min="0" max="50" step="1" />
+            <label id="watermark-left-field">
+              Left (% from the left)
+              <input id="watermark-left" type="number" min="0" max="100" step="1" />
+            </label>
+            <label id="watermark-top-field">
+              Top (% from the top)
+              <input id="watermark-top" type="number" min="0" max="100" step="1" />
             </label>
           </div>
+          <p id="watermark-hint" class="muted small"></p>
           <div class="row">
             <button id="watermark-save" class="primary">Save watermark</button>
             <button id="watermark-apply">Apply to all accounts</button>

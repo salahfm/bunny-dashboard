@@ -4,10 +4,22 @@
  * bunny.net stamps a library's watermark onto everything it encodes, and the
  * settings live on the library: an image, an offset from the top-left corner and
  * a size, all in percentages of the frame. There is no "position: bottom-right"
- * on the wire, so the dashboard keeps a friendlier corner-and-margin description
- * and turns it into the four numbers Bunny takes — which is also what makes the
- * mark land in *exactly* the same place on every account instead of wherever
- * each library happened to be configured.
+ * on the wire, so the dashboard keeps a friendlier description and turns it into
+ * the four numbers Bunny takes — which is also what makes the mark land in
+ * *exactly* the same place on every account instead of wherever each library
+ * happened to be configured.
+ *
+ * There are two ways to describe that position, and they are both just a way of
+ * arriving at the same four numbers:
+ *
+ * - `corner` (the default) pins the mark to one of the four corners and insets
+ *   it by a margin — the station-logo arrangement, and the one that keeps every
+ *   account identical whatever the frame's shape.
+ * - `offset` places it by hand: `left` and `top` are the mark's own edges, in
+ *   percent from the top-left of the frame. `0` is flush against the edge, which
+ *   is a position no corner-and-margin pair can express as directly (a top-right
+ *   mark is `100 - width - margin` from the left, so a left-hand corner is the
+ *   only way to reach `0` that way).
  *
  * Both halves are global: one image and one placement, applied to every library
  * this dashboard creates (and to any existing one, on demand). The image is
@@ -25,14 +37,31 @@ export type WatermarkCorner = 'top-left' | 'top-right' | 'bottom-left' | 'bottom
 export const WATERMARK_CORNERS: WatermarkCorner[] = ['top-left', 'top-right', 'bottom-left', 'bottom-right'];
 
 /**
+ * How the position is described: pinned to a corner, or typed in by hand.
+ *
+ * `corner` is the default because it survives a change of frame: the same
+ * corner and the same margin, expressed in percent, land the mark in the same
+ * place on a 16:9 film and a 4:3 episode alike. `offset` is for the positions
+ * that description cannot reach — most of all "flush against the left edge".
+ */
+export type WatermarkAnchor = 'corner' | 'offset';
+
+export const WATERMARK_ANCHORS: WatermarkAnchor[] = ['corner', 'offset'];
+
+/**
  * The placement this dashboard uses unless it is told otherwise.
  *
  * Bottom-right, small, and inset a little from the edge — the corner a station
  * logo usually sits in, and far enough from the player's controls to stay
- * legible without covering the picture.
+ * legible without covering the picture. `left`/`top` carry what that corner
+ * resolves to, so switching to hand placement starts from where the mark already
+ * is rather than from a jump to the top-left corner.
  */
 export const DEFAULT_WATERMARK_SETTINGS: WatermarkSettings = {
+  anchor: 'corner',
   corner: 'bottom-right',
+  left: 86,
+  top: 90,
   width: 12,
   height: 8,
   margin: 2,
@@ -42,7 +71,21 @@ export const DEFAULT_WATERMARK_SETTINGS: WatermarkSettings = {
 export const MAX_WATERMARK_BYTES = 10 * 1024 * 1024;
 
 export interface WatermarkSettings {
+  /**
+   * How the mark is positioned; treated as `corner` when it is not named.
+   *
+   * Every field is filled in whichever way the mark is placed, because the
+   * dashboard shows the resolved numbers: a corner placement keeps `left`/`top`
+   * in step with the corner it derives from, so switching to `offset` is a no-op
+   * until one of them is edited.
+   */
+  anchor?: WatermarkAnchor;
+  /** Which corner, and inset by how much — only read when `anchor` is `corner`. */
   corner: WatermarkCorner;
+  /** The mark's left edge, in percent from the left — only read when `anchor` is `offset`. */
+  left?: number;
+  /** The mark's top edge, in percent from the top — only read when `anchor` is `offset`. */
+  top?: number;
   /** The mark's width, as a percentage of the video's width. */
   width: number;
   /** The mark's height, as a percentage of the video's height. */
@@ -66,6 +109,11 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
+/** Two decimals is as fine as a percentage of a frame is worth reporting. */
+function round2(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
 /** Read a number out of an untrusted body, falling back to `fallback`. */
 function numberOr(value: unknown, fallback: number): number {
   const number = Number(value);
@@ -81,34 +129,55 @@ function numberOr(value: unknown, fallback: number): number {
  * the same corner everywhere", and a clamped value still does that consistently.
  */
 export function normalizeWatermarkSettings(input: Record<string, unknown>, base: WatermarkSettings = DEFAULT_WATERMARK_SETTINGS): WatermarkSettings {
+  const anchor: WatermarkAnchor =
+    input.anchor === 'offset' || input.anchor === 'corner' ? input.anchor : base.anchor ?? 'corner';
   const corner = WATERMARK_CORNERS.includes(input.corner as WatermarkCorner) ? (input.corner as WatermarkCorner) : base.corner;
   const width = clamp(numberOr(input.width, base.width), 1, 100);
   const height = clamp(numberOr(input.height, base.height), 1, 100);
   const margin = clamp(numberOr(input.margin, base.margin), 0, 50);
-  return { corner, width, height, margin };
+  // Where the corner-and-margin description currently puts the mark. A request
+  // that does not name `left`/`top` — every corner-mode save, and any client that
+  // predates hand placement — follows the corner, so the stored offsets are
+  // always the ones the resolved placement uses. That is what makes changing the
+  // corner and then switching to hand placement a smooth move rather than a jump.
+  const derived = watermarkPlacement({ corner, width, height, margin });
+  const left = clamp(numberOr(input.left, derived.left), 0, 100);
+  const top = clamp(numberOr(input.top, derived.top), 0, 100);
+  return { anchor, corner, left, top, width, height, margin };
 }
 
 /**
- * The four percentages Bunny wants, from the corner-and-size description.
+ * The four percentages Bunny wants.
  *
  * `left`/`top` are offsets from the *top-left* corner, so the right and bottom
- * corners are the far edge minus the mark's own size and the margin. Everything
- * is clamped again here, because this is the last point before the numbers leave
- * for Bunny.
+ * corners are the far edge minus the mark's own size and the margin. A
+ * hand-placed mark is taken at its word instead — `0` really does mean flush
+ * against the edge. Either way everything is clamped again here, because this is
+ * the last point before the numbers leave for Bunny.
  */
 export function watermarkPlacement(settings: WatermarkSettings): WatermarkPlacementRecord {
-  const right = settings.corner === 'top-right' || settings.corner === 'bottom-right';
-  const bottom = settings.corner === 'bottom-left' || settings.corner === 'bottom-right';
   const wide = clamp(settings.width, 1, 100);
   const tall = clamp(settings.height, 1, 100);
+  if (settings.anchor === 'offset') {
+    // Only the frame itself is enforced: the mark may sit anywhere it fits, and
+    // a field that was never set is the top-left corner rather than `NaN`.
+    return {
+      left: round2(clamp(numberOr(settings.left, 0), 0, 100 - wide)),
+      top: round2(clamp(numberOr(settings.top, 0), 0, 100 - tall)),
+      width: round2(wide),
+      height: round2(tall),
+    };
+  }
+  const right = settings.corner === 'top-right' || settings.corner === 'bottom-right';
+  const bottom = settings.corner === 'bottom-left' || settings.corner === 'bottom-right';
   const margin = clamp(settings.margin, 0, 50);
   const left = right ? 100 - wide - margin : margin;
   const top = bottom ? 100 - tall - margin : margin;
   return {
-    left: Math.round(clamp(left, 0, 100 - wide) * 100) / 100,
-    top: Math.round(clamp(top, 0, 100 - tall) * 100) / 100,
-    width: Math.round(wide * 100) / 100,
-    height: Math.round(tall * 100) / 100,
+    left: round2(clamp(left, 0, 100 - wide)),
+    top: round2(clamp(top, 0, 100 - tall)),
+    width: round2(wide),
+    height: round2(tall),
   };
 }
 

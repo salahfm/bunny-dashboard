@@ -72,13 +72,20 @@ test('createVideoLibrary posts the name and every resolution to the core API', a
   assert.deepEqual(bodyOf(calls[0]!), { Name: 'Feature Films', EnabledResolutions: resolutionsValue() });
 });
 
-test('enableAllResolutions sends the whole ladder as a comma-separated string', async () => {
+test('configureEncoding sends the ladder as a comma-separated string, with the shared scaling flag', async () => {
   const { impl, calls } = captureFetch(() => ({ body: LIBRARY }));
   const client = new BunnyCoreClient({ apiKey: 'acct-key', fetchImpl: impl, retries: 0 });
-  await client.enableAllResolutions(4242);
+  await client.configureEncoding(4242);
   assert.equal(calls[0]?.url, `${BUNNY_CORE_BASE}/videolibrary/4242`);
   assert.equal(calls[0]?.init.method, 'POST');
-  assert.deepEqual(bodyOf(calls[0]!), { EnabledResolutions: '240p,360p,480p,720p,1080p,1440p,2160p' });
+  assert.deepEqual(bodyOf(calls[0]!), {
+    EnabledResolutions: '240p,360p,480p,720p,1080p,1440p,2160p',
+    ScaleVideoUsingBothDimensions: true,
+  });
+  // A narrower ladder is the same call with a different list — the flag is what
+  // makes "scale video by height and width" on, and it travels every time.
+  await client.configureEncoding(4242, ['1080p', '720p']);
+  assert.deepEqual(bodyOf(calls[1]!), { EnabledResolutions: '1080p,720p', ScaleVideoUsingBothDimensions: true });
 });
 
 test('setWatermarkPlacement sends the four percentages Bunny takes', async () => {
@@ -191,6 +198,7 @@ test('provisionLibrary creates, places, uploads and reads the pull zone back', a
     WatermarkWidth: 12,
     WatermarkHeight: 8,
     EnabledResolutions: resolutionsValue(),
+    ScaleVideoUsingBothDimensions: true,
   });
 });
 
@@ -207,6 +215,7 @@ test('provisionLibrary with no image still configures the library', async () => 
   // The library came back with no hostname, so the url points at a bare zone name.
   assert.equal(provisioned.pullZoneHost, undefined);
   assert.ok(!calls.some((call) => call.url.endsWith('/watermark')), 'no image means no upload');
+  assert.ok(calls.some((call) => bodyOf(call).ScaleVideoUsingBothDimensions === true), 'the scaling flag goes on every library');
 });
 
 test('a library Bunny made without a Stream key is refused rather than stored', async () => {
@@ -289,12 +298,14 @@ const IN_SYNC: BunnyLibrary = {
   WatermarkPositionTop: 90,
   WatermarkWidth: 12,
   WatermarkHeight: 8,
+  ScaleVideoUsingBothDimensions: true,
 };
 
 const EXPECTED = {
   resolutions: ALL_RESOLUTIONS,
   watermark: { left: 86, top: 90, width: 12, height: 8 },
   expectImage: true,
+  scaleByBothDimensions: true,
 };
 
 test('enabledResolutionSet reads the comma-separated string however it is written', () => {
@@ -306,7 +317,24 @@ test('enabledResolutionSet reads the comma-separated string however it is writte
 test('a library that matches the settings has no findings', () => {
   assert.deepEqual(libraryDrift(IN_SYNC, EXPECTED), []);
   // And a library that says nothing about its bullets is not drift it was not asked about.
-  assert.deepEqual(libraryDrift({ Id: 1, EnabledResolutions: resolutionsValue() }, { resolutions: ALL_RESOLUTIONS }), []);
+  assert.deepEqual(
+    libraryDrift({ Id: 1, EnabledResolutions: resolutionsValue() }, { resolutions: ALL_RESOLUTIONS, scaleByBothDimensions: false }),
+    [],
+  );
+});
+
+test('scaling by height and width is checked the same way the ladder is', () => {
+  const off = libraryDrift({ ...IN_SYNC, ScaleVideoUsingBothDimensions: false }, EXPECTED);
+  assert.equal(off.length, 1);
+  assert.equal(off[0]?.field, 'encoding');
+  assert.match(off[0]!.message, /not scaled using both dimensions/);
+  assert.equal(off[0]?.actual, 'Bunny holds false');
+  // A library Bunny said nothing about stands the same way an empty resolution
+  // ladder does: unconfirmed, not fine.
+  const silent = libraryDrift({ ...IN_SYNC, ScaleVideoUsingBothDimensions: undefined }, EXPECTED);
+  assert.equal(silent.length, 1);
+  assert.equal(silent[0]?.field, 'encoding');
+  assert.equal(silent[0]?.actual, 'Bunny did not report it');
 });
 
 test('a narrower resolution ladder is reported with the rungs that are missing', () => {
@@ -318,8 +346,12 @@ test('a narrower resolution ladder is reported with the rungs that are missing',
 });
 
 test('a library Bunny will not describe is reported rather than assumed fine', () => {
-  const findings = libraryDrift({ Id: 1, EnabledResolutions: '' }, { resolutions: ALL_RESOLUTIONS });
+  const findings = libraryDrift(
+    { Id: 1, EnabledResolutions: '', ScaleVideoUsingBothDimensions: true },
+    { resolutions: ALL_RESOLUTIONS },
+  );
   assert.equal(findings.length, 1);
+  assert.equal(findings[0]?.field, 'resolutions');
   assert.match(findings[0]!.message, /could not be confirmed/);
 });
 
@@ -335,7 +367,7 @@ test('a mark that has moved is drift; one Bunny rounded is not', () => {
 });
 
 test('a placement Bunny never reported at all is drift', () => {
-  const bare: BunnyLibrary = { Id: 1, EnabledResolutions: resolutionsValue(), HasWatermark: false };
+  const bare: BunnyLibrary = { Id: 1, EnabledResolutions: resolutionsValue(), HasWatermark: false, ScaleVideoUsingBothDimensions: true };
   const findings = libraryDrift(bare, EXPECTED);
   assert.equal(findings.length, 2);
   assert.deepEqual(findings.map((finding) => finding.field), ['watermark-placement', 'watermark-image']);
@@ -373,6 +405,7 @@ test('applyLibrarySettings sends the ladder and the placement in one request, th
     WatermarkWidth: 12,
     WatermarkHeight: 8,
     EnabledResolutions: resolutionsValue(),
+    ScaleVideoUsingBothDimensions: true,
   });
 });
 
@@ -391,6 +424,7 @@ test('applyLibrarySettings with no image fixes the ladder and placement only', a
     WatermarkWidth: 12,
     WatermarkHeight: 8,
     EnabledResolutions: '1080p,720p',
+    ScaleVideoUsingBothDimensions: true,
   });
 });
 
@@ -418,11 +452,20 @@ test('mock mode provisions a library without touching the network', async () => 
     [],
     'a provisioned mock library reads back exactly as configured',
   );
-  // A library this dashboard never configured reports all three differences:
-  // its ladder stops short, its mark is nowhere, and it has no image.
+  // A library this dashboard never configured reports all four differences: its
+  // ladder stops short, scaling by height and width is off, its mark is nowhere,
+  // and it has no image.
   const untouched = await client.getVideoLibrary('424242');
   assert.deepEqual(
     libraryDrift(untouched, { resolutions: ALL_RESOLUTIONS, watermark: placement, expectImage: true }).map((finding) => finding.field),
-    ['resolutions', 'watermark-placement', 'watermark-image'],
+    ['resolutions', 'encoding', 'watermark-placement', 'watermark-image'],
+  );
+  // And the fix is what clears it, read back rather than assumed.
+  await client.applyLibrarySettings(untouched.Id, { placement });
+  assert.deepEqual(
+    libraryDrift(await client.getVideoLibrary(untouched.Id), { resolutions: ALL_RESOLUTIONS, watermark: placement, expectImage: true }).map(
+      (finding) => finding.field,
+    ),
+    ['watermark-image'],
   );
 });

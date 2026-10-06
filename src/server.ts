@@ -32,7 +32,7 @@ import { TmdbClient, TmdbError, lookupTmdb } from './tmdb';
 import { DEEPL_WEB_ENDPOINT } from './translate';
 import { TunnelManager } from './tunnel';
 import { FolderWatcher } from './watch';
-import { WATERMARK_CORNERS, WatermarkError, WatermarkStore, watermarkPlacement } from './watermark';
+import { WATERMARK_ANCHORS, WATERMARK_CORNERS, WatermarkError, WatermarkStore, watermarkPlacement } from './watermark';
 
 const config = loadConfig();
 const secret = loadOrCreateSecret(config.secretPath);
@@ -177,11 +177,20 @@ function accountKeyOf(account: Account): string | undefined {
  * change compares against the settings in force *now* rather than whatever was
  * saved when the account was added.
  */
-function libraryExpectation(): { resolutions: string[]; watermark: ReturnType<typeof watermarkPlacement>; expectImage: boolean } {
+function libraryExpectation(): {
+  resolutions: string[];
+  watermark: ReturnType<typeof watermarkPlacement>;
+  expectImage: boolean;
+  scaleByBothDimensions: boolean;
+} {
   return {
     resolutions: ALL_RESOLUTIONS,
     watermark: watermarkPlacement(watermark.settings),
     expectImage: Boolean(watermark.image()),
+    // Bunny's "scale video by height and width"; every library this dashboard
+    // makes or fixes carries it, so a check looks for it on the same footing as
+    // the ladder and the watermark.
+    scaleByBothDimensions: true,
   };
 }
 
@@ -840,7 +849,14 @@ app.post('/api/accounts/provision', handle(async (req, res) => {
   res.status(201).json({
     account: accountView(account),
     // What the new library ended up as, so the dashboard can say so plainly.
-    library: { id: provisioned.libraryId, name, pullZoneHost: provisioned.pullZoneHost ?? null, resolutions: ALL_RESOLUTIONS },
+    library: {
+      id: provisioned.libraryId,
+      name,
+      pullZoneHost: provisioned.pullZoneHost ?? null,
+      resolutions: ALL_RESOLUTIONS,
+      // What the settings call also switched on, so the dashboard can say so.
+      scaleByBothDimensions: true,
+    },
     watermark: { applied: provisioned.watermarkApplied, hasImage: Boolean(image), placement },
   });
 }));
@@ -891,11 +907,16 @@ app.post('/api/accounts/:id/test', handle(async (req, res) => {
 
 /** The shared watermark: the placement in force, and whether an image is stored. */
 app.get('/api/watermark', (_req, res) => {
-  res.json({ ...watermark.state(), corners: WATERMARK_CORNERS, resolutions: ALL_RESOLUTIONS });
+  res.json({ ...watermark.state(), anchors: WATERMARK_ANCHORS, corners: WATERMARK_CORNERS, resolutions: ALL_RESOLUTIONS });
 });
 
 /**
  * Change the placement.
+ *
+ * Two shapes of body arrive here and both end in the same four percentages:
+ * `{ corner, margin }` for a mark pinned to a corner, or
+ * `{ anchor: 'offset', left, top }` to place it by hand — `0` meaning flush
+ * against that edge. Naming neither leaves the current mode alone.
  *
  * Changing it does not touch Bunny by itself — it changes what the *next* apply
  * (or provision) sends. `POST /api/watermark/apply` is the second half of that
@@ -903,7 +924,7 @@ app.get('/api/watermark', (_req, res) => {
  */
 app.put('/api/watermark', (req, res) => {
   try {
-    res.json({ ...watermark.updateSettings((req.body ?? {}) as Record<string, unknown>), corners: WATERMARK_CORNERS });
+    res.json({ ...watermark.updateSettings((req.body ?? {}) as Record<string, unknown>), anchors: WATERMARK_ANCHORS, corners: WATERMARK_CORNERS });
   } catch (error) {
     if (error instanceof WatermarkError) return void res.status(400).json({ error: error.message });
     throw error;

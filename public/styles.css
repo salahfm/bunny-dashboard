@@ -184,6 +184,20 @@ label.inline {
   color: var(--text);
 }
 
+/*
+ * A field the chosen placement mode does not use. It stays in place so the panel
+ * keeps its shape, dimmed and disabled rather than hidden — the numbers are still
+ * worth reading, they are just not what this mode is set by.
+ */
+label.off {
+  opacity: 0.5;
+}
+
+label.off input,
+label.off select {
+  cursor: not-allowed;
+}
+
 input[type='text'],
 input[type='url'],
 input[type='search'],

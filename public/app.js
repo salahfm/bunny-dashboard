@@ -1960,11 +1960,19 @@
       const data = await api('GET', '/api/watermark');
       state.watermark = data;
       const settings = data.settings ?? {};
+      const placement = data.placement ?? {};
+      $('#watermark-anchor').value = settings.anchor === 'offset' ? 'offset' : 'corner';
       $('#watermark-corner').value = settings.corner ?? 'bottom-right';
       $('#watermark-width').value = String(settings.width ?? 12);
       $('#watermark-height').value = String(settings.height ?? 8);
       $('#watermark-margin').value = String(settings.margin ?? 2);
-      const placement = data.placement ?? {};
+      // The offsets are filled in whichever way the mark is placed: they are the
+      // mark's real edges, so the panel reads as one description of one position
+      // and switching to "by hand" is a move, not a jump.
+      const offset = (value, fallback) => String(Number.isFinite(Number(value)) ? value : fallback ?? 0);
+      $('#watermark-left').value = offset(settings.left, placement.left);
+      $('#watermark-top').value = offset(settings.top, placement.top);
+      watermarkFields();
       $('#watermark-state').textContent = data.hasImage
         ? `${bytes(data.bytes)} ${data.contentType ?? 'image'} · ${fmtPercent(placement.left)} from the left, ${fmtPercent(placement.top)} from the top`
         : 'no image yet — the position and size are saved, but nothing shows until one is uploaded';
@@ -1977,6 +1985,53 @@
   function fmtPercent(value) {
     const number = Number(value);
     return Number.isFinite(number) ? `${Math.round(number * 100) / 100}%` : '—';
+  }
+
+  /** Whether the mark is being placed by hand rather than pinned to a corner. */
+  function watermarkByHand() {
+    return $('#watermark-anchor').value === 'offset';
+  }
+
+  /**
+   * Show the fields the chosen placement actually uses.
+   *
+   * Both pairs stay on screen so the panel never changes shape, but only the live
+   * one is editable; the other is a read-out of what the server would store,
+   * greyed out and disabled rather than left to look editable.
+   */
+  function watermarkFields() {
+    const byHand = watermarkByHand();
+    for (const id of ['watermark-corner-field', 'watermark-margin-field']) $(`#${id}`).classList.toggle('off', byHand);
+    for (const id of ['watermark-left-field', 'watermark-top-field']) $(`#${id}`).classList.toggle('off', !byHand);
+    $('#watermark-corner').disabled = byHand;
+    $('#watermark-margin').disabled = byHand;
+    $('#watermark-left').disabled = !byHand;
+    $('#watermark-top').disabled = !byHand;
+    $('#watermark-hint').textContent = byHand
+      ? 'left and top are measured to the mark\'s own edges, in percent of the frame — 0 pins it flush against that edge'
+      : 'the mark sits in the chosen corner, inset from the edge by the margin — choose “left & top (by hand)” to type an exact position';
+    if (!byHand) mirrorPlacement();
+  }
+
+  /**
+   * Keep the offsets in step with the corner fields.
+   *
+   * The server derives left/top from the corner and the margin whenever a request
+   * does not carry them, and this is that same arithmetic — so the greyed-out
+   * numbers are the ones that will be stored, and switching to hand placement
+   * starts from where the mark already is.
+   */
+  function mirrorPlacement() {
+    const corner = $('#watermark-corner').value;
+    const right = corner === 'top-right' || corner === 'bottom-right';
+    const bottom = corner === 'bottom-left' || corner === 'bottom-right';
+    const restrict = (value, min, max) => Math.min(max, Math.max(min, value));
+    const wide = restrict(Number($('#watermark-width').value) || 12, 1, 100);
+    const tall = restrict(Number($('#watermark-height').value) || 8, 1, 100);
+    const margin = restrict(Number($('#watermark-margin').value) || 0, 0, 50);
+    const round = (value) => Math.round(value * 100) / 100;
+    $('#watermark-left').value = String(round(restrict(right ? 100 - wide - margin : margin, 0, 100 - wide)));
+    $('#watermark-top').value = String(round(restrict(bottom ? 100 - tall - margin : margin, 0, 100 - tall)));
   }
 
   /**
@@ -2007,12 +2062,15 @@
     const box = clear($('#accounts-verify-report'));
     box.classList.remove('hidden');
     const results = report.results ?? [];
-    const placement = report.expected?.placement;
+    // The server reports the expectation under `watermark` (what the libraries
+    // are checked against), not under `placement`.
+    const placement = report.expected?.watermark ?? report.expected?.placement;
     $('#accounts-verify-state').textContent =
       `${report.total} account(s) · ${report.inSync} in sync · ${report.drifted} drifted · ${report.skipped} without an account key` +
       (report.unreachable ? ` · ${report.unreachable} could not be read` : '') +
+      (report.expected?.scaleByBothDimensions ? ' · checked for the resolution ladder, “scale video by height and width”' : '') +
       (placement
-        ? ` · checked against a watermark at ${placement.left}% / ${placement.top}%, ${placement.width}% × ${placement.height}%`
+        ? ` and a watermark at ${placement.left}% / ${placement.top}%, ${placement.width}% × ${placement.height}%`
         : '');
 
     const body = h('tbody');
@@ -2122,8 +2180,9 @@
       $('#account-apikey').value = '';
       const library = data.library ?? {};
       const mark = data.watermark?.applied ? 'watermark applied' : 'watermark placement saved (no image yet)';
+      const scale = library.scaleByBothDimensions ? ' · scaled by height and width' : '';
       toast(
-        `library ${library.id} created for “${name}” · ${(library.resolutions ?? []).length} resolutions · ${mark}`,
+        `library ${library.id} created for “${name}” · ${(library.resolutions ?? []).length} resolutions${scale} · ${mark}`,
         'ok',
       );
       await refreshAccounts();
@@ -2162,15 +2221,42 @@
 
   /* ------------------------------------------------------------ watermark */
 
+  $('#watermark-anchor').addEventListener('change', () => watermarkFields());
+  // Typing a corner, a size or a margin moves the read-out with it, so the two
+  // numbers under "left" and "top" are never stale.
+  for (const id of ['#watermark-corner', '#watermark-width', '#watermark-height', '#watermark-margin']) {
+    $(id).addEventListener('input', () => {
+      if (!watermarkByHand()) mirrorPlacement();
+    });
+    $(id).addEventListener('change', () => {
+      if (!watermarkByHand()) mirrorPlacement();
+    });
+  }
+
   $('#watermark-save').addEventListener('click', async () => {
+    const byHand = watermarkByHand();
+    const left = $('#watermark-left').value.trim();
+    const top = $('#watermark-top').value.trim();
+    // A hand-placed mark cannot be saved half-blank: an empty box reads as zero,
+    // which would quietly move the mark to the edge instead of leaving it alone.
+    if (byHand && (!left || !top)) return void toast('give the left and top offsets, in percent', 'bad');
     try {
       await api('PUT', '/api/watermark', {
+        anchor: byHand ? 'offset' : 'corner',
         corner: $('#watermark-corner').value,
         width: Number($('#watermark-width').value),
         height: Number($('#watermark-height').value),
         margin: Number($('#watermark-margin').value),
+        // Only a hand-placed mark sends its offsets: a corner placement is
+        // derived from the corner and the margin, on the server, every time.
+        ...(byHand ? { left: Number(left), top: Number(top) } : {}),
       });
-      toast('watermark saved — apply it to put it on your libraries', 'ok');
+      toast(
+        byHand
+          ? `watermark saved at ${left}% from the left, ${top}% from the top — apply it to put it on your libraries`
+          : 'watermark saved — apply it to put it on your libraries',
+        'ok',
+      );
       await refreshWatermark();
     } catch (error) {
       toast(describeError(error), 'bad');

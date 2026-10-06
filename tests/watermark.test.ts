@@ -30,6 +30,51 @@ test('each corner is described as offsets from the top-left', () => {
   assert.deepEqual(watermarkPlacement({ ...base, corner: 'bottom-right' }), { left: 75, top: 85, width: 20, height: 10 });
 });
 
+test('a mark can be placed by hand, including flush against the left edge', () => {
+  const corner = { corner: 'top-right' as const, width: 20, height: 15, margin: 0 };
+  // The same corner and margin as a corner placement gives: 80% from the left.
+  assert.deepEqual(watermarkPlacement(corner), { left: 80, top: 0, width: 20, height: 15 });
+  // Placed by hand, 0 is a real offset — the mark sits on the edge.
+  assert.deepEqual(watermarkPlacement({ ...corner, anchor: 'offset', left: 0, top: 0 }), {
+    left: 0,
+    top: 0,
+    width: 20,
+    height: 15,
+  });
+  // Also a half-way position no corner can describe.
+  assert.deepEqual(watermarkPlacement({ ...corner, anchor: 'offset', left: 30, top: 45 }), {
+    left: 30,
+    top: 45,
+    width: 20,
+    height: 15,
+  });
+});
+
+test('a hand-placed mark that would leave the frame is pulled back inside it', () => {
+  const placement = watermarkPlacement({ anchor: 'offset', corner: 'top-left', left: 95, top: 95, width: 20, height: 15, margin: 0 });
+  assert.deepEqual(placement, { left: 80, top: 85, width: 20, height: 15 });
+  // An offset that was never set is the top-left corner, not NaN.
+  assert.deepEqual(watermarkPlacement({ anchor: 'offset', corner: 'top-left', width: 10, height: 10, margin: 0 }), {
+    left: 0,
+    top: 0,
+    width: 10,
+    height: 10,
+  });
+});
+
+test('switching to hand placement starts where the corner put the mark', () => {
+  const corner = normalizeWatermarkSettings({ corner: 'bottom-right', width: 20, height: 15, margin: 0 });
+  assert.equal(corner.left, 80);
+  assert.equal(corner.top, 85);
+  const byHand = normalizeWatermarkSettings({ anchor: 'offset' }, corner);
+  assert.equal(byHand.anchor, 'offset');
+  assert.deepEqual(watermarkPlacement(byHand), watermarkPlacement(corner));
+  // An unknown mode is not a mode, and offsets may arrive as strings.
+  assert.equal(normalizeWatermarkSettings({ anchor: 'diagonal' }).anchor, 'corner');
+  assert.equal(normalizeWatermarkSettings({ anchor: 'offset', left: '0' }).left, 0);
+  assert.equal(normalizeWatermarkSettings({ anchor: 'offset', left: 'nowhere' }, corner).left, 80);
+});
+
 test('a placement that would leave the frame is pulled back inside it', () => {
   // A mark that fills the frame plus a margin cannot hang off the edge.
   const placement = watermarkPlacement({ corner: 'bottom-right', width: 100, height: 100, margin: 20 });
@@ -75,10 +120,23 @@ test('an uploaded image and placement survive a restart', () => {
   assert.equal(state.hasImage, true);
   assert.equal(state.bytes, 9);
   assert.equal(state.contentType, 'image/png');
-  assert.deepEqual(state.settings, { corner: 'top-left', width: 25, height: 15, margin: 4 });
+  // The offsets are stored alongside the corner, because they are what the mark
+  // resolves to — a corner save keeps them in step rather than clearing them.
+  assert.deepEqual(state.settings, { anchor: 'corner', corner: 'top-left', left: 4, top: 4, width: 25, height: 15, margin: 4 });
   assert.deepEqual(state.placement, { left: 4, top: 4, width: 25, height: 15 });
   assert.equal(reopened.image()?.bytes.toString(), 'PNG-BYTES');
   assert.equal(reopened.image()?.contentType, 'image/png');
+});
+
+test('a hand-placed mark survives a restart as offsets', () => {
+  const dir = tempDir();
+  const store = new WatermarkStore(testConfig(dir));
+  store.updateSettings({ anchor: 'offset', corner: 'top-right', left: 0, top: 0, width: 20, height: 15, margin: 0 });
+  assert.deepEqual(store.state().placement, { left: 0, top: 0, width: 20, height: 15 });
+
+  const reopened = new WatermarkStore(testConfig(dir));
+  assert.deepEqual(reopened.settings, { anchor: 'offset', corner: 'top-right', left: 0, top: 0, width: 20, height: 15, margin: 0 });
+  assert.deepEqual(reopened.state().placement, { left: 0, top: 0, width: 20, height: 15 });
 });
 
 test('replacing the image keeps the placement', () => {

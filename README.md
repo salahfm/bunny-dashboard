@@ -103,17 +103,19 @@ Paste that URL into **Source URL** and press **Download & upload**.
   encrypted at rest (AES-256-GCM) and only ever displayed masked. Limit: 30.
   An account can also be created from **nothing but your bunny.net account API
   key**: the dashboard makes the Stream library itself, enables **every
-  resolution**, applies the watermark and fills in the library ID, Stream key
-  and pull zone — see [Accounts and the shared
+  resolution**, turns on **scale video by height and width**, applies the
+  watermark and fills in the library ID, Stream key and pull zone — see
+  [Accounts and the shared
   watermark](#accounts-and-the-shared-watermark).
 - **Watermark**: one image and one placement, shared by every account, so the
-  mark lands in the same corner at the same size on every library. A new library
-  gets it as it is created; libraries added by hand can be given it afterwards,
-  one at a time or all at once.
+  mark lands in the same corner at the same size on every library — picked by
+  corner *or* typed in as **left/top** offsets, which is what reaches the frame's
+  edges. A new library gets it as it is created; libraries added by hand can be
+  given it afterwards, one at a time or all at once.
 - **Check libraries**: read every library back from Bunny and report the ones
-  that no longer match — a shorter resolution ladder, a mark that moved, an image
-  missing — each with a *fix* that rewrites the settings and re-reads the library
-  to confirm.
+  that no longer match — a shorter resolution ladder, scaling by height and width
+  off, a mark that moved, an image missing — each with a *fix* that rewrites the
+  settings and re-reads the library to confirm.
 - **Queue engine**: oldest-first, evenly spread across enabled accounts, never
   more than 10 concurrent uploads per account. Retry failed jobs, cancel active
   ones, delete finished ones. Playback links when a pull-zone host is set.
@@ -278,11 +280,21 @@ dashboard:
 
 1. creates a Stream library named after the account,
 2. enables **all seven encoding resolutions** (`240p` … `2160p`),
-3. sets the shared watermark's position and size, and uploads the shared image,
-4. reads the pull zone back to derive the CDN hostname, and
-5. stores the **Stream API key Bunny generated** for that library, encrypted,
+3. turns on **scale video by height and width**
+   (`ScaleVideoUsingBothDimensions`, which Bunny's own panel leaves off),
+4. sets the shared watermark's position and size, and uploads the shared image,
+5. reads the pull zone back to derive the CDN hostname, and
+6. stores the **Stream API key Bunny generated** for that library, encrypted,
    along with the account key — so nothing has to be copied out of the Bunny
 dashboard by hand.
+
+The ladder and the scaling flag travel together, in the one settings call that
+also carries the watermark placement — Bunny documents
+`ScaleVideoUsingBothDimensions` on the update call rather than on create, so
+that request is the one place it can be relied on. A library that predates this
+(or one Bunny's panel made) shows up as **drifted** with "scale video by height
+and width" named, and **fix** puts it on: the same button that re-applies the
+watermark writes that flag and the resolution ladder back in the same request.
 
 If Bunny refuses — a wrong key, an account that has hit its library limit — the
 error is shown and **nothing is stored**, so the attempt can simply be repeated.
@@ -290,10 +302,24 @@ error is shown and **nothing is stored**, so the attempt can simply be repeated.
 ### The watermark
 
 One image and one placement, kept next to the database and applied to every
-account. The placement is stored as a **corner, a width, a height and a margin**,
-all in percentages of the frame, and turned into the four numbers Bunny takes
-(`WatermarkPositionLeft`/`Top`/`Width`/`Height`) — which is what makes the mark
-land in *exactly* the same place on every library regardless of video size.
+account. The position is described one of two ways and turned into the four
+numbers Bunny takes (`WatermarkPositionLeft`/`Top`/`Width`/`Height`), which is
+what makes the mark land in *exactly* the same place on every library regardless
+of video size:
+
+- **corner + margin** (the default): a corner, a width, a height and a margin,
+  all in percentages of the frame.
+- **left & top (by hand)**: the mark's own edges, in percent from the top-left of
+  the frame. This is the only way to reach some positions at all — a top-right
+  mark is `100 - width - margin` from the left, so a *left*-hand corner with no
+  margin is the one way a corner description reaches `0%`; anything else (a mark
+  half-way across, or flush left with the corner setting untouched) wants the
+  offsets typed in. The two fields are clamped so the mark itself cannot leave
+  the frame, and both modes end in the same four numbers.
+
+The panel shows the resolved offsets either way, greyed out and disabled while
+the other mode is in charge, so `left`/`top` always read as where the mark
+really is.
 
 - **Save watermark** changes the placement. It does not touch Bunny by itself.
 - **Apply to all accounts** re-sends the placement and re-uploads the image to
@@ -319,7 +345,7 @@ from here the two look identical.
 
 | Verdict | Meaning |
 | --- | --- |
-| **in sync** | the ladder, the placement and the image are what the settings say |
+| **in sync** | the ladder, the scaling flag, the placement and the image are what the settings say |
 | **drifted** | at least one differs; the report names *what was expected* and *what Bunny holds*, and a **fix** button writes the settings back and re-reads the library to confirm |
 | **not checked** | Bunny was not asked: the account has no stored account API key (or the request failed), and the reason is shown |
 
@@ -864,12 +890,12 @@ keeps the queue honest.
 | `GET`/`POST` | `/api/accounts` | list / add an account |
 | `PATCH`/`DELETE` | `/api/accounts/:id` | update (incl. `enabled`) / remove |
 | `POST` | `/api/accounts/:id/test` | verify key + library |
-| `POST` | `/api/accounts/provision` | `{ name, accountApiKey }` → create a Stream library with every resolution enabled and the shared watermark applied, and add it as an account |
+| `POST` | `/api/accounts/provision` | `{ name, accountApiKey }` → create a Stream library with every resolution enabled, scale by height and width on, and the shared watermark applied, and add it as an account |
 | `POST` | `/api/accounts/:id/watermark` | re-apply the shared watermark to one library (`502` with the reason when its account key is missing) |
-| `POST` | `/api/accounts/verify` | **read every library back**: per account, whether its resolution ladder, watermark placement and watermark image match the settings, with `inSync` / `drifted` / `skipped` counts. Read-only |
-| `POST` | `/api/accounts/:id/settings` | **put the settings back** onto one library (ladder + placement, then the image) and read it back to confirm — the remedy for a drifted library |
+| `POST` | `/api/accounts/verify` | **read every library back**: per account, whether its resolution ladder, `ScaleVideoUsingBothDimensions`, watermark placement and watermark image match the settings, with `inSync` / `drifted` / `skipped` counts. Read-only |
+| `POST` | `/api/accounts/:id/settings` | **put the settings back** onto one library (ladder + `ScaleVideoUsingBothDimensions` + placement, then the image) and read it back to confirm — the remedy for a drifted library |
 | `GET` | `/api/watermark` | the shared watermark: placement in force, whether an image is stored, its size and type |
-| `PUT` | `/api/watermark` | change the placement: `{ corner, width, height, margin }` (percentages, clamped to the frame) |
+| `PUT` | `/api/watermark` | change the placement: `{ anchor: 'corner', corner, width, height, margin }` or `{ anchor: 'offset', left, top, width, height }` (percentages, clamped to the frame; `GET` reports both modes under `anchors`) |
 | `PUT` | `/api/watermark/image` | the image itself as a raw body (`image/png`, `image/jpeg`, …) — up to 10 MB |
 | `DELETE` | `/api/watermark/image` | forget the image (libraries keep the placement) |
 | `POST` | `/api/watermark/apply` | `{ accountIds? }` → re-apply to every account (or the named ones); answers with a per-account report |
@@ -1037,11 +1063,17 @@ right home for the queue. Hosts that build from a git repository only need the
 
 ```bash
 npm run typecheck        # tsc --noEmit
-npm test                 # 303 tests (queue caps, crypto, store + its change hook, catalogue, the Stream client, the account client behind library provisioning, watermarks and the library read-back, TUS, watcher, job lifecycle, crash resume, HLS, source pipeline, subtitles, DeepL translation, multi-language targets, subtitle backfill and its automatic repair, the R2 archive background queue with its verification pass and its scheduled weekly sweep, targeted repair, restore and signed-URL playback, and its SigV4 signer/presigner, tunnel, network policy, diagnostics, login, autopilot, host politeness)
+npm test                 # 308 tests (queue caps, crypto, store + its change hook, catalogue, the Stream client, the account client behind library provisioning, watermarks and the library read-back, TUS, watcher, job lifecycle, crash resume, HLS, source pipeline, subtitles, DeepL translation, multi-language targets, subtitle backfill and its automatic repair, the R2 archive background queue with its verification pass and its scheduled weekly sweep, targeted repair, restore and signed-URL playback, and its SigV4 signer/presigner, tunnel, network policy, diagnostics, login, autopilot, host politeness)
 
 # End-to-end against a running mock server:
 npm run mock &           # or in another terminal
-node scripts/smoke.mjs   # TMDB, accounts, provisioning from an account key, the shared watermark and the library read-back (check, drift, fix, re-check), uploads, concurrency cap, the live event stream, the source pipeline, the subtitle backfill (two titles repaired, one source fetch each), the autopilot, watched folder, cleanup
+node scripts/smoke.mjs   # 127 checks: TMDB, accounts, provisioning from an account key, the shared watermark (both placement modes) and the library read-back (check, drift, fix, re-check), uploads, concurrency cap, the live event stream, the source pipeline, the subtitle backfill (two titles repaired, one source fetch each), the autopilot, watched folder, cleanup
+
+# The server under test must have no R2 destination: a block of the checks is
+# about that state, and one of them queues an archive — which on a real
+# destination would move videos out of Bunny. A repo-root `.env` with the R2_*
+# variables set counts, so blank them for the run:
+#   R2_ACCOUNT_ID= R2_ACCESS_KEY_ID= R2_SECRET_ACCESS_KEY= R2_BUCKET= npm run mock
 
 # …when the dashboard runs with a custom DATA_DIR:
 SMOKE_BASE_URL=http://127.0.0.1:4791 SMOKE_DATA_DIR=data-smoke2 node scripts/smoke.mjs

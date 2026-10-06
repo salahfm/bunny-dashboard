@@ -18,6 +18,13 @@
  *
  * Set SMOKE_DATA_DIR when the dashboard under test was started with a custom
  * DATA_DIR, so the temp-file checks look in the right place.
+ *
+ * The server must have **no R2 destination**: a block of checks is about that
+ * state, and one of them queues an archive, which on a server that really does
+ * have a destination would move videos out of Bunny. Since `loadEnvFile` reads
+ * a repo-root `.env` even under `--mock`, such a server makes this script refuse
+ * to run rather than check the wrong thing — start it with the `R2_*` variables
+ * blanked instead.
  */
 import fs from 'node:fs';
 import http from 'node:http';
@@ -155,6 +162,19 @@ check(
 // This run has no R2 destination, which is the state that must be safe: the
 // dashboard has to say so, refuse to switch the archive on, and archive nothing
 // — it must never look like it deleted a video without keeping a copy.
+//
+// A server that *does* have a destination (a repo-root `.env` with the `R2_*`
+// variables is enough — it is read even under `--mock`) is the opposite state,
+// and this script must not drive it: queueing an archive there really does move
+// videos out of Bunny. So the mismatch is refused here, with the command that
+// fixes it, rather than left to surface nine checks deeper.
+if (result.json?.archive?.configured === true) {
+  console.error('SMOKE REFUSED — the dashboard under test has an R2 destination configured, and this');
+  console.error('script checks the state with none (queueing an archive on it would move videos out');
+  console.error('of Bunny for real). Start it without one, e.g.:');
+  console.error('  R2_ACCOUNT_ID= R2_ACCESS_KEY_ID= R2_SECRET_ACCESS_KEY= R2_BUCKET= npm run mock');
+  process.exit(2);
+}
 check(
   'settings report the R2 archive as unconfigured',
   result.json?.archive?.configured === false && result.json?.archive?.auto === false && typeof result.json?.archive?.urlTtl === 'number',
@@ -455,6 +475,33 @@ check(
   JSON.stringify(result.json?.watermark),
 );
 
+// The placement can also be typed in by hand, which is the only way to put the
+// mark flush against the left edge: 0 is a real offset, not "the far corner".
+result = await request('GET', '/api/watermark');
+check(
+  'the watermark names both ways a placement can be described',
+  Array.isArray(result.json?.anchors) && result.json.anchors.join(',') === 'corner,offset',
+  JSON.stringify(result.json?.anchors),
+);
+result = await request('PUT', '/api/watermark', { anchor: 'offset', corner: 'top-right', left: 0, top: 0, width: 20, height: 15, margin: 0 });
+check(
+  'a mark can be placed by hand, flush against the left and top edges',
+  result.status === 200 && result.json?.settings?.anchor === 'offset' && result.json?.placement?.left === 0 && result.json?.placement?.top === 0,
+  JSON.stringify(result.json?.placement),
+);
+result = await request('PUT', '/api/watermark', { anchor: 'offset', left: 40, top: 95, width: 20, height: 15 });
+check(
+  'an offset that would push the mark off the frame is pulled back inside it',
+  result.status === 200 && result.json?.placement?.left === 40 && result.json?.placement?.top === 85,
+  JSON.stringify(result.json?.placement),
+);
+result = await request('PUT', '/api/watermark', { anchor: 'corner', corner: 'bottom-right', width: 12, height: 8, margin: 2 });
+check(
+  'switching back to a corner derives the offsets from it again',
+  result.status === 200 && result.json?.settings?.anchor === 'corner' && result.json?.placement?.left === 86 && result.json?.placement?.top === 90,
+  JSON.stringify(result.json?.placement),
+);
+
 // The hand-added account above has no account API key, which is exactly the
 // case the report has to name rather than swallow.
 result = await request('POST', '/api/watermark/apply', {});
@@ -481,8 +528,8 @@ check(
 );
 const provisionedId = result.json?.account?.id;
 check(
-  'the new library got every resolution and wears the watermark',
-  (result.json?.library?.resolutions ?? []).length === 7 && result.json?.watermark?.applied === true,
+  'the new library got every resolution, scaling by height and width, and the watermark',
+  (result.json?.library?.resolutions ?? []).length === 7 && result.json?.library?.scaleByBothDimensions === true && result.json?.watermark?.applied === true,
   JSON.stringify(result.json?.library),
 );
 check(
@@ -546,8 +593,8 @@ check(
 const reported = (result.json?.results ?? []).find((entry) => entry.id === fixableId) ?? {};
 const reportedFields = (reported.findings ?? []).map((finding) => finding.field).sort();
 check(
-  'it names the resolution ladder, the placement and the missing image',
-  JSON.stringify(reportedFields) === JSON.stringify(['resolutions', 'watermark-image', 'watermark-placement']),
+  'it names the resolution ladder, the scaling flag, the placement and the missing image',
+  JSON.stringify(reportedFields) === JSON.stringify(['encoding', 'resolutions', 'watermark-image', 'watermark-placement']),
   JSON.stringify(reportedFields),
 );
 check(

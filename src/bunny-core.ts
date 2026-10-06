@@ -16,9 +16,9 @@
  *
  * The one thing that ties the halves together is [BunnyCoreClient.provisionLibrary]:
  * create the library, read back the Stream API key Bunny generated for it,
- * enable every resolution, upload the shared watermark and pin its position and
- * size. That is the whole of "add an account": one account API key in, a
- * ready-to-publish Stream library out.
+ * enable every resolution, turn on scaling by both dimensions, upload the shared
+ * watermark and pin its position and size. That is the whole of "add an
+ * account": one account API key in, a ready-to-publish Stream library out.
  */
 import { BunnyError } from './bunny';
 import { DEFAULT_FETCH_RETRIES, DEFAULT_FETCH_TIMEOUT_MS, NetworkError, fetchWithPolicy } from './net';
@@ -39,6 +39,23 @@ export const ALL_RESOLUTIONS = ['240p', '360p', '480p', '720p', '1080p', '1440p'
 export function resolutionsValue(heights: readonly string[] = ALL_RESOLUTIONS): string {
   return heights.join(',');
 }
+
+/**
+ * The encoding flags every library this dashboard makes or fixes carries.
+ *
+ * `ScaleVideoUsingBothDimensions` is the API behind Bunny's "scale video by
+ * height and width" switch, which is off on a library Bunny's own panel created.
+ * It is documented on the *update* call only, so it travels with the resolution
+ * ladder rather than with the create call — the same request that sets the ladder
+ * sets this, and a library that never took it shows up in the read-back check.
+ *
+ * (An earlier version of this file sent it on create as well; Bunny ignores
+ * fields it does not know, so it made no difference — one documented call is
+ * easier to reason about than two speculative ones.)
+ */
+export const LIBRARY_ENCODING_SETTINGS: Record<string, unknown> = { ScaleVideoUsingBothDimensions: true };
+
+export const SCALE_BY_BOTH_DIMENSIONS = 'ScaleVideoUsingBothDimensions';
 
 /**
  * A video library as the core API describes it.
@@ -63,6 +80,13 @@ export interface BunnyLibrary {
   WatermarkWidth?: number;
   WatermarkHeight?: number;
   EnabledResolutions?: string;
+  /**
+   * Bunny's "scale video by height and width": whether an upload is scaled using
+   * both dimensions rather than one. Off by default on a library Bunny's own
+   * panel created, which is why every library this dashboard configures turns it
+   * on and the read-back check looks for it.
+   */
+  ScaleVideoUsingBothDimensions?: boolean;
   [key: string]: unknown;
 }
 
@@ -107,12 +131,19 @@ export interface LibraryExpectation {
   watermark?: WatermarkPlacement;
   /** Whether an image should be on the library at all. */
   expectImage?: boolean;
+  /**
+   * Whether "scale video by height and width" should be on.
+   *
+   * Defaults to true, like the resolution ladder: a check run without saying so
+   * is still asking whether the library holds what this dashboard configures.
+   */
+  scaleByBothDimensions?: boolean;
 }
 
 /** One way a library differs from what the dashboard asked for. */
 export interface LibraryFinding {
   /** Which part of the library drifted. */
-  field: 'resolutions' | 'watermark-placement' | 'watermark-image';
+  field: 'resolutions' | 'encoding' | 'watermark-placement' | 'watermark-image';
   /** What the dashboard asked for, in prose. */
   expected: string;
   /** What bunny.net reports, in prose. */
@@ -182,6 +213,20 @@ export function libraryDrift(library: BunnyLibrary, expected: LibraryExpectation
         message: `missing ${missing.join(', ')}`,
       });
     }
+  }
+
+  if ((expected.scaleByBothDimensions ?? true) && library.ScaleVideoUsingBothDimensions !== true) {
+    // The field is either off or absent, and both are worth saying out loud: a
+    // library that never took the setting is the shape a Bunny-made one has.
+    findings.push({
+      field: 'encoding',
+      expected: 'videos scaled by height and width (ScaleVideoUsingBothDimensions)',
+      actual:
+        library.ScaleVideoUsingBothDimensions === undefined
+          ? 'Bunny did not report it'
+          : `Bunny holds ${String(library.ScaleVideoUsingBothDimensions)}`,
+      message: '"scale video by height and width" is off, so uploads are not scaled using both dimensions',
+    });
   }
 
   if (expected.watermark) {
@@ -323,8 +368,8 @@ export class BunnyCoreClient {
 
   /** Create a video library under the account. */
   async createVideoLibrary(name: string, extra: Record<string, unknown> = {}): Promise<BunnyLibrary> {
-    if (this.mock) return mockCreateLibrary(name);
     const body = { Name: name, EnabledResolutions: resolutionsValue(), ...extra };
+    if (this.mock) return mockCreateLibrary(name, body);
     return this.request<BunnyLibrary>('/videolibrary', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -356,9 +401,19 @@ export class BunnyCoreClient {
     });
   }
 
-  /** Turn on every encoding resolution the library offers. */
-  async enableAllResolutions(id: number | string): Promise<BunnyLibrary> {
-    return this.updateVideoLibrary(id, { EnabledResolutions: resolutionsValue() });
+  /**
+   * The whole encoding half of a library's settings, in one call.
+   *
+   * The ladder of rungs plus the flags that are shared by every library, which
+   * is why this is no longer just "enable every resolution": Bunny keeps both on
+   * the same object, and one request leaves the library configured rather than
+   * two that could half-succeed.
+   */
+  async configureEncoding(id: number | string, resolutions: readonly string[] = ALL_RESOLUTIONS): Promise<BunnyLibrary> {
+    return this.updateVideoLibrary(id, {
+      EnabledResolutions: resolutionsValue(resolutions),
+      ...LIBRARY_ENCODING_SETTINGS,
+    });
   }
 
   /**
@@ -501,11 +556,18 @@ export class BunnyCoreClient {
   }): Promise<ProvisionedLibrary> {
     const library = await this.createVideoLibrary(options.name, options.create ?? {});
     const libraryId = String(library.Id);
-    // Enable every resolution explicitly: the create call already asks for them,
-    // but the placement call re-sends them so one request leaves the library
-    // whole even if Bunny ignored the field on creation.
+    // One settings call leaves the library whole: the resolution ladder and the
+    // shared encoding flags go in every time, and the placement joins them when
+    // there is one. (The create call already asks for the ladder, but Bunny was
+    // asked twice here long before `ScaleVideoUsingBothDimensions` was found on
+    // the update call only — and a re-sent field is cheap.)
     if (options.watermark) {
-      await this.setWatermarkPlacement(libraryId, options.watermark, { EnabledResolutions: resolutionsValue() });
+      await this.setWatermarkPlacement(libraryId, options.watermark, {
+        EnabledResolutions: resolutionsValue(),
+        ...LIBRARY_ENCODING_SETTINGS,
+      });
+    } else {
+      await this.configureEncoding(libraryId);
     }
     let watermarkApplied = false;
     if (options.image && options.image.byteLength > 0) {
@@ -536,10 +598,11 @@ export class BunnyCoreClient {
   /**
    * Put back everything this dashboard owns on a library that already exists.
    *
-   * The companion to [libraryDrift]: reading a library back can report a
-   * narrower resolution ladder or a placement that has moved, and this is the
-   * one call that makes both true again. The placement and the ladder go in a
-   * single request; the image, being a body of bytes, is its own.
+ * The companion to [libraryDrift]: reading a library back can report a
+ * narrower resolution ladder, scaling by height and width switched off, or a
+ * placement that has moved, and this is the one call that makes all of them true
+ * again. The placement, the ladder and the flags go in a single request; the
+ * image, being a body of bytes, is its own.
    */
   async applyLibrarySettings(
     libraryId: number | string,
@@ -552,6 +615,7 @@ export class BunnyCoreClient {
   ): Promise<boolean> {
     await this.setWatermarkPlacement(libraryId, options.placement, {
       EnabledResolutions: resolutionsValue(options.resolutions ?? ALL_RESOLUTIONS),
+      ...LIBRARY_ENCODING_SETTINGS,
     });
     if (!options.image || options.image.byteLength === 0) return false;
     await this.uploadWatermark(libraryId, options.image, options.imageContentType ?? 'image/png');
@@ -587,8 +651,10 @@ let MOCK_NEXT_ID = 900_000;
 
 /**
  * A library as Bunny holds one this dashboard never configured: a ladder that
- * stops at 1080p and no watermark at all. That is what the read-back check is
- * for, so the mock has to be able to represent it.
+ * stops at 1080p, scaling by height and width switched off, and no watermark at
+ * all — which is exactly what a library made in Bunny's own panel looks like.
+ * That is what the read-back check is for, so the mock has to be able to
+ * represent it.
  */
 function mockHandMadeLibrary(id: number, name: string): BunnyLibrary {
   return {
@@ -599,12 +665,26 @@ function mockHandMadeLibrary(id: number, name: string): BunnyLibrary {
     PullZoneId: id + 500_000,
     HasWatermark: false,
     EnabledResolutions: '240p,360p,480p,720p,1080p',
+    ScaleVideoUsingBothDimensions: false,
   };
 }
 
-function mockCreateLibrary(name: string): BunnyLibrary {
+/**
+ * Create a mock library from the body the client sent, the way Bunny does.
+ *
+ * `Id` and `HasWatermark` are the library's own: they are Bunny's to assign, not
+ * the caller's to set. Everything else the request named is stored as sent, so a
+ * library this process created reads back the way it was configured.
+ */
+function mockCreateLibrary(name: string, body: Record<string, unknown> = {}): BunnyLibrary {
   const id = (MOCK_NEXT_ID += 1);
-  const library: BunnyLibrary = { ...mockHandMadeLibrary(id, name), EnabledResolutions: resolutionsValue() };
+  const library: BunnyLibrary = {
+    ...mockHandMadeLibrary(id, name),
+    ...(body as Partial<BunnyLibrary>),
+    Id: id,
+    Name: name,
+    HasWatermark: false,
+  };
   MOCK_LIBRARIES.set(id, library);
   return library;
 }
