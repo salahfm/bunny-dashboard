@@ -453,6 +453,26 @@
             <button id="settings-save" class="primary">Save settings</button>
             <button id="settings-clear">Forget TMDB credential</button>
           </div>
+
+          <h2>Checking the archive</h2>
+          <p class="muted small">
+            An archived title is only safe while something keeps re-reading it. This runs the Library's <em>check R2</em>
+            pass on a timer — every manifest, and every object it lists, re-hashed — so <code>verifiedAt</code> keeps up to
+            date on its own and anything that stopped matching turns up on its own row without anyone thinking to look.
+          </p>
+          <div class="row">
+            <label class="inline"><input id="check-enabled" type="checkbox" /> re-check the archive on its own</label>
+            <label>every <input id="check-interval" type="number" min="1" max="720" step="1" /> h</label>
+            <label><input id="check-batch" type="number" min="1" max="5000" step="1" /> titles at a time</label>
+            <button id="check-save" class="primary">Save</button>
+            <button id="check-run">Check now</button>
+            <button id="check-clear">Clear log</button>
+          </div>
+          <div class="row">
+            <span id="check-status" class="muted small"></span>
+          </div>
+          <pre id="check-log" class="output"></pre>
+
           <h2>Network</h2>
           <p class="muted small">
             A job that fails with <code>fetch failed</code> is almost always one of two things: this machine cannot reach

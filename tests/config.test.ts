@@ -77,6 +77,8 @@ test('the R2 archive needs all of its keys, or none of them', () => {
     enabled: true,
     keepBunny: false,
     urlTtl: 300,
+    verify: true,
+    verifyIntervalMs: 7 * 24 * 60 * 60_000,
   });
 });
 
@@ -94,6 +96,14 @@ test('the archive switches read like every other flag, and the prefix has a defa
   assert.equal(parseR2({ ...base, R2_URL_TTL: '0' }).config?.urlTtl, 1);
   assert.equal(parseR2({ ...base, R2_URL_TTL: '99999999' }).config?.urlTtl, 604_800);
   assert.equal(parseR2({ ...base, R2_URL_TTL: 'soon' }).config?.urlTtl, 300);
+  // The scheduled re-check: weekly and on by default, clamped to 1 h – 30 days.
+  assert.equal(parseR2(base).config?.verify, true);
+  assert.equal(parseR2({ ...base, R2_VERIFY: 'off' }).config?.verify, false);
+  assert.equal(parseR2(base).config?.verifyIntervalMs, 7 * 24 * 60 * 60_000);
+  assert.equal(parseR2({ ...base, R2_VERIFY_INTERVAL_MS: '86400000' }).config?.verifyIntervalMs, 86_400_000);
+  assert.equal(parseR2({ ...base, R2_VERIFY_INTERVAL_MS: '1' }).config?.verifyIntervalMs, 60 * 60_000);
+  assert.equal(parseR2({ ...base, R2_VERIFY_INTERVAL_MS: '99999999999' }).config?.verifyIntervalMs, 30 * 24 * 60 * 60_000);
+  assert.equal(parseR2({ ...base, R2_VERIFY_INTERVAL_MS: 'soon' }).config?.verifyIntervalMs, 7 * 24 * 60 * 60_000);
 });
 
 test('the TUS chunk size is clamped to sane bounds', () => {

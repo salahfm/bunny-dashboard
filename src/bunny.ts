@@ -8,7 +8,32 @@
  */
 import fs from 'node:fs';
 import { DEFAULT_FETCH_RETRIES, DEFAULT_FETCH_TIMEOUT_MS, NetworkError, fetchWithPolicy } from './net';
-import { TusError, TusUploadAborted, fileTusSource, tusUpload, type TusSource, type TusUploadResult } from './tus';
+import { DEFAULT_TUS_CHUNK_BYTES, TusError, TusUploadAborted, fileTusSource, tusUpload, type TusSource, type TusUploadResult } from './tus';
+
+/**
+ * A byte source as the web stream a `PUT` body has to be.
+ *
+ * The source is read strictly forwards, one chunk per pull, so the bytes are
+ * never held anywhere but in the request — the point of a streamed upload.
+ */
+function tusSourceStream(source: TusSource, chunkBytes = DEFAULT_TUS_CHUNK_BYTES): ReadableStream<Uint8Array> {
+  let offset = 0;
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (offset >= source.totalBytes) {
+        controller.close();
+        return;
+      }
+      const chunk = await source.read(offset, Math.min(chunkBytes, source.totalBytes - offset));
+      if (!chunk.length) {
+        controller.close();
+        return;
+      }
+      offset += chunk.length;
+      controller.enqueue(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.length));
+    },
+  });
+}
 
 export interface BunnyCaption {
   srclang: string;
@@ -306,6 +331,34 @@ export class BunnyClient {
       body: stream as unknown as NonNullable<RequestInit['body']>,
       duplex: 'half',
     } as RequestInit & { duplex: 'half' }, { timeoutMs: 30 * 60_000, retries: 0 });
+    await this.ensureOk(response);
+  }
+
+  /**
+   * Raw binary PUT, streamed from a byte source rather than a file.
+   *
+   * The same single attempt as [uploadVideo], with the same ceiling, but the
+   * body is pulled straight off the source as the request is written — so a
+   * caller holding an object in R2 (or anywhere else) can hand it over without
+   * ever putting it on disk first.
+   */
+  async uploadVideoStream(videoId: string, source: TusSource): Promise<void> {
+    if (this.mock) return;
+    const response = await this.send(
+      `${this.base}/videos/${encodeURIComponent(videoId)}`,
+      {
+        method: 'PUT',
+        headers: {
+          AccessKey: this.apiKey,
+          accept: 'application/json',
+          'content-type': 'application/octet-stream',
+          'content-length': String(source.totalBytes),
+        },
+        body: tusSourceStream(source) as unknown as NonNullable<RequestInit['body']>,
+        duplex: 'half',
+      } as RequestInit & { duplex: 'half' },
+      { timeoutMs: 30 * 60_000, retries: 0 },
+    );
     await this.ensureOk(response);
   }
 

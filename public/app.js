@@ -45,6 +45,8 @@
     archiveRestore: [],
     /** What a check flagged and a targeted repair could mend. */
     archiveRepair: [],
+    /** The scheduled re-check: when it next runs, and what the last sweep found. */
+    archiveCheck: null,
     tunnel: null,
     autopilot: null,
     only: new Set(),
@@ -140,6 +142,17 @@
     const date = new Date(iso);
     if (Number.isNaN(date.getTime())) return '—';
     return date.toLocaleTimeString();
+  }
+
+  /**
+   * A timestamp as a person reads it: the clock time when it is today, the full
+   * date when it is not. A weekly check's "next pass" is a week away, so a bare
+   * time of day would read as "in a few minutes".
+   */
+  function whenLabel(iso) {
+    const date = new Date(iso);
+    if (Number.isNaN(date.getTime())) return '—';
+    return date.toDateString() === new Date().toDateString() ? date.toLocaleTimeString() : date.toLocaleString();
   }
 
   function fmtDuration(ms) {
@@ -1337,6 +1350,9 @@
       case 'verifying':
         return `re-hashing ${task.stored ?? 0}/${task.assets ?? 0} object(s) against the manifest`;
       case 'downloading':
+        // A restore reads the bucket and hands the bytes on in the same pass, so
+        // its first half is the whole trip rather than just the download.
+        if (task.operation === 'restore') return `streaming ${task.asset ?? 'the rendition'} out of R2 into Bunny`;
         return `downloading ${task.asset ?? 'the rendition'} from R2`;
       case 'repairing':
         return task.assets ? `mending ${task.stored ?? 0}/${task.assets} flagged object(s)` : 'mending the flagged objects';
@@ -1379,15 +1395,15 @@
       (entry.archive.mediaKey
         ? ` · plays ${entry.archive.base ? 'from the bucket directly' : `through the dashboard with a signed URL (${archiveTtlLabel(state.settings?.archive?.urlTtl)})`}`
         : '') +
-      `${entry.archive.restoredAt ? ` · put back into Bunny ${shortTime(entry.archive.restoredAt)}` : ''}` +
+      `${entry.archive.restoredAt ? ` · put back into Bunny ${whenLabel(entry.archive.restoredAt)}` : ''}` +
       `${
         entry.archive.verifiedAt || verify
-          ? ` · checked ${shortTime(entry.archive.verifiedAt ?? verify?.at)}${verify && !verify.ok ? ` (${(verify.missing ?? []).length} missing, ${(verify.mismatched ?? []).length} changed)` : ''}`
+          ? ` · checked ${whenLabel(entry.archive.verifiedAt ?? verify?.at)}${verify && !verify.ok ? ` (${(verify.missing ?? []).length} missing, ${(verify.mismatched ?? []).length} changed)` : ''}`
           : ''
       }` +
       `${
         entry.archive.repairedAt
-          ? ` · mended ${shortTime(entry.archive.repairedAt)} (${entry.archive.repair?.recopied?.length ?? 0} re-copied` +
+          ? ` · mended ${whenLabel(entry.archive.repairedAt)} (${entry.archive.repair?.recopied?.length ?? 0} re-copied` +
             `${entry.archive.repair?.drifted?.length ? `, ${entry.archive.repair.drifted.length} changed` : ''}` +
             `${entry.archive.repair?.dropped?.length ? `, ${entry.archive.repair.dropped.length} dropped` : ''}` +
             `${entry.archive.repair?.switchedTo ? `, now playing ${entry.archive.repair.switchedTo}` : ''})`
@@ -2089,6 +2105,9 @@
     $('#library-verify').title = archive.configured
       ? `Re-read every manifest in ${archive.bucket} and re-hash the objects it lists`
       : 'no R2 destination is configured';
+    // The scheduled pass is its own little form, below the settings it belongs
+    // to; it is read and written through /api/archive/check.
+    void refreshCheck();
     $('#mode-badge').textContent = settings.mock ? 'MOCK providers' : 'live providers';
 
     const runtime = clear($('#runtime-table tbody'));
@@ -2121,6 +2140,14 @@
           ? `${settings.archive.bucket}/${settings.archive.prefix}${settings.archive.keepBunny ? ' · keeps the Bunny copy' : ' · removes the Bunny copy'}` +
             ` · plays through the dashboard with signed URLs (${archiveTtlLabel(settings.archive.urlTtl)}, R2_URL_TTL)` +
             `${settings.archive.publicBase ? ` · also served at ${settings.archive.publicBase}` : ' · no public base needed'}`
+          : 'not configured',
+      ],
+      [
+        'archive check',
+        settings.archive?.configured
+          ? (settings.archive.check?.enabled === false ? 'off' : checkIntervalLabel(settings.archive.check?.intervalMs)) +
+            ` · ${settings.archive.check?.totals?.checked ?? 0} of ${settings.archive.check?.totals?.archived ?? 0} title(s) checked` +
+            `${settings.archive.check?.totals?.failing ? ` · ${settings.archive.check.totals.failing} stopped matching` : ' · nothing has stopped matching'}`
           : 'not configured',
       ],
       ['scrape pace', `${settings.source?.minIntervalMs ?? 350} ms between hits to one host · first cooldown ${fmtDuration(settings.source?.cooldownMs ?? 60_000)}`],
@@ -2339,6 +2366,103 @@
     }
   });
 
+  /* ------------------------------------------------------- archive check */
+
+  /** "every 7 days", "every 12 h" — the interval as a person would say it. */
+  function checkIntervalLabel(ms) {
+    const hours = Math.max(1, Math.round(Number(ms) / 3_600_000));
+    if (hours % 24 !== 0) return `every ${hours} h`;
+    const days = hours / 24;
+    return days === 1 ? 'every day' : `every ${days} days`;
+  }
+
+  function renderCheck(check, options = {}) {
+    if (!check) return;
+    state.archiveCheck = check;
+    const configured = Boolean(state.settings?.archive?.configured);
+    // A background refresh (the slow poll, or a sweep landing mid-edit) must not
+    // clobber a half-typed interval.
+    if (!options.skipConfig) {
+      $('#check-enabled').checked = check.config.enabled;
+      $('#check-interval').value = String(Math.round((check.config.intervalMs / 3_600_000) * 100) / 100);
+      $('#check-batch').value = String(check.config.batchSize);
+    }
+    $('#check-enabled').disabled = !configured;
+    $('#check-interval').disabled = !configured;
+    $('#check-batch').disabled = !configured;
+    $('#check-run').disabled = !configured;
+
+    const totals = check.totals ?? {};
+    const failing = check.lastSweep?.failingKeys ?? [];
+    const named = failing.slice(0, 3).join(', ') + (failing.length > 3 ? ` and ${failing.length - 3} more` : '');
+    const parts = [
+      check.running ? 'a sweep is under way' : null,
+      `${totals.archived ?? 0} archived`,
+      `${totals.checked ?? 0} checked`,
+      totals.failing ? `${totals.failing} stopped matching${named ? ` — ${named}` : ''}` : 'nothing has stopped matching',
+      totals.never ? `${totals.never} never checked` : null,
+    ].filter(Boolean);
+    if (check.config.enabled) {
+      parts.push(check.running ? 'the next pass follows this one' : check.nextRunAt ? `next pass ${whenLabel(check.nextRunAt)}` : 'no pass scheduled');
+    } else {
+      parts.push('switched off');
+    }
+    parts.push(check.lastRunAt ? `last pass ${whenLabel(check.lastRunAt)}` : 'no pass has run yet');
+    $('#check-status').textContent = configured ? parts.join(' · ') : 'not configured — there is no archive to check';
+    $('#check-log').textContent = check.log?.length ? check.log.join('\n') : 'nothing logged yet';
+  }
+
+  async function refreshCheck(options = {}) {
+    const quiet = options.quiet === true;
+    try {
+      const data = await api('GET', '/api/archive/check');
+      renderCheck(data, { skipConfig: quiet });
+    } catch (error) {
+      if (!quiet) toast(describeError(error), 'bad');
+    }
+  }
+
+  $('#check-save').addEventListener('click', async () => {
+    try {
+      const data = await api('PUT', '/api/archive/check', {
+        enabled: $('#check-enabled').checked,
+        intervalMs: Math.round(Number($('#check-interval').value) * 3_600_000),
+        batchSize: Number($('#check-batch').value),
+      });
+      renderCheck(data);
+      toast(data.config.enabled ? `archive checks saved — ${checkIntervalLabel(data.config.intervalMs)}` : 'archive checks switched off', 'ok');
+      // The Runtime table carries the same setting; keep it from going stale.
+      void refreshSettings();
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    }
+  });
+
+  $('#check-run').addEventListener('click', async () => {
+    const button = $('#check-run');
+    button.disabled = true;
+    button.textContent = 'checking…';
+    try {
+      const data = await api('POST', '/api/archive/check/run');
+      renderCheck(data);
+      toast(data.running ? 'a check is under way — the Library shows it on each row' : data.lastSweep?.note ?? 'nothing was in R2 to check', 'ok');
+      await refreshLibrary({ quiet: true });
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    } finally {
+      button.disabled = false;
+      button.textContent = 'Check now';
+    }
+  });
+
+  $('#check-clear').addEventListener('click', async () => {
+    try {
+      renderCheck(await api('POST', '/api/archive/check/log/clear'));
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    }
+  });
+
   /* ------------------------------------------------------------ host list */
 
   function renderHosts() {
@@ -2402,6 +2526,8 @@
         // The autopilot's own cycle is minutes apart; a slow poll keeps the
         // status and the queue it just filled current.
         if (state.activeTab === 'autopilot') void refreshAutopilot({ quiet: true });
+        // A sweep runs in the background, so the Settings panel follows it.
+        if (state.activeTab === 'settings') void refreshCheck({ quiet: true });
       }
     }, 5000);
   }

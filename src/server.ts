@@ -15,6 +15,7 @@ import { Autopilot, AutopilotError } from './autopilot';
 import { DEFAULT_MAX_BULK_JOBS, planBulk, planShow, queuedKeys, withoutQueued, type BulkOptions, type BulkPlan } from './bulk';
 import { BunnyClient, BunnyError } from './bunny';
 import { Catalog, type CatalogEntry } from './catalog';
+import { ArchiveCheckSchedule, CheckScheduleError } from './check-schedule';
 import { MAX_UPLOAD_BYTES, loadConfig } from './config';
 import { decryptSecret, encryptSecret, loadOrCreateSecret, maskSecret } from './crypto';
 import { runDiagnostics } from './diagnostics';
@@ -166,6 +167,24 @@ const jobs = new JobService({
 jobs.recover();
 
 /**
+ * The scheduled verification pass: once a week, re-read every archived title
+ * and re-hash what its manifest lists.
+ *
+ * It is the Library's "check R2" button on a timer, so `verifiedAt` keeps up to
+ * date on its own and a title that has quietly rotted in the bucket — an object
+ * deleted by hand, a part-upload that landed wrong — shows up in the counts and
+ * on its row without anyone thinking to look. A sweep only queues work; the
+ * archive's own queue does the reading, and `R2_VERIFY=off` (or the switch in
+ * Settings) turns the whole thing off.
+ */
+const checkSchedule = new ArchiveCheckSchedule({
+  config,
+  catalog,
+  archive,
+  log: (message) => console.log(message),
+});
+
+/**
  * The autopilot: walk TMDB's top-rated lists and queue what clears the rating
  * floor, then retry what failed, then look again.
  */
@@ -288,6 +307,21 @@ function settingsView() {
       // Playback is served through the dashboard, so the TTL is worth showing.
       urlTtl: config.r2?.urlTtl ?? DEFAULT_PRESIGN_SECONDS,
       auto: store.settings.archiveToR2 !== false,
+      // The scheduled re-check, in short: the Settings tab reads
+      // /api/archive/check for the log and the titles behind the counts.
+      check: (() => {
+        const check = checkSchedule.stateView();
+        return {
+          enabled: check.config.enabled,
+          intervalMs: check.config.intervalMs,
+          batchSize: check.config.batchSize,
+          running: check.running,
+          lastRunAt: check.lastRunAt,
+          nextRunAt: check.nextRunAt,
+          lastSweep: check.lastSweep,
+          totals: check.totals,
+        };
+      })(),
     },
     limits: { maxAccounts: 30, perAccountConcurrency: 10, maxUploadBytes: MAX_UPLOAD_BYTES },
     catalogEntries: catalog.size,
@@ -1230,6 +1264,37 @@ app.get('/api/archive/play/:key', (req, res) => {
   res.redirect(302, media.url);
 });
 
+/* --------------------- scheduled verification --------------------- */
+
+/**
+ * The scheduled check: when it last ran, when it runs next, what it found, and
+ * how much of the archive has a verdict at all.
+ *
+ * `totals.failing` is the number to watch — a weekly sweep keeps it honest, and
+ * the Library's own rows name the titles behind it.
+ */
+app.get('/api/archive/check', (_req, res) => {
+  res.json(checkSchedule.stateView());
+});
+
+app.put('/api/archive/check', (req, res) => {
+  try {
+    res.json(checkSchedule.updateConfig((req.body ?? {}) as Record<string, unknown>));
+  } catch (error) {
+    if (error instanceof CheckScheduleError) return void res.status(400).json({ error: error.message });
+    throw error;
+  }
+});
+
+/** One sweep now, whatever the schedule says. */
+app.post('/api/archive/check/run', (_req, res) => {
+  res.json(checkSchedule.runNow());
+});
+
+app.post('/api/archive/check/log/clear', (_req, res) => {
+  res.json(checkSchedule.clearLog());
+});
+
 /* ------------------------- subtitle backfill ------------------------- */
 
 /** Which published titles are still missing a target language — no work done. */
@@ -1307,6 +1372,9 @@ jobs.start();
 watcher.start();
 // The scheduler is always up; a cycle only runs while the autopilot is enabled.
 autopilot.start();
+// The verification schedule too: it only checks while it is switched on and R2
+// is configured, and a tick is a clock read when it is not.
+checkSchedule.start();
 const loopback = ['127.0.0.1', 'localhost', '::1'].includes(config.host);
 if (!config.dashboardPassword && !loopback) {
   console.warn(
@@ -1327,6 +1395,7 @@ const server = app.listen(config.port, config.host, () => {
 function shutdown(): void {
   jobs.stop();
   autopilot.stop();
+  checkSchedule.stop();
   autoRepair.stop();
   archive.stop();
   store.flush();

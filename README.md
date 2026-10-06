@@ -141,9 +141,13 @@ Paste that URL into **Source URL** and press **Download & upload**.
   The same queue re-checks a folder later by **re-hashing every object against
   its manifest** in R2, **mends the specific objects a check flags** (re-fetching
   them from Bunny, or falling back to the bucket's intact copies), and can **put
-  a title back into Bunny** from the archive. Archived titles play **through the
-  dashboard with short-lived signed URLs**, so the bucket never needs to be
-  public. See *R2 archive* below.
+  a title back into Bunny** from the archive — straight out of R2 into Bunny with
+  nothing spooled to this machine's disk, so restoring a film needs no free
+  space. That re-check also runs **on its
+  own, weekly**, so `verifiedAt` stays current and anything that has quietly
+  stopped matching is surfaced in the counts and on its own row. Archived titles
+  play **through the dashboard with short-lived signed URLs**, so the bucket
+  never needs to be public. See *R2 archive* below.
 - **Named by TMDB id**: the video object created in Bunny is called `tmdb:27205`
   for a movie and `tv:1396:S01E02` for an episode, not `Inception (2010)`.
   A library of ids stays unique and joinable back to TMDB (and to this
@@ -229,6 +233,8 @@ at startup and never overrides real environment variables.
 | `R2_URL_TTL` | `300` | how long a signed playback URL stays valid, in seconds (clamped 1 s – 7 days). The bucket can stay private |
 | `R2_ARCHIVE` | `1` | copy a finished publish automatically (also the default of the dashboard switch) |
 | `R2_KEEP_BUNNY` | `0` | `1` keeps the video in Bunny after a successful archive instead of deleting it |
+| `R2_VERIFY` | `1` | re-check the archive on a schedule, refreshing `verifiedAt` and reporting anything that stopped matching (also the default of the dashboard switch) |
+| `R2_VERIFY_INTERVAL_MS` | `604800000` | how often that pass runs, in ms (clamped 1 hour – 30 days); a weekly pass by default |
 | `DASHBOARD_USER` | `index` | login user, used only when a password is set |
 | `DASHBOARD_PASSWORD` | – | set it to require the login on every page and API route |
 
@@ -582,6 +588,39 @@ title whose bytes no longer match is reported rather than quietly repaired: the
 row turns up in the red with the object's name, and the stored object is left
 exactly as it was found.
 
+### Checking the archive on its own
+
+A check somebody has to remember to press is a check that stops happening, so
+the same pass also runs **by itself, weekly** (`R2_VERIFY`, `R2_VERIFY_INTERVAL_MS`;
+change it under **Settings → Checking the archive**). It puts every archived
+title through the pass above, which is what keeps `verifiedAt` current and what
+makes a title that has quietly rotted in the bucket show up without anyone
+looking for it.
+
+A sweep is the same background work as a button press, so nothing blocks: the
+titles go into the archive queue, the browser watches them arrive on the event
+stream, and the sweep is only marked finished once that queue has gone quiet.
+When it has, the verdicts are counted and written to the schedule's log —
+`checked 12 title(s): 11 still match, 1 stopped matching — movie:603` —
+and the Settings panel shows the standing totals: how many titles are archived,
+how many have a verdict, how many **stopped matching**, and how many have never
+been checked at all.
+
+A library larger than one batch is walked in **waves**: the queue never holds
+more than the batch, and the next wave is only offered once the previous one has
+been worked through, so a big library is still covered by a single sweep rather
+than over several weeks. Two sweeps never overlap — a second would only re-queue
+the first's titles and double the reads — and a queue that never goes quiet (a
+stalled transfer, say) is given up on after a day rather than leaving the
+schedule wedged. `POST /api/archive/check/run` runs one now, whatever the
+schedule says.
+
+The schedule's own state lives in `DATA_DIR/archive-check.json`, next to
+`db.json` and the autopilot's, so "when did this last run, and what did it find?"
+survives a restart. The environment only supplies the *defaults*: once the
+interval or the switch has been changed from the dashboard, that choice is the
+one that is kept.
+
 ### Mending what a check finds
 
 A failed check names its objects, and `repair` on the row (or
@@ -610,15 +649,22 @@ rather than the intention. Everything it did is recorded under `archive.repair`
 
 The opposite trip is a **restore** (`restore` on a Library row, or
 `POST /api/archive/restore`). It streams the **tallest archived MP4 rendition**
-back out of R2 — hashing it on the way, so a corrupt object is caught before it
-becomes a Bunny video — creates a fresh video, uploads the file, and re-attaches
+straight out of R2 and into a fresh Bunny video — the bucket's bytes are pulled
+in chunks and handed to Bunny as they arrive, hashed on the way — and re-attaches
 every caption the folder holds. The Bunny URL the archive replaced is then the
 video's playback URL again, and the catalogue follows the new video id.
 
+The rendition is **never written to this machine**, so a restore needs no free
+disk: nothing is spooled to a temp file before the upload, whatever the transport
+(`UPLOAD_MODE=tus` or `put`). The hash is therefore taken in the same pass that
+sends the bytes, and the verdict comes after the upload rather than before it — if
+the object no longer matches the manifest, the fresh video is **deleted** instead
+of left in the library as a copy nothing has vouched for.
+
 A restore is a **copy, not a move**: the R2 archive is left exactly where it is,
 so a title can live in both places, and be archived again afterwards. The task
-runs on the same queue and reports both halves of the round trip in one bar —
-bytes out of R2, then bytes into Bunny.
+runs on the same queue and reports the round trip in one bar — bytes read and
+bytes sent, counted as they happen.
 
 ## Autopilot
 
@@ -757,6 +803,10 @@ keeps the queue honest.
 | `POST` | `/api/archive/repair` | **queue a targeted repair**: mend just the objects the last check flagged, from Bunny or from the bucket's intact copies. `{ keys?, limit? }`, answers at once |
 | `POST` | `/api/archive/restore` | **queue a restore**: stream an archived title back into a fresh Bunny video, captions included. `{ keys?, limit? }`, answers at once |
 | `GET` | `/api/archive/play/:key` | **play an archived title**: `302` to a short-lived signed R2 URL for its best rendition, so the bucket can stay private |
+| `GET` | `/api/archive/check` | the **scheduled re-check**: its settings, when it last ran and runs next, the last sweep's report, the standing totals (`archived` / `checked` / `failing` / `never`) and the log |
+| `PUT` | `/api/archive/check` | change it: `{ enabled?, intervalMs?, batchSize? }` (validated: 1 hour – 30 days, ≤5000 at a time); stored on disk, and it survives a restart |
+| `POST` | `/api/archive/check/run` | **run one sweep now**, whatever the schedule says. Answers at once; the queue does the reading |
+| `POST` | `/api/archive/check/log/clear` | forget the schedule's log lines |
 | `GET`/`PUT` | `/api/autopilot` | read / change the autopilot (rating floor, lists, limits, interval) |
 | `POST` | `/api/autopilot/run` | run one cycle now, whatever the schedule says |
 | `POST` | `/api/autopilot/reset` | reset the page cursors to page 1 |
@@ -878,7 +928,7 @@ right home for the queue. Hosts that build from a git repository only need the
 
 ```bash
 npm run typecheck        # tsc --noEmit
-npm test                 # 243 tests (queue caps, crypto, store + its change hook, catalogue, clients, TUS, watcher, job lifecycle, crash resume, HLS, source pipeline, subtitles, DeepL translation, multi-language targets, subtitle backfill and its automatic repair, the R2 archive background queue with its verification pass, targeted repair, restore and signed-URL playback, and its SigV4 signer/presigner, tunnel, network policy, diagnostics, login, autopilot, host politeness)
+npm test                 # 266 tests (queue caps, crypto, store + its change hook, catalogue, clients, TUS, watcher, job lifecycle, crash resume, HLS, source pipeline, subtitles, DeepL translation, multi-language targets, subtitle backfill and its automatic repair, the R2 archive background queue with its verification pass and its scheduled weekly sweep, targeted repair, restore and signed-URL playback, and its SigV4 signer/presigner, tunnel, network policy, diagnostics, login, autopilot, host politeness)
 
 # End-to-end against a running mock server:
 npm run mock &           # or in another terminal

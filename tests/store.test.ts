@@ -32,7 +32,18 @@ test('the R2 archive switch follows R2_ARCHIVE until the dashboard overrides it'
 
   const other = fs.mkdtempSync(path.join(os.tmpdir(), 'bunny-store-'));
   const config = testConfig(other, {
-    r2: { accountId: 'a', accessKeyId: 'k', secretAccessKey: 's', bucket: 'b', prefix: 'archive', enabled: true, keepBunny: false, urlTtl: 300 },
+    r2: {
+      accountId: 'a',
+      accessKeyId: 'k',
+      secretAccessKey: 's',
+      bucket: 'b',
+      prefix: 'archive',
+      enabled: true,
+      keepBunny: false,
+      urlTtl: 300,
+      verify: true,
+      verifyIntervalMs: 7 * 24 * 60 * 60_000,
+    },
   });
   const store = new Store(config);
   assert.equal(store.settings.archiveToR2, true, 'a configured destination turns it on by default');

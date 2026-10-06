@@ -124,3 +124,44 @@ test('uploadVideo streams the file with an explicit byte length', async () => {
   assert.equal(seenLength, '1024');
   assert.equal(drained, true);
 });
+
+test('uploadVideoStream puts a byte source on the wire, with a declared length', async () => {
+  const payload = Buffer.from(Array.from({ length: 900 }, (_, index) => index % 253));
+  let seenLength: string | undefined;
+  let body: Buffer | undefined;
+  let drained: Promise<void> = Promise.resolve();
+  const { impl, calls } = captureFetch((_url, init) => {
+    seenLength = (init.headers as Record<string, string>)['content-length'];
+    // Nobody else will read the request body, so this test has to pull it dry
+    // itself — which is also proof the bytes come off the source on demand.
+    drained = (async () => {
+      const chunks: Buffer[] = [];
+      const reader = (init.body as ReadableStream<Uint8Array>).getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(Buffer.from(value));
+      }
+      body = Buffer.concat(chunks);
+    })();
+    return { body: { success: true } };
+  });
+  const reads: Array<{ offset: number; length: number }> = [];
+  const client = new BunnyClient({ apiKey: 'key', libraryId: '9', fetchImpl: impl });
+  await client.uploadVideoStream('v1', {
+    totalBytes: payload.length,
+    read: async (offset: number, length: number) => {
+      reads.push({ offset, length });
+      return payload.subarray(offset, offset + length);
+    },
+  });
+  await drained;
+
+  assert.equal(calls[0]?.init.method, 'PUT');
+  assert.equal(calls[0]?.url, 'https://video.bunnycdn.com/library/9/videos/v1');
+  assert.equal(seenLength, String(payload.length));
+  assert.equal((calls[0]?.init as { duplex?: string }).duplex, 'half');
+  assert.deepEqual(body, payload);
+  // Read strictly forwards, so the bytes are never held anywhere but in flight.
+  assert.deepEqual(reads[0], { offset: 0, length: payload.length });
+});

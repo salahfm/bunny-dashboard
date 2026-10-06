@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { clampCheckInterval } from './check-schedule';
 import { clampPresignExpiry } from './r2';
 import { normalizeLanguage } from './subtitles';
 import { clampChunkBytes } from './tus';
@@ -122,6 +123,14 @@ export interface R2ArchiveConfig {
    * to S3's own 1 s – 7 day range.
    */
   urlTtl: number;
+  /**
+   * Whether the archive is re-verified on a schedule, without being asked
+   * (default: yes). A copy nobody re-reads is a copy nobody knows the state of,
+   * so a configured archive is checked weekly unless this is switched off.
+   */
+  verify: boolean;
+  /** How often that pass runs, in milliseconds (default: weekly). */
+  verifyIntervalMs: number;
 }
 
 export function clampConcurrency(value: unknown, fallback = DEFAULT_CONCURRENCY): number {
@@ -223,6 +232,7 @@ export function parseR2(env: NodeJS.ProcessEnv): { config?: R2ArchiveConfig; not
   const publicBase = read('R2_PUBLIC_BASE').replace(/\/+$/, '');
   const endpoint = read('R2_ENDPOINT');
   const urlTtl = read('R2_URL_TTL');
+  const verifyInterval = read('R2_VERIFY_INTERVAL_MS');
   return {
     config: {
       accountId: read('R2_ACCOUNT_ID'),
@@ -235,6 +245,11 @@ export function parseR2(env: NodeJS.ProcessEnv): { config?: R2ArchiveConfig; not
       enabled: envFlag(env.R2_ARCHIVE, true),
       keepBunny: envFlag(env.R2_KEEP_BUNNY, false),
       urlTtl: clampPresignExpiry(urlTtl === '' ? undefined : urlTtl),
+      // The scheduled pass is on by default for the same reason the archive
+      // itself is: a title copied out of Bunny is only safe while somebody is
+      // still checking that it is all there.
+      verify: envFlag(env.R2_VERIFY, true),
+      verifyIntervalMs: clampCheckInterval(verifyInterval === '' ? undefined : verifyInterval),
     },
   };
 }

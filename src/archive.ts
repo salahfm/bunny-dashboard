@@ -38,7 +38,9 @@
  *             object it lists, so "is the copy still intact?" is answered by the
  *             bytes themselves rather than by a HEAD that only proves they exist
  *   restore   streams the archived rendition back out of R2 into a fresh Bunny
- *             video, re-attaches the captions, and points the catalogue at it
+ *             video, re-attaches the captions, and points the catalogue at it —
+ *             one pass of bytes with nothing on disk in between, so putting a
+ *             title back needs no free space on this machine at all
  *
  * A task therefore carries an `operation`, and the stages it walks depend on it:
  * an archive ends in `deleting`, a verify in `verifying`, a restore in
@@ -81,6 +83,7 @@ import type { Catalog, CatalogArchive, CatalogArchiveObject, CatalogEntry } from
 import type { AppConfig } from './config';
 import { fetchWithPolicy } from './net';
 import { clampPresignExpiry, R2Client, type R2UploadResult } from './r2';
+import type { TusSource } from './tus';
 
 /** How long one asset download may take: a feature-length MP4 can be big. */
 const ASSET_TIMEOUT_MS = 30 * 60_000;
@@ -1180,9 +1183,14 @@ export class ArchiveService {
   /**
    * Puts an archived title back into Bunny.
    *
-   * The best archived rendition is streamed out of R2 — hashing it on the way, so
-   * a corrupt object is caught *before* it becomes a Bunny video — uploaded as a
-   * fresh video, and the captions are re-attached from the folder's own copies.
+   * The best archived rendition streams out of R2 and straight into Bunny — one
+   * pass of bytes through a running SHA-256, with no local copy at any point, so
+   * a restore needs no free disk. The digest that pass produces is what decides
+   * whether the object still is what the manifest recorded: because the bytes go
+   * to Bunny while they are being hashed, a mismatch is caught *after* the fact
+   * rather than before it, so the half-made video is deleted rather than left in
+   * the library as a copy nothing vouched for.
+   *
    * The R2 archive is left exactly where it is: a restore adds a copy rather than
    * moving one, so a title can be restored, and archived again, as often as it is
    * asked to.
@@ -1199,26 +1207,38 @@ export class ArchiveService {
 
     // The bar counts both halves of the round trip — the bytes out of R2 and the
     // bytes back into Bunny — so it only reads 100% once the title is playable.
+    // They now move at the same time, so the two counts are added as they arrive.
     const total = Math.max(1, source.bytes * 2);
+    let read = 0;
+    let sent = 0;
+    const progress = (): void => {
+      this.touch(task, { bytes: Math.min(total, read + sent) });
+    };
     this.touch(task, { stage: 'downloading', asset: source.name, assets: 1, stored: 0, bytes: 0, totalBytes: total });
 
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bunny-restore-'));
-    const tempPath = path.join(dir, path.basename(source.name) || 'restore.mp4');
+    // The bucket is asked for the object before Bunny is asked for a video: a
+    // folder whose rendition is gone must fail the restore, not leave an empty
+    // video behind.
+    const rendition = await streamedObject(r2, source, (bytes) => {
+      read = bytes;
+      progress();
+    });
+    const title = archiveLabel(entry);
+    let video: BunnyVideo | undefined;
     try {
-      const downloaded = await this.download(r2, source, task, tempPath);
-      if (downloaded.sha256 !== source.sha256) throw new Error(`${source.name} no longer matches the archive (its SHA-256 changed)`);
+      video = await client.createVideo(title);
+      this.touch(task, { stage: 'uploading', asset: source.name, stored: 1 });
+      await this.upload(client, video.guid, title, source, rendition, (bytesSent) => {
+        sent = bytesSent;
+        progress();
+      });
 
-      const title = archiveLabel(entry);
-      const video = await client.createVideo(title);
-      this.touch(task, { stage: 'uploading', asset: source.name, stored: 1, bytes: source.bytes });
-      try {
-        await this.upload(client, video.guid, tempPath, title, source, task);
-      } catch (error) {
-        // A half-uploaded video would sit in the library with nothing playable:
-        // let Bunny forget it rather than leave the shell behind.
-        await client.deleteVideo(video.guid).catch(() => undefined);
-        throw error;
-      }
+      // A transport that answered without pulling the bytes (a mock Bunny, or a
+      // PUT that was never written) leaves the digest short: finish the read so
+      // the verdict is about the archive rather than about the transport.
+      const digest = await rendition.finish();
+      if (digest.bytes !== source.bytes) throw new Error(`${source.name} is ${digest.bytes} bytes, not the ${source.bytes} the archive recorded`);
+      if (digest.sha256 !== source.sha256) throw new Error(`${source.name} no longer matches the archive (its SHA-256 changed)`);
 
       const failedCaptions = await this.reapplyCaptions(client, video.guid, entry, archive, r2);
       const at = this.nowIso();
@@ -1226,8 +1246,14 @@ export class ArchiveService {
       this.writeRestore(entry.key, { videoId: video.guid, ...(playbackUrl ? { playbackUrl } : {}), ...(video.status !== undefined ? { bunnyStatus: video.status } : {}), at });
       const note = `back in Bunny as ${video.guid}${failedCaptions.length ? ` — ${failedCaptions.length} caption(s) could not be re-attached (${failedCaptions.join(', ')})` : ''}`;
       return { status: 'ok', note, videoId: video.guid };
+    } catch (error) {
+      // A half-uploaded copy would sit in the library with nothing playable — or
+      // worse, with bytes nothing has vouched for: let Bunny forget it rather
+      // than leave the shell behind.
+      if (video) await client.deleteVideo(video.guid).catch(() => undefined);
+      throw error;
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      await rendition.close();
     }
   }
 
@@ -1483,38 +1509,35 @@ export class ArchiveService {
     return Buffer.concat(chunks).toString('utf8');
   }
 
-  /** Streams one archived object to disk, hashing and reporting as it goes. */
-  private async download(r2: R2Client, object: CatalogArchiveObject, task: ArchiveTask, filePath: string): Promise<{ bytes: number; sha256: string }> {
-    const handle = await fs.promises.open(filePath, 'w');
-    let written = 0;
-    try {
-      const digest = await r2.read(object.key, async (chunk) => {
-        await handle.write(chunk, 0, chunk.length, written);
-        written += chunk.length;
-        this.touch(task, { bytes: written });
-      });
-      if (!digest) throw new Error(`${object.name} is not in the bucket (${object.key})`);
-      if (digest.bytes !== written) throw new Error(`${object.name} stopped short at ${written} of ${digest.bytes} bytes`);
-      return { bytes: digest.bytes, sha256: digest.sha256 };
-    } finally {
-      await handle.close();
-    }
-  }
-
-  /** Hands the downloaded rendition to Bunny, by whichever transport is configured. */
-  private async upload(client: BunnyClient, videoId: string, filePath: string, title: string, object: CatalogArchiveObject, task: ArchiveTask): Promise<void> {
+  /**
+   * Hands the streamed rendition to Bunny, by whichever transport is configured.
+   *
+   * Both take the bytes off the source as they go, so no transport here needs a
+   * local copy of the film: TUS pulls chunks through the retry loop, and a PUT
+   * reads the source straight into the request body.
+   */
+  private async upload(
+    client: BunnyClient,
+    videoId: string,
+    title: string,
+    object: CatalogArchiveObject,
+    source: TusSource,
+    onProgress: (bytesSent: number) => void,
+  ): Promise<void> {
+    const fileName = path.basename(object.name) || 'restore.mp4';
     if (this.deps.config.uploadMode === 'tus') {
-      await client.uploadVideoResumable(videoId, filePath, {
+      await client.uploadVideoResumable(videoId, undefined, {
         title,
-        fileName: path.basename(object.name) || 'restore.mp4',
+        fileName,
+        source,
         chunkBytes: this.deps.config.tusChunkBytes,
-        onProgress: (sent) => this.touch(task, { bytes: object.bytes + sent }),
+        onProgress,
         shouldContinue: () => !this.stopped,
       });
       return;
     }
-    await client.uploadVideo(videoId, filePath);
-    this.touch(task, { bytes: object.bytes * 2 });
+    await client.uploadVideoStream(videoId, source);
+    onProgress(source.totalBytes);
   }
 
   /** Re-attaches every caption the folder holds, keyed by the language in its name. */
@@ -1722,6 +1745,149 @@ async function spoolToFile(body: ReadableStream<Uint8Array>, filePath: string, o
     await handle.close();
   }
   return { bytes: written, sha256: hash.digest('hex') };
+}
+
+/**
+ * One archived object, as the byte source a restore streams from.
+ *
+ * TUS asks two things of a source that a bucket `GET` does not answer on its own:
+ * the total length before it starts (TUS demands a declared `Upload-Length`), and
+ * a re-read of the range it just sent when Bunny stored only part of a chunk —
+ * while an R2 body is a forward-only stream that cannot be rewound. This bridges
+ * the two by pulling the body in order and keeping only the range it last handed
+ * out, which is exactly the range a retry asks for again. A resumed upload starts
+ * part-way in, so anything before its offset is pulled and dropped rather than
+ * reopened.
+ *
+ * Every byte pulled goes through a running SHA-256, so the object is verified
+ * against the manifest in the same pass that puts it back in Bunny. The digest is
+ * only final once the last byte has been read, which is why [finish] exists: a
+ * transport that answers without reading the body still leaves a verdict.
+ */
+export class StreamedObject implements TusSource {
+  readonly totalBytes: number;
+  /** Bytes handed to the caller, as a high-water mark. */
+  private delivered = 0;
+  /** Pulled from the bucket through the hash, but not yet handed out. */
+  private buffered: Buffer = Buffer.alloc(0);
+  /** What the previous read returned, kept because a TUS retry asks for it again. */
+  private last?: { offset: number; bytes: Buffer };
+  private reader?: ReadableStreamDefaultReader<Uint8Array>;
+  private ended = false;
+  private finished?: { bytes: number; sha256: string };
+  private pulled = 0;
+  private readonly hash = crypto.createHash('sha256');
+
+  constructor(
+    private readonly body: ReadableStream<Uint8Array>,
+    totalBytes: number,
+    /** Called with the running byte count as the object is pulled. */
+    private readonly onRead: (bytes: number) => void = () => undefined,
+  ) {
+    this.totalBytes = totalBytes;
+  }
+
+  async read(offset: number, length: number): Promise<Buffer> {
+    if (length <= 0) return Buffer.alloc(0);
+    if (offset >= this.delivered) return this.remember(offset, await this.forward(offset, length));
+
+    // A retry asks again for the range it just sent, or the tail of it when Bunny
+    // stored part of the chunk: serve that from the copy still in hand, because a
+    // bucket GET cannot be rewound.
+    const last = this.last;
+    if (!last || offset < last.offset) {
+      throw new Error(`the archived object can only be streamed forwards (asked for byte ${offset} after reading ${this.delivered})`);
+    }
+    const from = offset - last.offset;
+    const head = last.bytes.subarray(from, from + length);
+    if (head.length >= length) return this.remember(offset, head);
+    const rest = await this.forward(last.offset + last.bytes.length, length - head.length);
+    return this.remember(offset, Buffer.concat([head, rest]));
+  }
+
+  /** Pulls the bucket body until `length` bytes from `offset` are in hand. */
+  private async forward(offset: number, length: number): Promise<Buffer> {
+    // A resumed upload starts part-way in. The bytes it skips are still pulled
+    // through the hash — every byte that comes out of the bucket is — and then
+    // dropped, because a GET cannot be told to open anywhere but the start.
+    const oldest = this.pulled - this.buffered.length;
+    if (offset < oldest) {
+      throw new Error(`the archived object can only be streamed forwards (asked for byte ${offset} after dropping ${oldest})`);
+    }
+    let discard = offset - oldest;
+
+    const parts: Buffer[] = [];
+    let wanted = length;
+    while (wanted > 0) {
+      if (this.buffered.length === 0) {
+        if (this.ended) break;
+        if (!this.reader) this.reader = this.body.getReader();
+        const { done, value } = await this.reader.read();
+        if (done) {
+          this.ended = true;
+          break;
+        }
+        if (!value?.length) continue;
+        const chunk = Buffer.from(value);
+        this.hash.update(chunk);
+        this.pulled += chunk.length;
+        this.onRead(this.pulled);
+        this.buffered = chunk;
+      }
+      if (discard > 0) {
+        const dropped = Math.min(discard, this.buffered.length);
+        this.buffered = this.buffered.subarray(dropped);
+        discard -= dropped;
+        continue;
+      }
+      const slice = this.buffered.subarray(0, Math.min(wanted, this.buffered.length));
+      parts.push(slice);
+      this.buffered = this.buffered.subarray(slice.length);
+      wanted -= slice.length;
+    }
+    return parts.length === 1 ? (parts[0] as Buffer) : Buffer.concat(parts);
+  }
+
+  private remember(offset: number, bytes: Buffer): Buffer {
+    this.last = { offset, bytes };
+    this.delivered = Math.max(this.delivered, offset + bytes.length);
+    return bytes;
+  }
+
+  /**
+   * The SHA-256 of everything read, completing the read first when a transport
+   * answered without pulling the body (a mock Bunny, or a PUT nobody wrote) — the
+   * verdict has to be about the archive rather than about the transport.
+   */
+  async finish(): Promise<{ bytes: number; sha256: string }> {
+    while (!this.ended && this.delivered < this.totalBytes) {
+      const chunk = await this.read(this.delivered, this.totalBytes - this.delivered);
+      if (chunk.length === 0) break;
+    }
+    this.finished ??= { bytes: this.pulled, sha256: this.hash.digest('hex') };
+    return this.finished;
+  }
+
+  /** Releases the bucket connection as soon as nothing more is needed from it. */
+  async close(): Promise<void> {
+    const reader = this.reader;
+    this.reader = undefined;
+    this.ended = true;
+    this.buffered = Buffer.alloc(0);
+    await reader?.cancel().catch(() => undefined);
+  }
+}
+
+/**
+ * Opens an archived object as a byte source, asking the bucket *before* anything
+ * is created in Bunny: a rendition that is not there must fail the restore rather
+ * than leave an empty video behind. A `403` still throws — a refusal is not an
+ * absent object.
+ */
+export async function streamedObject(r2: R2Client, object: CatalogArchiveObject, onRead?: (bytes: number) => void): Promise<StreamedObject> {
+  const body = await r2.open(object.key);
+  if (!body) throw new Error(`${object.name} is not in the bucket (${object.key})`);
+  return new StreamedObject(body, object.bytes, onRead);
 }
 
 /** One flagged object, and what fetching it again produced. */

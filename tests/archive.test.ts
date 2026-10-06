@@ -12,12 +12,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { ArchiveService, archiveFolder, archiveSlug, captionLanguages, planAssets, playbackRoute } from '../src/archive';
-import type { BunnyClient, BunnyVideo } from '../src/bunny';
+import { ArchiveService, archiveFolder, archiveSlug, captionLanguages, planAssets, playbackRoute, streamedObject } from '../src/archive';
+import { BunnyClient, type BunnyVideo } from '../src/bunny';
 import { Catalog, type CatalogEntry } from '../src/catalog';
 import type { AppConfig } from '../src/config';
-import { R2Client } from '../src/r2';
+import { R2Client, sha256Hex } from '../src/r2';
+import type { TusSource } from '../src/tus';
 import { newJob, type Account, type Job, type JobTarget } from '../src/store';
+import { FakeTusServer } from './fake-tus';
 import { testConfig } from './helpers';
 import { startFakePullZone, type FakePullZoneFile } from './support/fake-pullzone';
 import { startFakeR2 } from './support/fake-r2';
@@ -98,15 +100,64 @@ function bunnyStub(video: BunnyVideo, deleted: string[]): BunnyClient {
   } as unknown as BunnyClient;
 }
 
+/** One upload a restore made, as the stand-in Bunny recorded it. */
+interface RestoreUpload {
+  videoId: string;
+  body: Buffer;
+  /** The file a spooling restore would have handed over; a streaming one passes none. */
+  filePath?: string;
+}
+
 /** What a restore did, as the stand-in Bunny recorded it. */
 interface RestoreLog {
   created: string[];
-  uploads: Array<{ videoId: string; body: Buffer }>;
+  uploads: RestoreUpload[];
   captions: Array<{ videoId: string; srclang: string; content: string }>;
   deleted: string[];
 }
 
 const RESTORED_VIDEO_ID = 'vid-restored';
+
+/**
+ * Pulls a byte source the way the TUS loop does — in order, in chunks — so what
+ * a restore streamed is exactly what a test can assert on.
+ */
+async function pullSource(source: TusSource, chunkBytes = 64 * 1024, onProgress?: (sent: number, total: number) => void): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let offset = 0;
+  while (offset < source.totalBytes) {
+    const chunk = await source.read(offset, Math.min(chunkBytes, source.totalBytes - offset));
+    if (chunk.length === 0) break;
+    chunks.push(chunk);
+    offset += chunk.length;
+    onProgress?.(offset, source.totalBytes);
+  }
+  return Buffer.concat(chunks);
+}
+
+/**
+ * A real Bunny client whose resumable traffic goes to the in-memory TUS server,
+ * so a restore can be driven through the actual chunk loop rather than a stub.
+ */
+function bunnyOverTus(tus: FakeTusServer): BunnyClient {
+  const impl = (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    const pathname = new URL(url).pathname;
+    if (pathname.startsWith('/tusupload')) return tus.handler(input, init);
+    // The control plane: creating the video answers with the id a restore records,
+    // the archive run reads back the finished video it is archiving, and everything
+    // else (the caption, the delete) just says OK.
+    const creating = init?.method === 'POST' && pathname.endsWith('/videos');
+    const readingVideo = (init?.method ?? 'GET') === 'GET' && /\/videos\/[^/]+$/.test(pathname);
+    const body = creating
+      ? { guid: RESTORED_VIDEO_ID, title: 'restored', status: 1, encodeProgress: 0, length: 0 }
+      : readingVideo
+        ? { ...finishedVideo(), guid: VIDEO_ID }
+        : {};
+    return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof fetch;
+  return new BunnyClient({ apiKey: 'key-123', libraryId: '456', fetchImpl: impl });
+}
 
 /** A Bunny that can also receive an upload, so a restore can be watched. */
 function restorableStub(video: BunnyVideo, log: RestoreLog): BunnyClient {
@@ -119,10 +170,19 @@ function restorableStub(video: BunnyVideo, log: RestoreLog): BunnyClient {
       log.created.push(title);
       return { guid: RESTORED_VIDEO_ID, title, status: 1, encodeProgress: 0, length: 0 };
     },
-    uploadVideoResumable: async (videoId: string, filePath: string) => {
-      log.uploads.push({ videoId, body: fs.readFileSync(filePath) });
-      const size = fs.statSync(filePath).size;
-      return { uploadUrl: `mock://tus/${videoId}`, bytesSent: size, totalBytes: size, resumed: false };
+    uploadVideoResumable: async (
+      videoId: string,
+      filePath: string | undefined,
+      options: { source?: TusSource; chunkBytes?: number; onProgress?: (sent: number, total: number) => void },
+    ) => {
+      const source = options.source;
+      if (!source) throw new Error('a restore must stream a source rather than hand over a file');
+      const body = await pullSource(source, options.chunkBytes, options.onProgress);
+      log.uploads.push({ videoId, body, ...(filePath ? { filePath } : {}) });
+      return { uploadUrl: `mock://tus/${videoId}`, bytesSent: body.length, totalBytes: source.totalBytes, resumed: false };
+    },
+    uploadVideoStream: async (videoId: string, source: TusSource) => {
+      log.uploads.push({ videoId, body: await pullSource(source) });
     },
     addCaption: async (videoId: string, srclang: string, _label: string, content: string | Buffer) => {
       log.captions.push({ videoId, srclang, content: Buffer.isBuffer(content) ? content.toString('utf8') : content });
@@ -171,16 +231,24 @@ async function rig(
     publicBase?: string;
     /** How long the signed playback URLs this rig mints stay valid. */
     urlTtl?: number;
+    /** Whether the rig's config has the scheduled pass switched on. */
+    verify?: boolean;
     /** Small limits make one asset take several part uploads, so progress is observable. */
     r2Options?: { partBytes?: number; singlePutLimitBytes?: number };
     /** A Bunny that also accepts uploads, for a restore. */
     client?: (entry: CatalogEntry) => BunnyClient;
+    /** How the restore hands the rendition to Bunny (default: the resumable one). */
+    uploadMode?: 'tus' | 'put';
+    /** Tiny chunks make a restore stream several reads, so the byte source is exercised. */
+    tusChunkBytes?: number;
   } = {},
 ): Promise<{ rig: Rig; r2Server: Awaited<ReturnType<typeof startFakeR2>>; pull: Awaited<ReturnType<typeof startFakePullZone>>; close: () => Promise<void> }> {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bunny-archive-'));
   const r2Server = await startFakeR2('archive');
   const pull = await startFakePullZone(options.files ?? pullZoneFiles());
   const config = testConfig(dir, {
+    ...(options.uploadMode ? { uploadMode: options.uploadMode } : {}),
+    ...(options.tusChunkBytes ? { tusChunkBytes: options.tusChunkBytes } : {}),
     r2: {
       accountId: 'acct',
       accessKeyId: 'key',
@@ -192,6 +260,10 @@ async function rig(
       enabled: true,
       keepBunny: options.keepBunny ?? false,
       urlTtl: options.urlTtl ?? 300,
+      // The scheduled pass is off here: a test drives the queue itself and must
+      // not have a weekly sweep put titles in line behind it.
+      verify: options.verify ?? false,
+      verifyIntervalMs: 7 * 24 * 60 * 60_000,
     },
   });
   const catalog = new Catalog(config);
@@ -833,7 +905,8 @@ test('a repair is offered only once a check has actually failed', async () => {
 
 test('a restore streams the archived rendition back into Bunny, captions included', async () => {
   const log: RestoreLog = { created: [], uploads: [], captions: [], deleted: [] };
-  const { rig: r, r2Server, close } = await rig({ client: () => restorableStub(finishedVideo(), log) });
+  // 1 KiB chunks mean the rendition comes out of the bucket in several reads.
+  const { rig: r, r2Server, close } = await rig({ client: () => restorableStub(finishedVideo(), log), tusChunkBytes: 1_024 });
   try {
     await r.archive.archiveKeys([r.entry.key], 1);
     const folder = 'archive/Movies/Inception (2010) [27205]';
@@ -852,10 +925,12 @@ test('a restore streams the archived rendition back into Bunny, captions include
     assert.equal(task?.percent, 100);
     assert.equal(task?.restoredVideoId, RESTORED_VIDEO_ID);
 
-    // A fresh video was made and the tallest rendition went into it, byte for byte.
+    // A fresh video was made and the tallest rendition went into it, byte for byte
+    // — as a byte source, not as a file, so nothing had to be written down first.
     assert.deepEqual(log.created, ['Inception (2010)']);
     assert.equal(log.uploads.length, 1);
     assert.equal(log.uploads[0]?.videoId, RESTORED_VIDEO_ID);
+    assert.equal(log.uploads[0]?.filePath, undefined, 'Bunny was handed bytes, not a path');
     assert.deepEqual(log.uploads[0]?.body, archived);
 
     // And the caption came back with it.
@@ -873,6 +948,186 @@ test('a restore streams the archived rendition back into Bunny, captions include
     assert.equal(r.archive.eligible(r.catalog.get(r.entry.key) as CatalogEntry), true);
   } finally {
     await close();
+  }
+});
+
+test('a restore needs no space on this machine at all', async () => {
+  const log: RestoreLog = { created: [], uploads: [], captions: [], deleted: [] };
+  const { rig: r, r2Server, close } = await rig({ client: () => restorableStub(finishedVideo(), log), tusChunkBytes: 1_024 });
+  const realMkdtemp = fs.mkdtempSync;
+  try {
+    await r.archive.archiveKeys([r.entry.key], 1);
+
+    // Whatever the restore wanted to write down, it cannot: every request for a
+    // temp directory now fails. A spooling restore would go down with it.
+    fs.mkdtempSync = (() => {
+      throw new Error('the restore tried to spool the rendition to disk');
+    }) as typeof fs.mkdtempSync;
+
+    const report = r.archive.enqueueKeys([r.entry.key], 1, 'restore');
+    assert.equal(report.queued.length, 1);
+    await r.archive.idle(10_000);
+
+    const task = r.archive.task(r.entry.key);
+    assert.equal(task?.status, 'done');
+    assert.equal(task?.percent, 100);
+    assert.equal(log.uploads.length, 1);
+    assert.equal(log.uploads[0]?.filePath, undefined, 'Bunny was handed bytes, not a path');
+    assert.deepEqual(log.uploads[0]?.body, r2Server.objects().get('archive/Movies/Inception (2010) [27205]/video/1080p.mp4')?.body);
+  } finally {
+    fs.mkdtempSync = realMkdtemp;
+    await close();
+  }
+});
+
+test('a restore does not record a video whose bytes no longer match the archive', async () => {
+  const log: RestoreLog = { created: [], uploads: [], captions: [], deleted: [] };
+  const { rig: r, r2Server, close } = await rig({ client: () => restorableStub(finishedVideo(), log), tusChunkBytes: 1_024 });
+  try {
+    await r.archive.archiveKeys([r.entry.key], 1);
+    // The bucket copy drifts after it was archived — a bit flip, or an object
+    // overwritten behind the dashboard's back.
+    assert.equal(r2Server.tamper('archive/Movies/Inception (2010) [27205]/video/1080p.mp4', Buffer.alloc(4_096, 0x42)), true);
+
+    assert.equal(r.archive.enqueueKeys([r.entry.key], 1, 'restore').queued.length, 1);
+    await r.archive.idle(10_000);
+
+    const task = r.archive.task(r.entry.key);
+    assert.equal(task?.status, 'failed');
+    assert.match(task?.note ?? '', /no longer matches the archive/);
+    // The copy sent to Bunny is forgotten rather than left as a video nothing
+    // has vouched for, and the catalogue still points at the old one.
+    assert.ok(log.deleted.includes(RESTORED_VIDEO_ID), 'the unverified copy was deleted');
+    assert.equal(r.catalog.get(r.entry.key)?.videoId, VIDEO_ID);
+    assert.equal(r.catalog.get(r.entry.key)?.archive?.restoredVideoId, undefined);
+  } finally {
+    await close();
+  }
+});
+
+test('a restore whose rendition is gone from the bucket never creates a video', async () => {
+  const log: RestoreLog = { created: [], uploads: [], captions: [], deleted: [] };
+  const { rig: r, r2Server, close } = await rig({ client: () => restorableStub(finishedVideo(), log) });
+  try {
+    await r.archive.archiveKeys([r.entry.key], 1);
+    // Empty the rendition out of the bucket the way an ordinary S3 delete would.
+    await r.r2.delete('archive/Movies/Inception (2010) [27205]/video/1080p.mp4');
+    assert.equal(r2Server.objects().has('archive/Movies/Inception (2010) [27205]/video/1080p.mp4'), false);
+
+    assert.equal(r.archive.enqueueKeys([r.entry.key], 1, 'restore').queued.length, 1);
+    await r.archive.idle(10_000);
+
+    const task = r.archive.task(r.entry.key);
+    assert.equal(task?.status, 'failed');
+    assert.match(task?.note ?? '', /is not in the bucket/);
+    assert.deepEqual(log.created, [], 'the bucket was asked before Bunny was');
+    // Only the archive run's own delete of the original video; nothing new.
+    assert.deepEqual(log.deleted, [VIDEO_ID]);
+  } finally {
+    await close();
+  }
+});
+
+test('a transport that never pulls the bytes still leaves the restore verified', async () => {
+  const log: RestoreLog = { created: [], uploads: [], captions: [], deleted: [] };
+  // A mock Bunny answers an upload without reading its body, exactly like the
+  // one the dashboard runs with --mock. The digest has to be completed anyway,
+  // or every restore made against a mock library would look corrupt.
+  const lazy = {
+    ...restorableStub(finishedVideo(), log),
+    uploadVideoResumable: async () => ({ uploadUrl: 'mock://tus/v', bytesSent: 0, totalBytes: 0, resumed: false }),
+  } as unknown as BunnyClient;
+  const { rig: r, close } = await rig({ client: () => lazy });
+  try {
+    await r.archive.archiveKeys([r.entry.key], 1);
+    assert.equal(r.archive.enqueueKeys([r.entry.key], 1, 'restore').queued.length, 1);
+    await r.archive.idle(10_000);
+
+    assert.equal(r.archive.task(r.entry.key)?.status, 'done');
+    assert.equal(r.catalog.get(r.entry.key)?.videoId, RESTORED_VIDEO_ID);
+    assert.deepEqual(log.uploads, [], 'the transport pulled nothing of its own');
+  } finally {
+    await close();
+  }
+});
+
+test('a PUT-mode restore streams the rendition too, with no file to hand over', async () => {
+  const log: RestoreLog = { created: [], uploads: [], captions: [], deleted: [] };
+  const { rig: r, r2Server, close } = await rig({ client: () => restorableStub(finishedVideo(), log), uploadMode: 'put' });
+  try {
+    await r.archive.archiveKeys([r.entry.key], 1);
+    assert.equal(r.archive.enqueueKeys([r.entry.key], 1, 'restore').queued.length, 1);
+    await r.archive.idle(10_000);
+
+    assert.equal(r.archive.task(r.entry.key)?.status, 'done');
+    assert.equal(log.uploads.length, 1);
+    assert.equal(log.uploads[0]?.filePath, undefined, 'Bunny was handed bytes, not a path');
+    assert.deepEqual(log.uploads[0]?.body, r2Server.objects().get('archive/Movies/Inception (2010) [27205]/video/1080p.mp4')?.body);
+  } finally {
+    await close();
+  }
+});
+
+test('a real TUS upload pulls the rendition out of R2 chunk by chunk, partial writes included', async () => {
+  const tus = new FakeTusServer();
+  // A rendition big enough to take several minimum-size chunks (64 KiB), so the
+  // real loop has to come back to the source more than once.
+  const files = { ...pullZoneFiles(), [`${VIDEO_ID}/play_1080p.mp4`]: { body: Buffer.alloc(200_000, 0x41), contentType: 'video/mp4' } };
+  const { rig: r, r2Server, close } = await rig({ files, client: () => bunnyOverTus(tus), tusChunkBytes: 64 * 1024 });
+  try {
+    await r.archive.archiveKeys([r.entry.key], 1);
+    const folder = 'archive/Movies/Inception (2010) [27205]';
+    const archived = r2Server.objects().get(`${folder}/video/1080p.mp4`)?.body as Buffer;
+    assert.ok(archived);
+    // Bunny stores the first 300 bytes of the opening chunk and drops the socket,
+    // so the retry asks for a range that starts *inside* what was just sent.
+    tus.dropNextChunkBytes = 300;
+
+    assert.equal(r.archive.enqueueKeys([r.entry.key], 1, 'restore').queued.length, 1);
+    await r.archive.idle(10_000);
+
+    assert.equal(r.archive.task(r.entry.key)?.status, 'done');
+    assert.equal(tus.patchAttempts, 5, 'four chunks went over the wire, one of them replayed');
+    assert.deepEqual(tus.patches.map((patch) => patch.offset), [300, 65_836, 131_372, 196_908], 'the replayed chunk resumed at Bunny\'s offset');
+    assert.deepEqual(
+      tus.onlyResource().stored,
+      archived,
+      'the rendition Bunny stored is the rendition in the bucket',
+    );
+    // The whole 4 KiB came out of one GET: the retry was served from memory.
+    assert.equal(
+      r2Server.transcript.requests.filter((request) => request.method === 'GET' && request.key.endsWith('video/1080p.mp4')).length,
+      1,
+    );
+  } finally {
+    await close();
+  }
+});
+
+test('a streamed object is one pass of bytes, retries and all', async () => {
+  const r2Server = await startFakeR2('archive');
+  const r2 = new R2Client({ accountId: 'acct', accessKeyId: 'key', secretAccessKey: 'secret', bucket: 'archive', endpoint: r2Server.url, now: () => NOW });
+  try {
+    const bytes = Buffer.from(Array.from({ length: 512 }, (_, index) => index % 251));
+    const key = 'archive/video/rendition.mp4';
+    const sha256 = sha256Hex(bytes);
+    await r2.put(key, bytes, { contentType: 'video/mp4' });
+    const source = await streamedObject(r2, { name: 'video/rendition.mp4', key, kind: 'video', bytes: bytes.length, sha256, contentType: 'video/mp4' });
+
+    assert.deepEqual(await source.read(0, 128), bytes.subarray(0, 128));
+    // Bunny stored only part of that chunk, so the TUS retry asks again from
+    // inside the range that was just sent — and gets it from memory, not R2.
+    assert.deepEqual(await source.read(64, 192), bytes.subarray(64, 256));
+    // A resumed upload starts at Bunny's own offset, skipping what it already has.
+    assert.deepEqual(await source.read(384, 64), bytes.subarray(384, 448));
+
+    const digest = await source.finish();
+    assert.equal(digest.bytes, bytes.length);
+    assert.equal(digest.sha256, sha256);
+    assert.equal(r2Server.transcript.gets, 1, 'the whole object came out of one GET');
+    await source.close();
+  } finally {
+    await r2Server.close();
   }
 });
 

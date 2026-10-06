@@ -160,6 +160,15 @@ check(
   result.json?.archive?.configured === false && result.json?.archive?.auto === false && typeof result.json?.archive?.urlTtl === 'number',
   `configured ${result.json?.archive?.configured}, auto ${result.json?.archive?.auto}, ttl ${result.json?.archive?.urlTtl}`,
 );
+// The scheduled re-check is part of the archive's settings, and it is on and
+// weekly by default: a copy nobody re-reads is a copy nobody knows the state of.
+check(
+  'settings report the archive check as on, weekly, over nothing yet',
+  result.json?.archive?.check?.enabled === true &&
+    result.json?.archive?.check?.intervalMs === 7 * 24 * 60 * 60_000 &&
+    result.json?.archive?.check?.totals?.archived === 0,
+  `enabled ${result.json?.archive?.check?.enabled}, every ${result.json?.archive?.check?.intervalMs} ms, ${result.json?.archive?.check?.totals?.archived} archived`,
+);
 result = await request('GET', '/api/archive');
 check(
   'the archive queue answers with no destination configured',
@@ -209,6 +218,60 @@ check(
   'switching the archive on with nowhere to write is refused',
   result.status === 400 && /R2_ACCOUNT_ID/.test(result.json?.error ?? ''),
   result.json?.error ?? '',
+);
+
+/* the scheduled verification pass -------------------------------------- */
+// Nothing is configured here, so the clock must be the only thing that ticks:
+// the schedule has to be readable and settable, and must never queue work
+// against an archive that does not exist.
+result = await request('GET', '/api/archive/check');
+check(
+  'the scheduled check reports itself, on and weekly by default',
+  result.status === 200 &&
+    result.json?.config?.enabled === true &&
+    result.json?.config?.intervalMs === 7 * 24 * 60 * 60_000 &&
+    result.json?.config?.batchSize === 250 &&
+    result.json?.running === false &&
+    Array.isArray(result.json?.log),
+  `enabled ${result.json?.config?.enabled}, every ${result.json?.config?.intervalMs} ms, ${(result.json?.log ?? []).length} log line(s)`,
+);
+check(
+  'with no destination there is no next pass, and nothing has ever been checked',
+  result.json?.nextRunAt === null && result.json?.lastRunAt === null && result.json?.totals?.archived === 0 && result.json?.totals?.never === 0,
+  `next ${result.json?.nextRunAt}, last ${result.json?.lastRunAt}, ${result.json?.totals?.checked} checked`,
+);
+result = await request('PUT', '/api/archive/check', { intervalMs: 60_000 });
+check(
+  'an interval below an hour is refused',
+  result.status === 400 && /between 1 hour and 30 days/.test(result.json?.error ?? ''),
+  result.json?.error ?? '',
+);
+result = await request('PUT', '/api/archive/check', { enabled: true, intervalMs: 24 * 60 * 60_000, batchSize: 25 });
+check(
+  'the schedule takes a new interval and batch and reports it back',
+  result.status === 200 && result.json?.config?.intervalMs === 24 * 60 * 60_000 && result.json?.config?.batchSize === 25,
+  `every ${result.json?.config?.intervalMs} ms, ${result.json?.config?.batchSize} at a time`,
+);
+result = await request('POST', '/api/archive/check/run');
+check(
+  'a sweep with no destination runs nothing',
+  result.status === 200 && result.json?.running === false && result.json?.lastSweep === null,
+  `running ${result.json?.running}`,
+);
+result = await request('POST', '/api/archive/check/log/clear');
+check(
+  'the schedule log clears',
+  result.status === 200 && (result.json?.log ?? []).length === 0,
+  `${(result.json?.log ?? []).length} log line(s)`,
+);
+result = await request('PUT', '/api/archive/check', { enabled: false });
+check(
+  'switching the schedule off leaves no next run, and is written to the log',
+  result.status === 200 &&
+    result.json?.config?.enabled === false &&
+    result.json?.nextRunAt === null &&
+    (result.json?.log ?? []).some((line) => /switched off/.test(line)),
+  `enabled ${result.json?.config?.enabled}, next ${result.json?.nextRunAt}`,
 );
 
 /* bulk queuing -------------------------------------------------------- */

@@ -335,7 +335,9 @@ export async function tusUpload(options: TusUploadOptions): Promise<TusUploadRes
     abortIfAsked();
     const end = Math.min(totalBytes, offset + chunkBytes);
     const chunk = await source.read(offset, end - offset);
-    if (chunk.length === 0) throw new TusError(`the local file ended early at byte ${offset} of ${totalBytes}`);
+    // The source is not necessarily a file: a restore streams straight out of R2,
+    // so a short read means the object was shorter than the length it declared.
+    if (chunk.length === 0) throw new TusError(`the byte source ended early at byte ${offset} of ${totalBytes}`);
     try {
       const patch = await send(
         fetchImpl,
