@@ -108,10 +108,11 @@ Paste that URL into **Source URL** and press **Download & upload**.
   [Accounts and the shared
   watermark](#accounts-and-the-shared-watermark).
 - **Watermark**: one image and one placement, shared by every account, so the
-  mark lands in the same corner at the same size on every library — picked by
-  corner *or* typed in as **left/top** offsets, which is what reaches the frame's
-  edges. A new library gets it as it is created; libraries added by hand can be
-  given it afterwards, one at a time or all at once.
+  mark lands in the same corner at the same size on every library — placed on a
+  preview frame by dragging it and its eight resize handles, by corner + margin,
+  or by **left/top** offsets typed in, which is what reaches the frame's edges. A
+  new library gets it as it is created; libraries added by hand can be given it
+  afterwards, one at a time or all at once.
 - **Check libraries**: read every library back from Bunny and report the ones
   that no longer match — a shorter resolution ladder, scaling by height and width
   off, a mark that moved, an image missing — each with a *fix* that rewrites the
@@ -321,6 +322,13 @@ The panel shows the resolved offsets either way, greyed out and disabled while
 the other mode is in charge, so `left`/`top` always read as where the mark
 really is.
 
+- The panel draws a **stand-in video frame with the mark inside it**: drag the
+  mark to move it, drag one of the eight handles to resize it, or nudge it with
+  the arrow keys (shift for a finer step). The frame, the four fields and the two
+  offsets are one description of one position — moving the mark switches the
+  panel to hand placement and fills the fields in, and typing in a field moves the
+  mark. Dragging is instant and saving is not, so the frame says *unsaved* until
+  **Save watermark** is pressed.
 - **Save watermark** changes the placement. It does not touch Bunny by itself.
 - **Apply to all accounts** re-sends the placement and re-uploads the image to
   every library, one at a time, and reports per account.
@@ -894,7 +902,8 @@ keeps the queue honest.
 | `POST` | `/api/accounts/:id/watermark` | re-apply the shared watermark to one library (`502` with the reason when its account key is missing) |
 | `POST` | `/api/accounts/verify` | **read every library back**: per account, whether its resolution ladder, `ScaleVideoUsingBothDimensions`, watermark placement and watermark image match the settings, with `inSync` / `drifted` / `skipped` counts. Read-only |
 | `POST` | `/api/accounts/:id/settings` | **put the settings back** onto one library (ladder + `ScaleVideoUsingBothDimensions` + placement, then the image) and read it back to confirm — the remedy for a drifted library |
-| `GET` | `/api/watermark` | the shared watermark: placement in force, whether an image is stored, its size and type |
+| `GET` | `/api/watermark` | the shared watermark: placement in force, whether an image is stored, its size and type (`anchors` and `corners` name the two ways a placement can be described) |
+| `GET` | `/api/watermark/image` | the stored image itself, as it was uploaded (`404` when there is none) — what the placement frame draws the mark from |
 | `PUT` | `/api/watermark` | change the placement: `{ anchor: 'corner', corner, width, height, margin }` or `{ anchor: 'offset', left, top, width, height }` (percentages, clamped to the frame; `GET` reports both modes under `anchors`) |
 | `PUT` | `/api/watermark/image` | the image itself as a raw body (`image/png`, `image/jpeg`, …) — up to 10 MB |
 | `DELETE` | `/api/watermark/image` | forget the image (libraries keep the placement) |
@@ -1067,7 +1076,7 @@ npm test                 # 308 tests (queue caps, crypto, store + its change hoo
 
 # End-to-end against a running mock server:
 npm run mock &           # or in another terminal
-node scripts/smoke.mjs   # 127 checks: TMDB, accounts, provisioning from an account key, the shared watermark (both placement modes) and the library read-back (check, drift, fix, re-check), uploads, concurrency cap, the live event stream, the source pipeline, the subtitle backfill (two titles repaired, one source fetch each), the autopilot, watched folder, cleanup
+node scripts/smoke.mjs   # 129 checks: TMDB, accounts, provisioning from an account key, the shared watermark (both placement modes, and the image served back for the frame) and the library read-back (check, drift, fix, re-check), uploads, concurrency cap, the live event stream, the source pipeline, the subtitle backfill (two titles repaired, one source fetch each), the autopilot, watched folder, cleanup
 
 # The server under test must have no R2 destination: a block of the checks is
 # about that state, and one of them queues an archive — which on a real

@@ -948,6 +948,25 @@ app.put('/api/watermark/image', express.raw({ type: () => true, limit: '12mb' })
   }
 });
 
+/**
+ * The stored image itself.
+ *
+ * The watermark panel draws the mark inside a stand-in video frame so it can be
+ * dragged into place, and the browser can only do that with the bytes — which are
+ * already on disk next to the database, so the route is a read of the same file
+ * the upload wrote. The image is replaced in place when a new one arrives, so the
+ * answer is explicitly uncacheable; the dashboard asks with a query string that
+ * changes with the upload, and a cached copy would keep showing the old mark.
+ */
+app.get('/api/watermark/image', (_req, res) => {
+  const image = watermark.image();
+  if (!image) return void res.status(404).json({ error: 'no watermark image is stored' });
+  res.setHeader('content-type', image.contentType);
+  res.setHeader('content-length', String(image.bytes.byteLength));
+  res.setHeader('cache-control', 'no-store');
+  res.end(image.bytes);
+});
+
 app.delete('/api/watermark/image', (_req, res) => {
   res.json(watermark.clearImage());
 });

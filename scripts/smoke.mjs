@@ -41,7 +41,14 @@ function check(label, condition, extra = '') {
   if (!condition) failures += 1;
 }
 
-async function request(method, path, body, contentType) {
+/**
+ * One HTTP call, with the answer read the way the caller needs it.
+ *
+ * `asBytes` is for the endpoints that answer with a file rather than with JSON —
+ * the watermark image, which the panel draws inside its placement frame — where
+ * decoding the body as text would mangle it.
+ */
+async function request(method, path, body, contentType, asBytes = false) {
   const init = { method, headers: { accept: 'application/json' } };
   if (body !== undefined) {
     if (Buffer.isBuffer(body) || typeof body === 'string') {
@@ -53,6 +60,15 @@ async function request(method, path, body, contentType) {
     }
   }
   const response = await fetch(base + path, init);
+  if (asBytes) {
+    return {
+      status: response.status,
+      bytes: Buffer.from(await response.arrayBuffer()),
+      contentType: response.headers.get('content-type') ?? '',
+      json: null,
+      text: '',
+    };
+  }
   const text = await response.text();
   let json = null;
   try {
@@ -456,11 +472,26 @@ check(
 );
 
 const watermarkImage = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00]);
+result = await request('GET', '/api/watermark/image');
+check(
+  'with no image stored there are no bytes for the placement frame to draw',
+  result.status === 404 && /no watermark image/.test(result.json?.error ?? ''),
+  `status ${result.status}`,
+);
 result = await request('PUT', '/api/watermark/image', watermarkImage, 'image/png');
 check(
   'the watermark image is stored, with its size and type',
   result.status === 200 && result.json?.hasImage === true && result.json?.bytes === watermarkImage.length && result.json?.contentType === 'image/png',
   `status ${result.status}, ${result.json?.bytes} bytes`,
+);
+result = await request('GET', '/api/watermark/image', undefined, undefined, true);
+check(
+  'the stored image is served back byte for byte, for the frame to draw',
+  result.status === 200 &&
+    result.bytes.length === watermarkImage.length &&
+    Buffer.compare(result.bytes, watermarkImage) === 0 &&
+    /image\/png/.test(result.contentType),
+  `status ${result.status}, ${result.bytes?.length} byte(s), ${result.contentType}`,
 );
 check('the image is on disk beside the database', fs.existsSync(path.join(dataDir, 'watermark-image')));
 check('the placement is on disk as JSON', fs.existsSync(path.join(dataDir, 'watermark.json')));

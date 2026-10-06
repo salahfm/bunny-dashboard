@@ -1973,6 +1973,9 @@
       $('#watermark-left').value = offset(settings.left, placement.left);
       $('#watermark-top').value = offset(settings.top, placement.top);
       watermarkFields();
+      loadWatermarkImage(data);
+      renderWatermarkStage();
+      markWatermarkDirty(false);
       $('#watermark-state').textContent = data.hasImage
         ? `${bytes(data.bytes)} ${data.contentType ?? 'image'} · ${fmtPercent(placement.left)} from the left, ${fmtPercent(placement.top)} from the top`
         : 'no image yet — the position and size are saved, but nothing shows until one is uploaded';
@@ -2025,14 +2028,229 @@
     const corner = $('#watermark-corner').value;
     const right = corner === 'top-right' || corner === 'bottom-right';
     const bottom = corner === 'bottom-left' || corner === 'bottom-right';
-    const restrict = (value, min, max) => Math.min(max, Math.max(min, value));
-    const wide = restrict(Number($('#watermark-width').value) || 12, 1, 100);
-    const tall = restrict(Number($('#watermark-height').value) || 8, 1, 100);
-    const margin = restrict(Number($('#watermark-margin').value) || 0, 0, 50);
-    const round = (value) => Math.round(value * 100) / 100;
-    $('#watermark-left').value = String(round(restrict(right ? 100 - wide - margin : margin, 0, 100 - wide)));
-    $('#watermark-top').value = String(round(restrict(bottom ? 100 - tall - margin : margin, 0, 100 - tall)));
+    const wide = watermarkNumber('#watermark-width', 12, 1, 100);
+    const tall = watermarkNumber('#watermark-height', 8, 1, 100);
+    const margin = watermarkNumber('#watermark-margin', 0, 0, 50);
+    $('#watermark-left').value = String(round2(clampNumber(right ? 100 - wide - margin : margin, 0, 100 - wide, 0)));
+    $('#watermark-top').value = String(round2(clampNumber(bottom ? 100 - tall - margin : margin, 0, 100 - tall, 0)));
   }
+
+  /* ------------------------------------- the placement frame */
+
+  /**
+   * The smallest the mark can be dragged or resized to, in percent.
+   *
+   * Below this the handles overlap each other and the mark is a sliver nobody
+   * could aim at again; the API itself takes 1%.
+   */
+  const WM_MIN_PERCENT = 2;
+
+  /** Whether what the panel shows has been sent to the server yet. */
+  let watermarkUnsaved = false;
+
+  /** A number inside a range — every number in this panel is a percentage. */
+  function clampNumber(value, min, max, fallback) {
+    const number = Number(value);
+    return Math.min(max, Math.max(min, Number.isFinite(number) ? number : fallback));
+  }
+
+  function round2(value) {
+    return Math.round(value * 100) / 100;
+  }
+
+  /** One of the panel's fields, read as a number inside the range it accepts. */
+  function watermarkNumber(selector, fallback, min, max) {
+    return clampNumber($(selector).value, min, max, fallback);
+  }
+
+  /**
+   * The placement the four fields describe, in percent of the frame.
+   *
+   * Read from the fields rather than from `state.watermark`, because the frame
+   * shows what is *about* to be saved: while dragging, the fields are the truth.
+   */
+  function watermarkRect() {
+    const width = watermarkNumber('#watermark-width', 12, 1, 100);
+    const height = watermarkNumber('#watermark-height', 8, 1, 100);
+    return {
+      width,
+      height,
+      left: watermarkNumber('#watermark-left', 0, 0, 100 - width),
+      top: watermarkNumber('#watermark-top', 0, 0, 100 - height),
+    };
+  }
+
+  /**
+   * The stored image, so the frame can draw the real mark.
+   *
+   * The URL carries the upload's timestamp: the image is replaced in place, and
+   * without it the browser would keep showing the previous PNG for as long as it
+   * felt like caching it (the route says `no-store`, and this is the belt to that
+   * pair of braces).
+   */
+  /** Whether an image is stored but its bytes could not be fetched. */
+  let watermarkImageFailed = false;
+
+  function loadWatermarkImage(data) {
+    const mark = $('#watermark-mark');
+    watermarkImageFailed = false;
+    if (!data?.hasImage) {
+      mark.removeAttribute('src');
+      return;
+    }
+    const stamp = encodeURIComponent(String(data.updatedAt ?? data.bytes ?? Date.now()));
+    mark.src = `/api/watermark/image?v=${stamp}`;
+  }
+
+  // A mark whose bytes cannot be read back is not a mark: the frame says so
+  // rather than falling back to the browser's broken-image glyph.
+  $('#watermark-mark').addEventListener('error', () => {
+    watermarkImageFailed = true;
+    renderWatermarkStage();
+  });
+
+  /** Draw the frame: the mark at its real percentages, and the numbers under it. */
+  function renderWatermarkStage() {
+    const rect = watermarkRect();
+    const box = $('#watermark-box');
+    box.style.left = `${rect.left}%`;
+    box.style.top = `${rect.top}%`;
+    box.style.width = `${rect.width}%`;
+    box.style.height = `${rect.height}%`;
+    const showMark = Boolean(state.watermark?.hasImage) && !watermarkImageFailed;
+    $('#watermark-mark').classList.toggle('hidden', !showMark);
+    const placeholder = $('#watermark-placeholder');
+    placeholder.classList.toggle('hidden', showMark);
+    placeholder.textContent = watermarkImageFailed
+      ? 'the stored image could not be read back'
+      : 'no image yet — upload one below';
+    $('#watermark-stage-state').textContent =
+      `${fmtPercent(rect.left)} from the left · ${fmtPercent(rect.top)} from the top · ${fmtPercent(rect.width)} × ${fmtPercent(rect.height)}`;
+  }
+
+  /**
+   * Say whether the frame holds changes the server has not been told about yet.
+   *
+   * Dragging is instant and saving is not, so without this the panel would look
+   * saved the moment the mark moved.
+   */
+  function markWatermarkDirty(dirty) {
+    watermarkUnsaved = dirty;
+    $('#watermark-dirty').textContent = dirty ? 'unsaved — press Save watermark' : '';
+  }
+
+  /**
+   * Write a placement back into the fields the API is sent from.
+   *
+   * Taking hold of the mark is hand placement by definition, so the panel
+   * switches to it: from then on the offsets are the ones the user set, not the
+   * ones a corner derives. The corner select keeps its value, so going back to
+   * a corner is one click.
+   */
+  function writeWatermarkRect(rect) {
+    $('#watermark-left').value = String(rect.left);
+    $('#watermark-top').value = String(rect.top);
+    $('#watermark-width').value = String(rect.width);
+    $('#watermark-height').value = String(rect.height);
+    if (!watermarkByHand()) {
+      $('#watermark-anchor').value = 'offset';
+      watermarkFields();
+    }
+    markWatermarkDirty(true);
+    renderWatermarkStage();
+  }
+
+  /** The mark moved by a delta, kept inside the frame. */
+  function moveWatermarkWithin(start, dx, dy) {
+    return {
+      left: round2(clampNumber(start.left + dx, 0, 100 - start.width, start.left)),
+      top: round2(clampNumber(start.top + dy, 0, 100 - start.height, start.top)),
+      width: start.width,
+      height: start.height,
+    };
+  }
+
+  /**
+   * The mark resized from one of its eight handles.
+   *
+   * The edge or corner opposite the one being dragged stays where it is, which is
+   * what makes a handle feel like a handle rather than a nudge; the mark cannot
+   * be pushed past its minimum, or out of the frame.
+   */
+  function resizeWatermarkFrom(start, handle, dx, dy) {
+    let { left, top, width, height } = start;
+    if (handle.includes('e')) width = clampNumber(start.width + dx, WM_MIN_PERCENT, 100 - start.left, start.width);
+    if (handle.includes('w')) {
+      left = clampNumber(start.left + dx, 0, start.left + start.width - WM_MIN_PERCENT, start.left);
+      width = start.left + start.width - left;
+    }
+    if (handle.startsWith('s')) height = clampNumber(start.height + dy, WM_MIN_PERCENT, 100 - start.top, start.height);
+    if (handle.startsWith('n')) {
+      top = clampNumber(start.top + dy, 0, start.top + start.height - WM_MIN_PERCENT, start.top);
+      height = start.top + start.height - top;
+    }
+    return { left: round2(left), top: round2(top), width: round2(width), height: round2(height) };
+  }
+
+  /**
+   * Drag the mark, or resize it from a handle, until the pointer is let go.
+   *
+   * The maths is done in percent of the frame — which is the unit the API stores,
+   * so what is dragged is what Bunny is sent. `handle` is `null` when the mark
+   * itself was grabbed, and the name of a handle (`'nw'`, `'e'`, …) when one was.
+   */
+  function dragWatermark(event, handle) {
+    if (event.button) return;
+    const frame = $('#watermark-stage').getBoundingClientRect();
+    // A frame with no size cannot be a coordinate system: nothing to drag onto.
+    if (!frame.width || !frame.height) return;
+    event.preventDefault();
+    const start = watermarkRect();
+    const startX = event.clientX;
+    const startY = event.clientY;
+    $('#watermark-box').classList.add('is-dragging');
+
+    const move = (moveEvent) => {
+      const dx = ((moveEvent.clientX - startX) / frame.width) * 100;
+      const dy = ((moveEvent.clientY - startY) / frame.height) * 100;
+      writeWatermarkRect(handle ? resizeWatermarkFrom(start, handle, dx, dy) : moveWatermarkWithin(start, dx, dy));
+    };
+    const stop = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', stop);
+      window.removeEventListener('pointercancel', stop);
+      $('#watermark-box').classList.remove('is-dragging');
+    };
+    // Listening on the window rather than on the element is what lets the drag
+    // continue once the pointer has run past the frame — and off the handle.
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', stop);
+    window.addEventListener('pointercancel', stop);
+  }
+
+  $('#watermark-box').addEventListener('pointerdown', (event) => dragWatermark(event, null));
+  for (const handle of document.querySelectorAll('.wm-handle')) {
+    handle.addEventListener('pointerdown', (event) => {
+      event.stopPropagation();
+      dragWatermark(event, handle.dataset.wmHandle);
+    });
+  }
+
+  // The same control from the keyboard: arrows nudge the mark, or resize it when
+  // a handle has focus, with shift for a finer step.
+  $('#watermark-stage').addEventListener('keydown', (event) => {
+    const steps = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+    const step = steps[event.key];
+    if (!step) return;
+    event.preventDefault();
+    const size = event.shiftKey ? 0.2 : 1;
+    const active = document.activeElement;
+    const handle = active?.dataset?.wmHandle;
+    const from = watermarkRect();
+    writeWatermarkRect(
+      handle ? resizeWatermarkFrom(from, handle, step[0] * size, step[1] * size) : moveWatermarkWithin(from, step[0] * size, step[1] * size),
+    );
+  });
 
   /**
    * Read every configured library back from bunny.net and show the differences.
@@ -2221,17 +2439,40 @@
 
   /* ------------------------------------------------------------ watermark */
 
-  $('#watermark-anchor').addEventListener('change', () => watermarkFields());
+  $('#watermark-anchor').addEventListener('change', () => {
+    watermarkFields();
+    renderWatermarkStage();
+  });
   // Typing a corner, a size or a margin moves the read-out with it, so the two
-  // numbers under "left" and "top" are never stale.
+  // numbers under "left" and "top" are never stale — and every field redraws the
+  // frame, because the frame is nothing but those numbers.
   for (const id of ['#watermark-corner', '#watermark-width', '#watermark-height', '#watermark-margin']) {
-    $(id).addEventListener('input', () => {
+    const typed = () => {
       if (!watermarkByHand()) mirrorPlacement();
-    });
-    $(id).addEventListener('change', () => {
-      if (!watermarkByHand()) mirrorPlacement();
-    });
+      markWatermarkDirty(true);
+      renderWatermarkStage();
+    };
+    $(id).addEventListener('input', typed);
+    $(id).addEventListener('change', typed);
   }
+  // The offsets are the other half of the same thing: typing one is hand
+  // placement, and it redraws the frame exactly the way dragging it does.
+  for (const id of ['#watermark-left', '#watermark-top']) {
+    const typed = () => {
+      markWatermarkDirty(true);
+      renderWatermarkStage();
+    };
+    $(id).addEventListener('input', typed);
+    $(id).addEventListener('change', typed);
+  }
+
+  // Moving the mark changes nothing until Save is pressed, so leaving the page
+  // with unsaved changes would quietly lose the placement.
+  window.addEventListener('beforeunload', (event) => {
+    if (!watermarkUnsaved) return;
+    event.preventDefault();
+    event.returnValue = '';
+  });
 
   $('#watermark-save').addEventListener('click', async () => {
     const byHand = watermarkByHand();
@@ -2280,7 +2521,7 @@
   });
 
   $('#watermark-remove').addEventListener('click', async () => {
-    if (!confirm('Remove the watermark image? Libraries keep the placement, but the mark stops showing.')) return;
+    if (!confirm('Delete the watermark image? Libraries keep the placement, but the mark stops showing.')) return;
     try {
       await api('DELETE', '/api/watermark/image');
       toast('watermark image removed', 'ok');

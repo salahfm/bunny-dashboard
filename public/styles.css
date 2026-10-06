@@ -299,6 +299,178 @@ button.link {
   cursor: pointer;
 }
 
+/*
+ * The watermark placement frame.
+ *
+ * A stand-in for a video frame with the mark drawn at its real percentages and
+ * eight handles around it — the control Bunny's own panel offers, driving the
+ * same four numbers the API takes. The picture is drawn rather than fetched, so
+ * the panel needs nothing but the mark itself.
+ */
+.wm-frame {
+  margin: 10px 0 4px;
+  max-width: 640px;
+}
+
+.wm-stage {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  border-radius: 6px;
+  touch-action: none;
+  user-select: none;
+}
+
+/* The frame is a pseudo-element so the handles can overhang its edges: a handle
+   half-cut by the picture would be half a target. */
+.wm-stage::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background-color: #6c7c91;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 640 360' preserveAspectRatio='none'%3E%3Cdefs%3E%3ClinearGradient id='sky' x1='0' y1='0' x2='0' y2='1'%3E%3Cstop offset='0' stop-color='%23cdd8e6'/%3E%3Cstop offset='0.55' stop-color='%239aabc0'/%3E%3Cstop offset='1' stop-color='%236c7c91'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='640' height='360' fill='url(%23sky)'/%3E%3Crect y='96' width='640' height='70' fill='%23ffffff' opacity='0.14'/%3E%3Cpath d='M0 250 L74 176 L150 236 L238 148 L330 244 L420 168 L512 240 L586 196 L640 232 L640 360 L0 360 Z' fill='%236d7f96' opacity='0.9'/%3E%3Cpath d='M0 296 L86 246 L176 304 L286 232 L386 306 L478 258 L566 314 L640 282 L640 360 L0 360 Z' fill='%2344505f' opacity='0.92'/%3E%3C/svg%3E");
+  background-size: cover;
+  background-position: center;
+}
+
+.wm-stage:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.wm-box {
+  position: absolute;
+  border: 1px dashed rgba(255, 255, 255, 0.55);
+  cursor: move;
+}
+
+.wm-mark {
+  display: block;
+  width: 100%;
+  height: 100%;
+  /* Both dimensions are set independently — that is what Bunny encodes, so it is
+     what the preview has to show. */
+  object-fit: fill;
+  pointer-events: none;
+}
+
+.wm-placeholder {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 2px 4px;
+  background: rgba(0, 0, 0, 0.32);
+  color: #fff;
+  font-size: 11px;
+  text-align: center;
+  pointer-events: none;
+}
+
+.wm-handle {
+  position: absolute;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid #fff;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45);
+}
+
+.wm-handle:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 1px;
+}
+
+.wm-handle[data-wm-handle='nw'] {
+  left: 0;
+  top: 0;
+  transform: translate(-50%, -50%);
+  cursor: nwse-resize;
+}
+
+.wm-handle[data-wm-handle='n'] {
+  left: 50%;
+  top: 0;
+  transform: translate(-50%, -50%);
+  cursor: ns-resize;
+}
+
+.wm-handle[data-wm-handle='ne'] {
+  left: 100%;
+  top: 0;
+  transform: translate(-50%, -50%);
+  cursor: nesw-resize;
+}
+
+.wm-handle[data-wm-handle='w'] {
+  left: 0;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  cursor: ew-resize;
+}
+
+.wm-handle[data-wm-handle='e'] {
+  left: 100%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  cursor: ew-resize;
+}
+
+.wm-handle[data-wm-handle='sw'] {
+  left: 0;
+  top: 100%;
+  transform: translate(-50%, -50%);
+  cursor: nesw-resize;
+}
+
+.wm-handle[data-wm-handle='s'] {
+  left: 50%;
+  top: 100%;
+  transform: translate(-50%, -50%);
+  cursor: ns-resize;
+}
+
+.wm-handle[data-wm-handle='se'] {
+  left: 100%;
+  top: 100%;
+  transform: translate(-50%, -50%);
+  cursor: nwse-resize;
+}
+
+/* The numbers under the picture, in the strip a player would put its controls
+   in — where the mark is, and whether that has been saved yet. */
+.wm-frame-row {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 9px;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0));
+  pointer-events: none;
+}
+
+.wm-frame-row .muted {
+  color: #e8edf4;
+}
+
+.wm-dirty {
+  color: var(--warn);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.file-button.wm-upload {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
 .checks {
   display: flex;
   flex-wrap: wrap;

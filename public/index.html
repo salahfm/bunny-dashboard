@@ -427,15 +427,12 @@
 
           <h2>Watermark</h2>
           <p class="muted small">
-            One image and one placement, shared by every account — a new library gets it the moment it is created, and any
-            library added by hand can be given it afterwards. The position and the size are kept in percentages of the
-            frame, so the mark lands in the same place whatever the video's resolution.
+            One image (PNG or JPEG, up to 10 MB) and one placement, shared by every account — a new library gets it the
+            moment it is created, and any library added by hand can be given it afterwards. The watermark is encoded into
+            the video itself and cannot be removed after encoding. Position and size are kept in percentages of the frame,
+            so the mark lands in the same place whatever the video's resolution.
           </p>
           <div class="grid2">
-            <label>
-              Image (PNG or JPEG, up to 10 MB)
-              <input id="watermark-file" type="file" accept="image/png,image/jpeg,image/webp" />
-            </label>
             <label>
               Placement
               <select id="watermark-anchor">
@@ -474,10 +471,52 @@
             </label>
           </div>
           <p id="watermark-hint" class="muted small"></p>
+
+          <!--
+            A stand-in for a video frame, with the mark drawn at its real
+            percentages. Drag the mark to move it, drag a handle to resize it,
+            or leave the frame alone and use the fields above — every route ends
+            in the same four numbers, and those are what Bunny is sent.
+          -->
+          <div class="wm-frame">
+            <div
+              id="watermark-stage"
+              class="wm-stage"
+              tabindex="0"
+              role="application"
+              aria-label="Watermark placement on a video frame — drag the mark to move it, drag a handle to resize it, or use the arrow keys"
+            >
+              <div id="watermark-box" class="wm-box">
+                <img
+                  id="watermark-mark"
+                  class="wm-mark hidden"
+                  alt="The watermark image, drawn where it will be encoded"
+                  draggable="false"
+                />
+                <span id="watermark-placeholder" class="wm-placeholder">no image yet — upload one below</span>
+                <span class="wm-handle" data-wm-handle="nw" tabindex="0" aria-label="resize from the top left"></span>
+                <span class="wm-handle" data-wm-handle="n" tabindex="0" aria-label="resize from the top edge"></span>
+                <span class="wm-handle" data-wm-handle="ne" tabindex="0" aria-label="resize from the top right"></span>
+                <span class="wm-handle" data-wm-handle="w" tabindex="0" aria-label="resize from the left edge"></span>
+                <span class="wm-handle" data-wm-handle="e" tabindex="0" aria-label="resize from the right edge"></span>
+                <span class="wm-handle" data-wm-handle="sw" tabindex="0" aria-label="resize from the bottom left"></span>
+                <span class="wm-handle" data-wm-handle="s" tabindex="0" aria-label="resize from the bottom edge"></span>
+                <span class="wm-handle" data-wm-handle="se" tabindex="0" aria-label="resize from the bottom right"></span>
+              </div>
+              <div class="wm-frame-row">
+                <span id="watermark-stage-state" class="muted small"></span>
+                <span id="watermark-dirty" class="wm-dirty"></span>
+              </div>
+            </div>
+          </div>
           <div class="row">
+            <label class="file-button wm-upload">
+              Upload watermark
+              <input id="watermark-file" type="file" accept="image/png,image/jpeg,image/webp" />
+            </label>
             <button id="watermark-save" class="primary">Save watermark</button>
             <button id="watermark-apply">Apply to all accounts</button>
-            <button id="watermark-remove">Remove image</button>
+            <button id="watermark-remove">Delete watermark</button>
             <span id="watermark-state" class="muted small"></span>
           </div>
         </section>
