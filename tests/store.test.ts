@@ -17,9 +17,29 @@ test('accounts and settings persist across reloads', () => {
   assert.equal(reloaded.accounts.length, 1);
   assert.equal(reloaded.account(account.id)?.name, 'primary');
 
-  reloaded.updateSettings({ perAccountConcurrency: 7 });
+  assert.equal(reloaded.settings.subtitleAutoFill, true, 'filling in a missing language is on by default');
+
+  reloaded.updateSettings({ perAccountConcurrency: 7, subtitleAutoFill: false });
   const again = new Store(config);
   assert.equal(again.settings.perAccountConcurrency, 7);
+  assert.equal(again.settings.subtitleAutoFill, false, 'turning the repair off survives a reload');
+});
+
+test('the R2 archive switch follows R2_ARCHIVE until the dashboard overrides it', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bunny-store-'));
+  const without = new Store(testConfig(dir));
+  assert.equal(without.settings.archiveToR2, false, 'no destination means there is nothing to archive');
+
+  const other = fs.mkdtempSync(path.join(os.tmpdir(), 'bunny-store-'));
+  const config = testConfig(other, {
+    r2: { accountId: 'a', accessKeyId: 'k', secretAccessKey: 's', bucket: 'b', prefix: 'archive', enabled: true, keepBunny: false },
+  });
+  const store = new Store(config);
+  assert.equal(store.settings.archiveToR2, true, 'a configured destination turns it on by default');
+
+  store.updateSettings({ archiveToR2: false });
+  assert.equal(new Store(config).settings.archiveToR2, false, 'turning it off survives a reload');
+  assert.equal(store.settings.archiveToR2, false);
 });
 
 test('out-of-range stored settings are clamped on load', () => {
@@ -36,6 +56,61 @@ test('out-of-range stored settings are clamped on load', () => {
   const reloaded = new Store(config);
   assert.equal(reloaded.settings.perAccountConcurrency, 10);
   assert.equal(reloaded.settings.maxAccounts, 30);
+});
+
+/**
+ * The dashboard's live queue is built on this: the event stream subscribes once
+ * and must hear about every change — including a progress tick, which is the
+ * one mutation that deliberately skips the disk write.
+ */
+test('every job change is announced to listeners, in order', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bunny-store-'));
+  const config = testConfig(dir);
+  const store = new Store(config);
+  const seen: Array<{ kind: string; id: string; status?: string }> = [];
+  const stop = store.onJobChange((job, kind) => {
+    seen.push({ kind, id: job.id, ...(job.status ? { status: job.status } : {}) });
+  });
+
+  const job = store.addJob(newJob({ kind: 'movie', tmdbId: 9, title: 'N' }, { kind: 'file', name: 'n.bin' }));
+  store.updateJob(job.id, { progress: 5 });
+  store.updateJob(job.id, { status: 'ready' });
+  assert.equal(store.removeJob(job.id), true);
+
+  assert.deepEqual(
+    seen,
+    [
+      { kind: 'added', id: job.id, status: 'queued' },
+      { kind: 'updated', id: job.id, status: 'queued' },
+      { kind: 'updated', id: job.id, status: 'ready' },
+      { kind: 'removed', id: job.id, status: 'ready' },
+    ],
+  );
+
+  stop();
+  store.addJob(newJob({ kind: 'movie', tmdbId: 10, title: 'O' }, { kind: 'file', name: 'o.bin' }));
+  assert.equal(seen.length, 4, 'a listener that unsubscribed hears nothing more');
+});
+
+/** Reporting a change is not allowed to be able to break the queue itself. */
+test('a listener that throws cannot break the store', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bunny-store-'));
+  const config = testConfig(dir);
+  const store = new Store(config);
+  store.onJobChange(() => {
+    throw new Error('listener exploded');
+  });
+
+  const originalError = console.error;
+  console.error = () => {};
+  try {
+    const job = store.addJob(newJob({ kind: 'movie', tmdbId: 11, title: 'P' }, { kind: 'file', name: 'p.bin' }));
+    assert.equal(store.updateJob(job.id, { status: 'ready' })?.status, 'ready');
+    assert.equal(store.job(job.id)?.status, 'ready');
+    assert.equal(store.removeJob(job.id), true);
+  } finally {
+    console.error = originalError;
+  }
 });
 
 test('a corrupt database is set aside instead of crashing', () => {

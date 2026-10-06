@@ -33,7 +33,10 @@ export function testConfig(dataDir: string, overrides: Partial<AppConfig> = {}):
     scrapeCooldownMs: 60_000,
     scrapeEgress: {},
     subtitleUpload: true,
-    subtitleTargetLanguage: 'ar',
+    subtitleTargetLanguages: ['ar'],
+    // On by default like the real configuration; a test that cares points the
+    // endpoint at its own fake DeepL.
+    subtitleTranslate: true,
     ...overrides,
   };
 }

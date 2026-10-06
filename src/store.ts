@@ -118,6 +118,16 @@ export interface Job {
   finishedAt?: string;
 }
 
+/**
+ * What happened to a job, as the live queue stream reports it.
+ *
+ * `added` and `removed` mean the row appeared or vanished; `updated` means one
+ * or more of its visible fields moved (a status, a progress tick, a byte count).
+ */
+export type JobChangeKind = 'added' | 'updated' | 'removed';
+
+type JobListener = (job: Job, kind: JobChangeKind) => void;
+
 /** One subtitle track carried to Bunny, as the job's report keeps it. */
 export interface SubtitleTrack {
   /** The ISO 639-1 code the caption was filed under with Bunny. */
@@ -159,6 +169,18 @@ export interface Settings {
   /** Folder scanned for new video files; seeded from WATCH_DIR on first run. */
   watchDir?: string;
   watchEnabled: boolean;
+  /**
+   * Fill in a target language a finished publish left missing, without being
+   * asked. On by default: the usual reason a language is absent is a refused
+   * translation, which one more try a minute later fixes.
+   */
+  subtitleAutoFill: boolean;
+  /**
+   * Copy a finished title into R2 (and let Bunny forget it) without being asked.
+   * Only meaningful when the R2 destination is configured at all; the default
+   * follows the R2_ARCHIVE switch, and this is what the dashboard toggles.
+   */
+  archiveToR2: boolean;
 }
 
 export interface Db {
@@ -187,6 +209,7 @@ export class Store {
   private db: Db;
   private savePending = false;
   private saveTimer: NodeJS.Timeout | undefined;
+  private jobListeners = new Set<JobListener>();
 
   constructor(config: AppConfig) {
     this.config = config;
@@ -201,6 +224,8 @@ export class Store {
         maxAccounts: clampMaxAccounts(this.config.maxAccounts),
         ...(this.config.watchDir ? { watchDir: this.config.watchDir } : {}),
         watchEnabled: true,
+        subtitleAutoFill: true,
+        archiveToR2: this.config.r2?.enabled ?? false,
       },
       accounts: [],
       jobs: [],
@@ -220,6 +245,9 @@ export class Store {
           perAccountConcurrency: clampConcurrency(raw.settings?.perAccountConcurrency, base.settings.perAccountConcurrency),
           maxAccounts: clampMaxAccounts(raw.settings?.maxAccounts, base.settings.maxAccounts),
           watchEnabled: raw.settings?.watchEnabled !== false,
+          subtitleAutoFill: raw.settings?.subtitleAutoFill !== false,
+          // A stored choice wins; with none, the R2_ARCHIVE switch decides.
+          archiveToR2: typeof raw.settings?.archiveToR2 === 'boolean' ? raw.settings.archiveToR2 : base.settings.archiveToR2,
         },
         accounts: Array.isArray(raw.accounts) ? raw.accounts : [],
         jobs: Array.isArray(raw.jobs) ? raw.jobs : [],
@@ -265,6 +293,37 @@ export class Store {
   /** True when a coalesced write is still pending — used by tests. */
   get hasPendingSave(): boolean {
     return this.savePending;
+  }
+
+  /**
+   * Watch the queue. The dashboard's live event stream is the subscriber: it is
+   * told *which* job moved and *how*, so it can push that one row to the browser
+   * instead of the browser re-reading the whole list.
+   *
+   * Every mutation path goes through this — the job worker, the autopilot, the
+   * watched folder and the API routes alike — so nothing can change a job
+   * without the stream hearing about it.
+   */
+  onJobChange(listener: JobListener): () => void {
+    this.jobListeners.add(listener);
+    return () => {
+      this.jobListeners.delete(listener);
+    };
+  }
+
+  /**
+   * Fans a change out to the listeners. A listener that throws is logged and
+   * skipped: reporting a change must never be able to break the queue itself.
+   */
+  private emitJob(job: Job, kind: JobChangeKind): void {
+    if (this.jobListeners.size === 0) return;
+    for (const listener of [...this.jobListeners]) {
+      try {
+        listener(job, kind);
+      } catch (error) {
+        console.error('[store] a job listener failed:', error);
+      }
+    }
   }
 
   get settings(): Settings {
@@ -329,6 +388,7 @@ export class Store {
   addJob(job: Job): Job {
     this.db.jobs.push(job);
     this.save();
+    this.emitJob(job, 'added');
     return job;
   }
 
@@ -341,14 +401,18 @@ export class Store {
     const keys = Object.keys(patch) as Array<keyof Job>;
     if (keys.length > 0 && keys.every((key) => VOLATILE_JOB_FIELDS.has(key))) this.saveSoon();
     else this.save();
+    this.emitJob(job, 'updated');
     return job;
   }
 
   removeJob(id: string): boolean {
     const index = this.db.jobs.findIndex((job) => job.id === id);
     if (index === -1) return false;
-    this.db.jobs.splice(index, 1);
+    const [removed] = this.db.jobs.splice(index, 1);
     this.save();
+    // Reported after the splice, so a listener that re-reads the queue sees the
+    // job already gone rather than removing a row that is about to come back.
+    if (removed) this.emitJob(removed, 'removed');
     return true;
   }
 }

@@ -5,7 +5,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import type { Catalog } from './catalog';
+import type { Catalog, CatalogEntry } from './catalog';
 import type { AppConfig } from './config';
 import { BunnyError, bunnyStatusLabel, mapBunnyStatus, playbackUrlFor, type BunnyClient } from './bunny';
 import { isActiveStatus, planAssignments } from './queue';
@@ -23,6 +23,13 @@ export interface JobServiceDeps {
   tunnel: TunnelManager;
   /** Where a finished job's full record is kept; absent means it is not kept. */
   catalog?: Catalog;
+  /**
+   * Called with the catalogue entry a job just published, once it has been
+   * written. This is where a title that finished without one of its subtitle
+   * languages gets that language queued — the job worker is the only place that
+   * knows a publish just happened.
+   */
+  onPublished?: (entry: CatalogEntry, job: Job) => void;
   now?: () => number;
 }
 
@@ -72,6 +79,7 @@ export class JobService {
   private relay: RelayHub;
   private tunnel: TunnelManager;
   private catalog: Catalog | undefined;
+  private onPublished: ((entry: CatalogEntry, job: Job) => void) | undefined;
   private now: () => number;
   private inFlight = new Set<string>();
   private polling = new Set<string>();
@@ -84,6 +92,7 @@ export class JobService {
     this.relay = deps.relay;
     this.tunnel = deps.tunnel;
     this.catalog = deps.catalog;
+    this.onPublished = deps.onPublished;
     this.now = deps.now ?? (() => Date.now());
   }
 
@@ -586,11 +595,21 @@ export class JobService {
   /** Records a finished job in the published catalogue, if one is configured. */
   private publish(job: Job, account: Account): void {
     if (!this.catalog) return;
+    let entry: CatalogEntry;
     try {
-      this.catalog.record(job, account);
+      entry = this.catalog.record(job, account);
     } catch (error) {
       // Losing the record must never fail a job that is already published.
       console.error(`[catalog] could not record ${job.id}: ${describeError(error)}`);
+      return;
+    }
+    // The hook acts *after* the record exists, so it can read the entry (the
+    // tracks the publish attached) rather than the job's own copy. It must not
+    // be able to break a publish either.
+    try {
+      this.onPublished?.(entry, job);
+    } catch (error) {
+      console.error(`[catalog] the published-title hook failed for ${job.id}: ${describeError(error)}`);
     }
   }
 

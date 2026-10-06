@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import type { BunnyClient, BunnyVideo } from '../src/bunny';
-import { Catalog } from '../src/catalog';
+import { Catalog, type CatalogEntry } from '../src/catalog';
 import type { AppConfig } from '../src/config';
 import { JobService } from '../src/jobs';
 import { Store } from '../src/store';
@@ -106,7 +106,10 @@ class FakeBunny {
   }
 }
 
-function setup(overrides: Partial<AppConfig> = {}): { config: AppConfig; store: Store; fake: FakeBunny; service: JobService; catalog: Catalog } {
+function setup(
+  overrides: Partial<AppConfig> = {},
+  onPublished?: (entry: CatalogEntry) => void,
+): { config: AppConfig; store: Store; fake: FakeBunny; service: JobService; catalog: Catalog } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bunny-jobs-'));
   const config = testConfig(dir, overrides);
   fs.mkdirSync(config.uploadsDir, { recursive: true });
@@ -119,6 +122,7 @@ function setup(overrides: Partial<AppConfig> = {}): { config: AppConfig; store: 
     config,
     clientFactory: () => fake as unknown as BunnyClient,
     catalog,
+    ...(onPublished ? { onPublished } : {}),
     ...testStreamDeps(dir),
   });
   return { config, store, fake, service, catalog };
@@ -168,6 +172,30 @@ test('a published job is written to the permanent catalogue when it turns ready'
   assert.equal(entry?.libraryId, '1');
   assert.equal(entry?.jobId, job.id);
   assert.equal(entry?.publishes, 1);
+});
+
+test('a finished publish hands its catalogue entry to the repair hook', async () => {
+  const published: CatalogEntry[] = [];
+  const { store, fake, service } = setup({}, (entry) => published.push(entry));
+  store.addAccount({ name: 'a', libraryId: '1', apiKeyEnc: 'x' });
+  const job = service.createUrlJob({ kind: 'movie', tmdbId: 27205, title: 'Inception', year: '2010' }, 'https://example.com/inception.mp4');
+
+  service.tickNow();
+  await waitFor(() => store.job(job.id)?.status === 'encoding', 'the fetch to complete');
+  assert.equal(published.length, 0, 'nothing is handed over before Bunny has finished');
+
+  // What a publish that attached the source track and missed the target looks
+  // like by the time the hook runs: the entry, its tracks and all.
+  store.updateJob(job.id, {
+    subtitles: [{ srclang: 'en', label: 'English', url: 'https://example.com/en.vtt', uploaded: true, cues: 2, bytes: 40 }],
+  });
+  for (const guid of fake.created) fake.statuses.set(guid, 4);
+  await service.pollNow();
+
+  assert.equal(published.length, 1);
+  assert.equal(published[0]?.key, 'movie:27205');
+  assert.equal(published[0]?.videoId, store.job(job.id)?.bunnyVideoId);
+  assert.deepEqual(published[0]?.subtitles?.map((track) => track.srclang), ['en']);
 });
 
 test('a remote-URL job asks Bunny to fetch and never touches disk', async () => {

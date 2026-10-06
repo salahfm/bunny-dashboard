@@ -8,7 +8,13 @@
  * It exercises TMDB search/lookup, account management, a streamed file
  * upload, remote-URL jobs, the 10-concurrent-uploads-per-account cap, and the
  * source-URL pipeline (a real HLS stream served from this process, downloaded
- * and published end to end), then cleans up the jobs and account it created.
+ * and published end to end). Its origin counts every request it answers, which
+ * is what proves the Library's batch fill-in downloads each title's subtitle
+ * track once — not once per language — before the jobs and account are cleaned
+ * up again.
+ *
+ * Run it against `npm run mock`: mock mode answers subtitle translation on this
+ * machine too, so the fill-in check neither needs a key nor reaches deepl.com.
  *
  * Set SMOKE_DATA_DIR when the dashboard under test was started with a custom
  * DATA_DIR, so the temp-file checks look in the right place.
@@ -50,6 +56,70 @@ async function request(method, path, body, contentType) {
   return { status: response.status, json, text };
 }
 
+/**
+ * Opens the live queue stream (`/api/events`) and collects what it pushes.
+ *
+ * Plain `fetch` is used rather than `EventSource` so the raw SSE frames can be
+ * read, and `waitFor` polls what has arrived so a check can say "the server
+ * pushed this" without guessing at a delay.
+ */
+function collectEvents(path) {
+  const controller = new AbortController();
+  const events = [];
+  const reading = (async () => {
+    const response = await fetch(base + path, { headers: { accept: 'text/event-stream' }, signal: controller.signal });
+    if (!response.ok || !response.body) throw new Error(`the event stream answered ${response.status}`);
+    const stream = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    for (;;) {
+      const { value, done } = await stream.read();
+      if (done) return;
+      buffer += decoder.decode(value, { stream: true });
+      let split;
+      while ((split = buffer.indexOf('\n\n')) >= 0) {
+        const frame = buffer.slice(0, split);
+        buffer = buffer.slice(split + 2);
+        const name = /^event:\s*(.+)$/m.exec(frame)?.[1];
+        const data = /^data:\s*(.+)$/m.exec(frame)?.[1];
+        if (!name || data === undefined) continue; // a `: ping` heartbeat
+        try {
+          events.push({ name, data: JSON.parse(data) });
+        } catch {
+          /* not a JSON frame */
+        }
+      }
+    }
+  })().catch((error) => {
+    if (error?.name !== 'AbortError') throw error;
+  });
+  return {
+    events,
+    /** The first job delta for one job matching `predicate`, if it arrived. */
+    deltaFor(id, predicate = () => true) {
+      for (const event of events) {
+        if (event.name !== 'jobs') continue;
+        const hit = (event.data?.jobs ?? []).find((entry) => entry.job?.id === id && predicate(entry));
+        if (hit) return hit;
+      }
+      return undefined;
+    },
+    /** Resolves true as soon as a collected event matches, false on timeout. */
+    async waitFor(predicate, timeoutMs = 5000) {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (events.some(predicate)) return true;
+        await sleep(50);
+      }
+      return false;
+    },
+    async stop() {
+      controller.abort();
+      await reading;
+    },
+  };
+}
+
 /** Deletes jobs, cancelling any that the queue has already picked up. */
 async function dropJobs(ids) {
   for (const id of ids ?? []) {
@@ -75,6 +145,39 @@ check(
 result = await request('GET', '/api/settings');
 check('settings expose the hard caps', result.json?.limits?.maxAccounts === 30 && result.json?.limits?.perAccountConcurrency === 10);
 check('settings expose the upload mode', result.json?.uploadMode === 'tus' && result.json?.tusChunkBytes === 8 * 1024 * 1024);
+check(
+  'settings report automatic subtitle repair, on by default',
+  result.json?.subtitles?.autoFill === true && result.json?.subtitles?.targets?.join(',') === 'ar',
+  `autoFill ${result.json?.subtitles?.autoFill}, targets ${result.json?.subtitles?.targets?.join(',')}`,
+);
+
+/* the R2 archive, from the outside -------------------------------- */
+// This run has no R2 destination, which is the state that must be safe: the
+// dashboard has to say so, refuse to switch the archive on, and archive nothing
+// — it must never look like it deleted a video without keeping a copy.
+check(
+  'settings report the R2 archive as unconfigured',
+  result.json?.archive?.configured === false && result.json?.archive?.auto === false,
+  `configured ${result.json?.archive?.configured}, auto ${result.json?.archive?.auto}`,
+);
+result = await request('GET', '/api/archive');
+check(
+  'the archive preview answers with no destination configured',
+  result.status === 200 && result.json?.configured === false && Array.isArray(result.json?.candidates),
+  `configured ${result.json?.configured}, ${(result.json?.candidates ?? []).length} candidate(s)`,
+);
+result = await request('POST', '/api/archive', { limit: 5 });
+check(
+  'archiving without a destination does nothing rather than half of it',
+  result.status === 200 && result.json?.configured === false && (result.json?.results ?? []).length === 0,
+  `configured ${result.json?.configured}, ${(result.json?.results ?? []).length} line(s)`,
+);
+result = await request('PUT', '/api/settings', { archiveToR2: true });
+check(
+  'switching the archive on with nowhere to write is refused',
+  result.status === 400 && /R2_ACCOUNT_ID/.test(result.json?.error ?? ''),
+  result.json?.error ?? '',
+);
 
 /* bulk queuing -------------------------------------------------------- */
 // These run before any account exists, and that is the point: with nothing to
@@ -147,6 +250,50 @@ check(
 await dropJobs(bulkJobIds);
 check('the bulk jobs were cleaned up again', bulkJobIds.length > 0, `${bulkJobIds.length} job(s)`);
 
+/* live queue ---------------------------------------------------------- */
+// The queue is pushed, not polled: the dashboard opens one event stream and the
+// server sends a delta per change, so only the row that moved is redrawn. These
+// jobs stay queued (no account exists yet), which makes each delta exact:
+// `added` on create, `updated` on cancel, `removed` on delete.
+const live = collectEvents('/api/events');
+check('the live stream greets a new subscriber', await live.waitFor((event) => event.name === 'hello'));
+const greet = live.events.find((event) => event.name === 'hello');
+check(
+  'the greeting carries the queue counters and the catalogue size',
+  typeof greet?.data?.stats?.total === 'number' && typeof greet?.data?.catalog === 'number',
+  JSON.stringify(greet?.data ?? null),
+);
+
+result = await request('POST', '/api/jobs/remote', {
+  target: { kind: 'movie', tmdbId: 550, title: 'Fight Club', year: '1999' },
+  url: 'https://example.com/live-queue.mp4',
+});
+const liveJobId = result.json?.job?.id;
+await live.waitFor((event) => Boolean(live.deltaFor(liveJobId)));
+const addedEntry = live.deltaFor(liveJobId);
+check(
+  'a new job is pushed as an added row, carrying what a queue row renders',
+  addedEntry?.kind === 'added' && addedEntry?.job?.status === 'queued' && addedEntry?.job?.libraryName === 'tmdb:550',
+  `${addedEntry?.kind ?? 'no event'} · ${addedEntry?.job?.libraryName ?? ''}`,
+);
+check(
+  'the pushed row leaves the heavy fields out, like the queue list does',
+  addedEntry?.job !== undefined && addedEntry.job.candidates === undefined && addedEntry.job.source?.headers === undefined,
+);
+
+await request('POST', `/api/jobs/${liveJobId}/cancel`, {});
+const cancelled = await live.waitFor(() => live.deltaFor(liveJobId, (entry) => entry.job?.status === 'cancelled') !== undefined);
+check('cancelling pushes the same row again, updated', cancelled, `${live.deltaFor(liveJobId)?.kind ?? 'no event'}`);
+
+result = await request('DELETE', `/api/jobs/${liveJobId}`);
+const removed = await live.waitFor(() => live.deltaFor(liveJobId, (entry) => entry.kind === 'removed') !== undefined);
+check('deleting the job pushes a removed row', result.status === 200 && removed);
+check(
+  'the queue counters ride along on the same stream',
+  await live.waitFor((event) => event.name === 'stats' && typeof event.data?.total === 'number'),
+);
+await live.stop();
+
 /* accounts ----------------------------------------------------------- */
 result = await request('POST', '/api/accounts', { name: 'smoke-library', libraryId: '12345', apiKey: 'mock-key-1234', pullZoneHost: 'vz-mock.b-cdn.net' });
 check('account is created', result.status === 201 && Boolean(result.json?.account?.id), `status ${result.status}`);
@@ -216,8 +363,42 @@ const masterPlaylist = [
 const englishVtt = ['WEBVTT', '', '00:00:01.000 --> 00:00:03.000', 'Smoke subtitle', ''].join('\n');
 const arabicVtt = ['WEBVTT', '', '00:00:01.000 --> 00:00:03.000', 'ترجمة', ''].join('\n');
 
+// Two English-only titles whose subtitle file is empty while they are published
+// and readable only later. That is what puts them in the state the Library's
+// "fill in <lang>" action exists for: the catalogue records the English track it
+// could not read (URL and all) and never creates the target language.
+const backfillTitles = [
+  { key: 'movie:604', name: 'Backfill One', master: '/backfill-604.m3u8', subs: '/subs/backfill-604.vtt' },
+  { key: 'movie:605', name: 'Backfill Two', master: '/backfill-605.m3u8', subs: '/subs/backfill-605.vtt' },
+];
+const emptyVtt = ['WEBVTT', ''].join('\n');
+let englishOnlyReadable = false; // flipped once the publishes are done
+const englishOnlyMaster = (subsPath) =>
+  [
+    '#EXTM3U',
+    `#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",LANGUAGE="en",DEFAULT=YES,URI="${subsPath}"`,
+    '#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080,SUBTITLES="subs"',
+    'v1080/index.m3u8',
+    '',
+  ].join('\n');
+
+// Every path this origin is asked for, in order. The subtitle backfill check
+// counts them: a title's source track must be fetched once, never once per
+// language or once per press.
+const originRequests = [];
+
 const origin = http.createServer((req, res) => {
   const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+  originRequests.push(url.pathname);
+  const englishOnly = backfillTitles.find((title) => url.pathname === title.master || url.pathname === title.subs);
+  if (englishOnly) {
+    if (url.pathname === englishOnly.master) {
+      res.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' });
+      return void res.end(englishOnlyMaster(englishOnly.subs));
+    }
+    res.writeHead(200, { 'content-type': 'text/vtt' });
+    return void res.end(englishOnlyReadable ? englishVtt : emptyVtt);
+  }
   if (url.pathname === '/master.m3u8') {
     res.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' });
     return void res.end(masterPlaylist);
@@ -275,6 +456,23 @@ const streamJobId = result.json?.job?.id;
 
 if (streamJobId) jobIds.push(streamJobId);
 
+// Two more source jobs, English subtitles only, published while their cue file
+// is still empty: the pipeline records the English track it could not read and
+// never creates Arabic, which is the batch the backfill check repairs later.
+const backfillJobIds = new Map();
+for (const title of backfillTitles) {
+  result = await request('POST', '/api/jobs/source', {
+    target: { kind: 'movie', tmdbId: Number(title.key.split(':')[1]), title: title.name, year: '2020' },
+    url: `${originBase}${title.master}`,
+    minHeight: 1080,
+  });
+  if (result.status === 201) {
+    jobIds.push(result.json.job.id);
+    backfillJobIds.set(title.key, result.json.job.id);
+  }
+}
+check('two English-only titles are queued for the backfill to repair', backfillJobIds.size === 2, `${backfillJobIds.size} queued`);
+
 /* a streamed file upload --------------------------------------------- */
 const uploadTarget = { kind: 'episode', tmdbId: 1396, title: 'Breaking Bad', season: 1, episode: 1, episodeTitle: 'Pilot' };
 const uploadBytes = Buffer.alloc(64 * 1024, 7);
@@ -310,8 +508,8 @@ const mine = finalJobs.filter((job) => myJobIds.has(job.id));
 const ready = mine.filter((job) => job.status === 'ready');
 const failed = mine.filter((job) => job.status === 'failed');
 check(
-  'every job finished (13 remote + 1 source + 1 file)',
-  ready.length === 15 && failed.length === 0,
+  'every job finished (13 remote + 3 source + 1 file)',
+  ready.length === 17 && failed.length === 0,
   `ready ${ready.length}, failed ${failed.length}${failed.length ? `: ${failed.map((job) => job.error).join(' | ')}` : ''}`,
 );
 
@@ -402,6 +600,99 @@ if (matrix) {
     `${record?.sources?.length ?? 0} source(s), ${record?.tiers?.length ?? 0} tier(s)`,
   );
 }
+
+/* subtitle backfill ------------------------------------------------------ */
+// The Library's "fill in <lang>" action reads this first. It is a report only:
+// nothing is fetched, translated or published until the POST is made, which is
+// why the smoke can check it here without leaving the machine.
+result = await request('GET', '/api/subtitles/backfill');
+const backfill = result.json;
+check(
+  'the backfill reports what is missing without doing any work',
+  result.status === 200 &&
+    Array.isArray(backfill?.targets) &&
+    backfill.targets.join(',') === 'ar' &&
+    Array.isArray(backfill?.candidates) &&
+    backfill.total === backfill.candidates.length &&
+    // Every candidate names the languages it is missing, not a single one.
+    (backfill.candidates ?? []).every((candidate) => Array.isArray(candidate.missing) && candidate.missing.length > 0),
+  `targets ${backfill?.targets?.join(',')}, ${backfill?.total} missing`,
+);
+check(
+  'a title that already has both subtitle tracks is not listed',
+  (backfill?.candidates ?? []).every((candidate) => candidate.key !== 'movie:603'),
+  (backfill?.candidates ?? []).map((candidate) => candidate.key).join(', '),
+);
+check(
+  'every candidate says where its text would come from, or why it cannot',
+  (backfill?.candidates ?? []).every((candidate) => typeof candidate.from === 'string' || typeof candidate.note === 'string'),
+  JSON.stringify((backfill?.candidates ?? [])[0] ?? null),
+);
+
+// The list filter the per-title action is picked out of: the same question the
+// backfill asks, asked of the catalogue so a single title can be chosen.
+result = await request('GET', '/api/catalog?subtitles=missing');
+const missingList = result.json;
+check(
+  'the library can be filtered to the titles with no target-language subtitle',
+  result.status === 200 &&
+    (missingList?.items ?? []).length > 0 &&
+    (missingList?.items ?? []).every((entry) => !(entry.subtitles ?? []).some((track) => track.srclang === 'ar' && track.uploaded)) &&
+    missingList?.subtitles?.targets?.join(',') === 'ar' &&
+    missingList?.subtitles?.missing === (missingList?.items ?? []).length,
+  `${(missingList?.items ?? []).length} listed, ${missingList?.subtitles?.missing} counted`,
+);
+
+result = await request('GET', '/api/catalog?subtitles=has');
+check(
+  'the same filter can list what already has it',
+  result.status === 200 &&
+    (result.json?.items ?? []).length > 0 &&
+    (result.json?.items ?? []).every((entry) => (entry.subtitles ?? []).some((track) => track.srclang === 'ar' && track.uploaded)),
+  `${(result.json?.items ?? []).length} with Arabic`,
+);
+
+// The batch itself, over the real endpoint. The two titles were published
+// without a readable English track, so the fill-in has to fetch each one's
+// recorded file, translate it and attach the language. The origin counts its
+// requests: one fetch per title, not one per language and not one per run.
+const batchKeys = backfillTitles.map((title) => title.key);
+const batchCandidates = (backfill?.candidates ?? []).filter((candidate) => batchKeys.includes(candidate.key));
+check(
+  'the two English-only titles are the batch the fill-in will work on',
+  batchCandidates.length === 2 &&
+    batchCandidates.every((candidate) => candidate.missing.includes('ar')) &&
+    batchCandidates.every((candidate) => typeof candidate.from === 'string' && candidate.from.endsWith('.vtt')),
+  batchCandidates.map((candidate) => `${candidate.key} missing ${candidate.missing} from ${candidate.from}`).join(', '),
+);
+
+englishOnlyReadable = true; // the recorded English track becomes readable now
+const fetchesBefore = originRequests.length;
+result = await request('POST', '/api/subtitles/backfill', { keys: batchKeys, limit: batchKeys.length });
+const batchReport = result.json;
+const batchFetches = originRequests.slice(fetchesBefore);
+check(
+  'the batch fill-in fetched each title subtitle track exactly once',
+  result.status === 200 &&
+    batchFetches.length === backfillTitles.length &&
+    backfillTitles.every((title) => batchFetches.filter((path) => path === title.subs).length === 1),
+  `${batchFetches.length} fetch(es): ${batchFetches.join(', ') || 'none'}`,
+);
+check(
+  'the one read per title was enough to attach every missing language',
+  batchReport?.translated === batchKeys.length && batchReport?.failed === 0 && batchReport?.remaining === 0,
+  `translated ${batchReport?.translated}, failed ${batchReport?.failed}, remaining ${batchReport?.remaining}`,
+);
+const repaired = (await request('GET', '/api/catalog')).json?.items ?? [];
+check(
+  'the new captions are recorded on the videos that already existed',
+  backfillTitles.every((title) =>
+    (repaired.find((entry) => entry.key === title.key)?.subtitles ?? []).some(
+      (track) => track.srclang === 'ar' && track.uploaded && track.translatedFrom === 'en',
+    ),
+  ),
+  backfillTitles.map((title) => title.key).join(', '),
+);
 
 /* autopilot ------------------------------------------------------------- */
 // The autopilot walks TMDB's top-rated lists. The rating floor is raised to

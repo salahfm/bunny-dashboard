@@ -25,12 +25,19 @@
     library: [],
     libraryStats: null,
     libraryMatched: null,
+    /** What the subtitle backfill would work on, as `/api/subtitles/backfill` reports it. */
+    backfill: null,
+    /** The missing/has counts for the search and kind currently on screen. */
+    librarySubtitles: null,
     librarySelectedKey: null,
     libraryEntry: null,
     tunnel: null,
     autopilot: null,
     only: new Set(),
-    autoRefresh: true,
+    /** Whether the live event stream is connected — the queue's own indicator. */
+    live: false,
+    /** The open EventSource, so the stream is only ever connected once. */
+    events: null,
     activeTab: 'titles',
     diagnosticsRan: false,
   };
@@ -573,15 +580,36 @@
     try {
       data = await api('GET', `/api/jobs?limit=200${$('#queue-filter').value ? `&status=${$('#queue-filter').value}` : ''}`);
     } catch (error) {
-      // A background refresh must not shout every 2s while the server restarts.
+      // A background refresh must not shout while the server restarts.
       if (!quiet) toast(describeError(error), 'bad');
       return;
     }
-    state.jobs = data.jobs ?? [];
     state.stats = data.stats ?? null;
-    renderJobs();
+    applyJobsList(data.jobs ?? []);
     renderCounts();
     if (state.selectedJobId) void refreshSelectedDetail({ quiet: true });
+  }
+
+  /**
+   * Reconciles the table with a fresh list, patching only what moved.
+   *
+   * The old code cleared the table and rebuilt every row on each refresh, which
+   * is what made a long queue flicker and jump while one job was downloading.
+   * Now a row that is still there keeps its element and its place.
+   */
+  function applyJobsList(list) {
+    const seen = new Set();
+    for (const job of list) {
+      seen.add(job.id);
+      upsertJobRow(job);
+    }
+    for (const job of [...state.jobs]) {
+      if (!seen.has(job.id)) removeJobRow(job.id);
+    }
+    state.jobs = list;
+    // A first load on an empty queue has no rows to remove, so the placeholder
+    // is drawn here rather than only when the last row leaves.
+    showEmptyQueue();
   }
 
   /**
@@ -606,47 +634,253 @@
       : '';
   }
 
+  /**
+   * Every queue row currently on screen, by job id.
+   *
+   * Holding onto the element is what lets a change replace exactly one row
+   * instead of the whole table.
+   */
+  const jobRows = new Map();
+
+  /** The fields a row renders — a row is only rebuilt when one of them moves. */
+  function jobRowSignature(job) {
+    return JSON.stringify([
+      job.status,
+      job.progress,
+      job.detail ?? '',
+      job.stage ?? '',
+      job.statusCode ?? '',
+      job.source?.kind ?? '',
+      job.source?.mode ?? '',
+      job.source?.provider ?? '',
+      job.source?.quality ?? '',
+      job.transport ?? '',
+      job.bytesIn ?? 0,
+      job.bytesOut ?? 0,
+      job.totalBytes ?? 0,
+      job.accountName ?? '',
+      job.error ?? '',
+      job.playbackUrl ?? '',
+    ]);
+  }
+
+  /** The queue table's body, with the "no jobs" placeholder cleared away. */
+  function queueBody() {
+    const body = $('#jobs-table tbody');
+    // A real row is about to land, so the placeholder has no business staying.
+    body.querySelector('tr.placeholder')?.remove();
+    return body;
+  }
+
+  /** Puts the "no jobs" placeholder back once the last row has left. */
+  function showEmptyQueue() {
+    const body = $('#jobs-table tbody');
+    if (jobRows.size > 0 || body.firstElementChild) return;
+    body.append(h('tr', { class: 'placeholder' }, h('td', { colspan: '7', class: 'muted', text: 'no jobs' })));
+  }
+
+  /** One queue row, freshly built. */
+  function jobRow(job) {
+    const actions = h('td', { class: 'actions' });
+    if (job.status === 'failed' || job.status === 'cancelled') {
+      actions.append(h('button', { text: 'retry', onclick: () => void jobAction(job.id, 'retry') }));
+    }
+    if (['queued', 'uploading', 'encoding'].includes(job.status)) {
+      actions.append(h('button', { text: 'cancel', onclick: () => void jobAction(job.id, 'cancel') }));
+    } else {
+      actions.append(h('button', { text: 'delete', onclick: () => void jobAction(job.id, 'delete') }));
+    }
+    if (job.playbackUrl) {
+      actions.append(h('a', { href: job.playbackUrl, target: '_blank', rel: 'noreferrer', text: 'play' }));
+    }
+
+    const detail = job.status === 'failed' && job.error ? h('span', { class: 'small', style: 'color:var(--bad)', text: job.error }) : null;
+
+    const row = h(
+      'tr',
+      { onclick: (event) => (event.target.closest('button,a') ? undefined : selectJob(job.id)) },
+      h(
+        'td',
+        {},
+        h('span', { text: job.target?.kind === 'episode' ? `${job.target.title} S${String(job.target.season).padStart(2, '0')}E${String(job.target.episode).padStart(2, '0')}` : `${job.target?.title ?? '—'}${job.target?.year ? ` (${job.target.year})` : ''}` }),
+        detail,
+      ),
+      h('td', {}, statusBadge(job.status)),
+      h('td', {}, progressBar(job), h('span', { class: 'small muted', text: job.detail ?? '' })),
+      h('td', { class: 'mono' }, job.stage ?? (job.status === 'encoding' ? `encoding${job.statusCode !== undefined ? ` · bunny ${job.statusCode}` : ''}` : '—')),
+      h('td', {}, sourceCell(job), h('span', { class: 'small muted', text: job.source?.kind === 'stream' ? `${bytes(job.bytesIn)} in · ${bytes(job.bytesOut)} out${job.totalBytes ? ` of ${bytes(job.totalBytes)}` : ''}` : '' })),
+      h('td', { class: 'mono', text: job.accountName ?? '—' }),
+      actions,
+    );
+    row.dataset.jobId = job.id;
+    row.dataset.createdAt = job.createdAt ?? '';
+    row.dataset.sig = jobRowSignature(job);
+    if (job.id === state.selectedJobId) row.classList.add('is-selected');
+    return row;
+  }
+
+  /** The whole table in one pass — the first paint, and the fallback path. */
   function renderJobs() {
     const body = clear($('#jobs-table tbody'));
-    if (!state.jobs.length) {
-      body.append(h('tr', {}, h('td', { colspan: '7', class: 'muted', text: 'no jobs' })));
-      return;
-    }
+    jobRows.clear();
     for (const job of state.jobs) {
-      const actions = h('td', { class: 'actions' });
-      if (job.status === 'failed' || job.status === 'cancelled') {
-        actions.append(h('button', { text: 'retry', onclick: () => void jobAction(job.id, 'retry') }));
-      }
-      if (['queued', 'uploading', 'encoding'].includes(job.status)) {
-        actions.append(h('button', { text: 'cancel', onclick: () => void jobAction(job.id, 'cancel') }));
-      } else {
-        actions.append(h('button', { text: 'delete', onclick: () => void jobAction(job.id, 'delete') }));
-      }
-      if (job.playbackUrl) {
-        actions.append(h('a', { href: job.playbackUrl, target: '_blank', rel: 'noreferrer', text: 'play' }));
-      }
-
-      const detail = job.status === 'failed' && job.error ? h('span', { class: 'small', style: 'color:var(--bad)', text: job.error }) : null;
-
-      const row = h(
-        'tr',
-        { onclick: (event) => (event.target.closest('button,a') ? undefined : selectJob(job.id)) },
-        h(
-          'td',
-          {},
-          h('span', { text: job.target?.kind === 'episode' ? `${job.target.title} S${String(job.target.season).padStart(2, '0')}E${String(job.target.episode).padStart(2, '0')}` : `${job.target?.title ?? '—'}${job.target?.year ? ` (${job.target.year})` : ''}` }),
-          detail,
-        ),
-        h('td', {}, statusBadge(job.status)),
-        h('td', {}, progressBar(job), h('span', { class: 'small muted', text: job.detail ?? '' })),
-        h('td', { class: 'mono' }, job.stage ?? (job.status === 'encoding' ? `encoding${job.statusCode !== undefined ? ` · bunny ${job.statusCode}` : ''}` : '—')),
-        h('td', {}, sourceCell(job), h('span', { class: 'small muted', text: job.source?.kind === 'stream' ? `${bytes(job.bytesIn)} in · ${bytes(job.bytesOut)} out${job.totalBytes ? ` of ${bytes(job.totalBytes)}` : ''}` : '' })),
-        h('td', { class: 'mono', text: job.accountName ?? '—' }),
-        actions,
-      );
-      if (job.id === state.selectedJobId) row.classList.add('is-selected');
+      const row = jobRow(job);
+      jobRows.set(job.id, row);
       body.append(row);
     }
+    showEmptyQueue();
+  }
+
+  /**
+   * Adds or refreshes one row, leaving every other row alone.
+   *
+   * A row whose rendered fields have not moved is left exactly as it is, so a
+   * queue where one job is downloading only ever redraws that one job.
+   */
+  function upsertJobRow(job, options = {}) {
+    const existing = jobRows.get(job.id);
+    if (existing && existing.dataset.sig === jobRowSignature(job)) return;
+    const row = jobRow(job);
+    jobRows.set(job.id, row);
+    if (existing) {
+      existing.replaceWith(row);
+      // Only a change that arrived from the live stream flashes; a plain
+      // re-read of the list redraws quietly.
+      if (options.flash === true) {
+        row.classList.add('flash');
+        setTimeout(() => row.classList.remove('flash'), 900);
+      }
+      return;
+    }
+    const body = queueBody();
+    // Newest first, matching the order the API returns.
+    for (const sibling of body.children) {
+      if ((sibling.dataset.createdAt ?? '') < (job.createdAt ?? '')) {
+        body.insertBefore(row, sibling);
+        return;
+      }
+    }
+    body.append(row);
+  }
+
+  function removeJobRow(id) {
+    const row = jobRows.get(id);
+    if (!row) return;
+    row.remove();
+    jobRows.delete(id);
+    showEmptyQueue();
+  }
+
+  /* ------------------------------------------------------------ live queue */
+
+  /** Whether a job belongs in the table as it is currently filtered. */
+  function jobMatchesFilter(job) {
+    const filter = $('#queue-filter').value;
+    return !filter || job.status === filter;
+  }
+
+  /**
+   * Applies one batch of changes from the live stream.
+   *
+   * A job that no longer matches the filter is treated as gone, so filtering to
+   * "encoding" and watching a job finish removes its row the moment it does.
+   */
+  function applyJobsDelta(entries) {
+    let added = false;
+    let movedSelection = false;
+    for (const entry of entries) {
+      const job = entry.job;
+      const index = state.jobs.findIndex((item) => item.id === job.id);
+      if (entry.kind === 'removed' || !jobMatchesFilter(job)) {
+        if (index >= 0) state.jobs.splice(index, 1);
+        removeJobRow(job.id);
+        if (job.id === state.selectedJobId) {
+          state.selectedJobId = null;
+          state.jobDetail = null;
+          renderJobDetail();
+        }
+        continue;
+      }
+      if (index >= 0) state.jobs[index] = job;
+      else {
+        state.jobs.push(job);
+        added = true;
+      }
+      upsertJobRow(job, { flash: true });
+      if (job.id === state.selectedJobId) movedSelection = true;
+    }
+    if (added) state.jobs.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    if (movedSelection && state.jobDetail) {
+      // The open job's panel is fed by the same pushed row, keeping its stage
+      // and byte counts current without a second request per progress tick.
+      // What the one-off fetch added (the candidate ladder) is kept.
+      const fresh = state.jobs.find((item) => item.id === state.selectedJobId);
+      if (fresh) {
+        state.jobDetail = { ...state.jobDetail, ...fresh };
+        renderJobDetail();
+      }
+    }
+  }
+
+  function parseEvent(event) {
+    try {
+      return JSON.parse(event.data);
+    } catch {
+      return null;
+    }
+  }
+
+  /** Shows whether the live stream is up, in the queue's own header. */
+  function setLive(live) {
+    state.live = live;
+    const badge = $('#queue-live');
+    if (!badge) return;
+    badge.classList.toggle('is-live', live);
+    badge.classList.toggle('is-down', !live);
+    badge.title = live
+      ? 'connected — the queue updates itself as jobs move'
+      : 'the live stream is reconnecting; the list is refreshed on a slow timer meanwhile';
+    $('#queue-live-text').textContent = live ? 'live' : 'reconnecting…';
+  }
+
+  /**
+   * The dashboard's one live connection.
+   *
+   * It replaces the old "refresh every 2 s" checkbox: the server pushes what
+   * changed, whenever it changes, and the header badge stays right even while
+   * another tab is on screen. `EventSource` reconnects by itself after a server
+   * restart; while it is down, a slow poll covers the gap.
+   */
+  function connectEvents() {
+    if (state.events) return;
+    const source = new EventSource('/api/events');
+    state.events = source;
+    source.addEventListener('open', () => setLive(true));
+    source.addEventListener('error', () => setLive(false));
+    source.addEventListener('hello', (event) => {
+      setLive(true);
+      const payload = parseEvent(event);
+      if (payload?.stats) {
+        state.stats = payload.stats;
+        renderCounts();
+      }
+    });
+    source.addEventListener('stats', (event) => {
+      const payload = parseEvent(event);
+      if (payload) {
+        state.stats = payload;
+        renderCounts();
+      }
+    });
+    source.addEventListener('jobs', (event) => {
+      const payload = parseEvent(event);
+      if (payload) applyJobsDelta(payload.jobs ?? []);
+    });
+    source.addEventListener('catalog', () => {
+      // A title finished publishing: the Library tab should show it, not wait
+      // for the next click.
+      if (state.activeTab === 'library') void refreshLibrary({ quiet: true });
+    });
   }
 
   function selectJob(jobId) {
@@ -825,8 +1059,10 @@
     const params = new URLSearchParams();
     const query = $('#library-search').value.trim();
     const kind = $('#library-kind').value;
+    const subtitles = $('#library-subtitles').value;
     if (query) params.set('q', query);
     if (kind) params.set('kind', kind);
+    if (subtitles) params.set('subtitles', subtitles);
     let data;
     try {
       data = await api('GET', `/api/catalog${params.toString() ? `?${params}` : ''}`);
@@ -837,12 +1073,217 @@
     state.library = data.items ?? [];
     state.libraryStats = data.stats ?? null;
     state.libraryMatched = typeof data.matched === 'number' ? data.matched : null;
+    state.librarySubtitles = data.subtitles ?? null;
     renderLibrary();
-    if (state.librarySelectedKey && !state.library.some((entry) => entry.key === state.librarySelectedKey)) {
-      state.librarySelectedKey = null;
-      state.libraryEntry = null;
-    }
     renderLibraryDetail();
+    // The backfill count is the same list, read the same way, so it is refreshed
+    // with the tab rather than on a timer of its own.
+    if (!quiet) void refreshBackfill();
+  }
+
+  /**
+   * Closes the open record.
+   *
+   * Called when the list is *deliberately* narrowed — not on every refresh: a
+   * title that just left the filter (because it was filled in, say) should keep
+   * its record on screen, and the slow background poll must not close it.
+   */
+  function closeLibraryDetail() {
+    state.librarySelectedKey = null;
+    state.libraryEntry = null;
+    renderLibraryDetail();
+  }
+
+  /* ------------------------------------------------- subtitle backfill */
+
+  /**
+   * What the backfill would do: which published titles have no caption in the
+   * target language yet. Purely a report — no title is touched until the button
+   * is pressed.
+   */
+  async function refreshBackfill() {
+    try {
+      state.backfill = await api('GET', '/api/subtitles/backfill');
+    } catch {
+      /* the button keeps whatever it last said */
+      return;
+    }
+    renderBackfill();
+    // The rows' own fill-in buttons come from the same report, so the table is
+    // redrawn once it arrives rather than left a moment behind.
+    if (state.library.length) renderLibrary();
+  }
+
+  function renderBackfill() {
+    const button = $('#library-backfill');
+    const data = state.backfill;
+    const total = data?.total ?? 0;
+    const targets = subtitleTargets();
+    const named = targets.join(', ');
+    const runnable = (data?.candidates ?? []).filter((candidate) => !candidate.note).length;
+    button.disabled = total === 0;
+    // The button names the languages rather than saying "targets": what one
+    // press would attach is exactly what it should say.
+    button.textContent = total ? `fill in ${named || 'the target languages'} (${total})` : 'nothing to fill in';
+    button.title = total
+      ? `Translate ${named} onto ${runnable} published title(s) that can be worked on, a batch of ${BACKFILL_BATCH} at a time. The videos are not re-downloaded or published again.`
+      : 'every published title already has every target-language subtitle';
+    $('#library-missing').textContent = total
+      ? `${total} published title(s) are missing one of ${named}${runnable < total ? ` · ${total - runnable} cannot be tried` : ''}` +
+        (state.settings?.subtitles?.autoFill === false ? '' : ' · a publish that comes up short is filled in automatically')
+      : '';
+    // The filter names the languages once they are known rather than saying "target".
+    for (const [value, prefix] of [['missing', 'missing'], ['has', 'has']]) {
+      const option = document.querySelector(`#library-subtitles option[value="${value}"]`);
+      if (option && named) option.textContent = `${prefix} ${named} subtitles`;
+    }
+  }
+
+  /** One click's worth of titles: each one costs a fetch, a translation and an upload. */
+  const BACKFILL_BATCH = 10;
+
+  /**
+   * One click's worth of archives. Deliberately smaller than the backfill
+   * batch: every title here is several gigabytes of download and upload, so the
+   * button walks through them rather than opening a dozen at once.
+   */
+  const ARCHIVE_BATCH = 5;
+
+  /** The languages being filled in — known from settings, or from the preview itself. */
+  function subtitleTargets() {
+    return state.backfill?.targets ?? state.settings?.subtitles?.targets ?? [];
+  }
+
+  /** The configured languages this record has no uploaded caption for, in order. */
+  function entryMissing(entry) {
+    return subtitleTargets().filter(
+      (target) => !(entry.subtitles ?? []).some((track) => track.srclang === target && track.uploaded),
+    );
+  }
+
+  /**
+   * The per-record fill-in button, or nothing when the record already has every
+   * language: it names exactly the languages that one press would attach.
+   */
+  function fillInButton(entry, label) {
+    const missing = entryMissing(entry);
+    if (!missing.length) return null;
+    return h('button', {
+      text: `fill in ${missing.join(', ')}`,
+      title: backfillNoteFor(entry.key) ?? `Translate the missing ${missing.join(', ')} onto this title without re-downloading the video`,
+      onclick: () => void backfillEntry(entry.key, label),
+    });
+  }
+
+  /** Why the backfill cannot touch this title, when the preview said so. */
+  function backfillNoteFor(key) {
+    return (state.backfill?.candidates ?? []).find((candidate) => candidate.key === key)?.note;
+  }
+
+  /**
+   * The batch's engine, aimed at one title: the same request with a single key.
+   *
+   * A title the preview already ruled out is refused with its reason rather than
+   * being sent to the server to fail there.
+   */
+  async function backfillEntry(key, label) {
+    const note = backfillNoteFor(key);
+    if (note) {
+      toast(`${label}: ${note}`, 'bad');
+      return;
+    }
+    try {
+      const report = await api('POST', '/api/subtitles/backfill', { keys: [key], limit: 1 });
+      const outcome = (report.results ?? [])[0];
+      if (outcome?.status !== 'translated') {
+        toast(`${label}: ${outcome?.note ?? 'nothing was filled in'}`, 'bad');
+        return;
+      }
+      const attached = (outcome.languages ?? []).join(', ') || (report.targets ?? []).join(', ');
+      toast(
+        `${label}: ${attached} attached (${outcome.cues ?? 0} cues)${outcome.note ? ` — ${outcome.note}` : ''}`,
+        outcome.note ? 'bad' : 'ok',
+      );
+      await refreshLibrary();
+      // The row may have just left a "missing" filter, so the record is reopened
+      // by key: the new track is the thing the click was for.
+      state.librarySelectedKey = key;
+      await refreshLibraryDetail(key);
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    }
+  }
+
+  async function runBackfill() {
+    const button = $('#library-backfill');
+    const data = state.backfill;
+    if (!data?.total) return;
+    const runnable = (data.candidates ?? []).filter((candidate) => !candidate.note);
+    if (!runnable.length) {
+      toast(`nothing can be filled in — ${data.candidates?.[0]?.note ?? 'no usable source was recorded'}`, 'bad');
+      return;
+    }
+    const batch = runnable.slice(0, BACKFILL_BATCH).map((candidate) => candidate.key);
+    button.disabled = true;
+    button.textContent = `translating ${batch.length}…`;
+    try {
+      const report = await api('POST', '/api/subtitles/backfill', { keys: batch, limit: batch.length });
+      const parts = [`translated ${report.translated} of ${report.attempted}`];
+      if (report.failed) parts.push(`${report.failed} failed`);
+      if (report.skipped) parts.push(`${report.skipped} skipped`);
+      toast(`${parts.join(' · ')}${report.remaining ? ` — ${report.remaining} still missing, press again` : ''}`, report.failed ? 'bad' : 'ok');
+      await refreshLibrary();
+      if (state.librarySelectedKey) await refreshLibraryDetail(state.librarySelectedKey);
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    } finally {
+      button.disabled = false;
+      renderBackfill();
+    }
+  }
+
+  /**
+   * Copies one title into R2 and lets Bunny forget it.
+   *
+   * The server does the whole thing — download every rendition, still and
+   * caption, verify each against the bucket, then delete — and answers with one
+   * line per title, which is what the toast shows.
+   */
+  async function archiveEntry(key, label) {
+    try {
+      const report = await api('POST', '/api/archive', { keys: [key], limit: 1 });
+      const line = (report.results ?? [])[0] ?? '';
+      const note = line.startsWith(`${key}: `) ? line.slice(key.length + 2) : line;
+      toast(`${label}: ${note || 'nothing to do'}`, /^archived\b/.test(note) ? 'ok' : 'bad');
+      await refreshLibrary();
+      if (state.librarySelectedKey === key) await refreshLibraryDetail(key);
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    }
+  }
+
+  /** The batch above: whatever the current filter lists, a few titles at a time. */
+  async function runArchive() {
+    const button = $('#library-archive');
+    if (!state.settings?.archive?.configured) {
+      toast('no R2 destination is configured', 'bad');
+      return;
+    }
+    const label = button.textContent;
+    button.disabled = true;
+    button.textContent = 'moving to R2…';
+    try {
+      const report = await api('POST', '/api/archive', { limit: ARCHIVE_BATCH });
+      const lines = report.results ?? [];
+      toast(lines.length ? lines.join(' · ') : 'nothing is waiting to be archived', lines.some((line) => /partial|failed/.test(line)) ? 'bad' : 'ok');
+      await refreshLibrary();
+      if (state.librarySelectedKey) await refreshLibraryDetail(state.librarySelectedKey);
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    } finally {
+      button.disabled = false;
+      button.textContent = label;
+    }
   }
 
   function titleCell(entry, index) {
@@ -854,13 +1295,21 @@
 
   function renderLibrary() {
     const stats = state.libraryStats;
+    const scoped = state.librarySubtitles;
+    // The missing count is only worth showing once the list itself is narrowed:
+    // unfiltered, the heading's own hint already says it.
+    const narrowed = Boolean($('#library-search').value.trim() || $('#library-kind').value || $('#library-subtitles').value);
     $('#library-summary').textContent = stats
       ? `${stats.total} title(s) · ${stats.movies} movie(s) · ${stats.episodes} episode(s) · ${bytes(stats.bytes)} published` +
-        (state.libraryMatched !== null && state.libraryMatched !== stats.total ? ` · ${state.libraryMatched} match the filter` : '')
+        (state.libraryMatched !== null && state.libraryMatched !== stats.total ? ` · ${state.libraryMatched} match the filter` : '') +
+        (narrowed && scoped ? ` · ${scoped.missing} of them have no ${(scoped.targets ?? []).join(', ')}` : '')
       : '';
     const body = clear($('#library-table tbody'));
     if (!state.library.length) {
-      body.append(h('tr', {}, h('td', { colspan: '10', class: 'muted', text: 'nothing published yet' })));
+      // An empty list means two different things: nothing published, or nothing
+      // matching the search and the subtitle filter.
+      const narrowed = Boolean($('#library-search').value.trim() || $('#library-kind').value || $('#library-subtitles').value);
+      body.append(h('tr', {}, h('td', { colspan: '10', class: 'muted', text: narrowed ? 'nothing matches the filter' : 'nothing published yet' })));
       return;
     }
     for (const entry of state.library) {
@@ -885,11 +1334,27 @@
           entry.playbackUrl
             ? h('a', { href: entry.playbackUrl, target: '_blank', rel: 'noreferrer', text: 'play' })
             : h('span', { class: 'muted small', text: '—' }),
+          // Where the bytes actually are now: R2 once the copy verified, Bunny
+          // otherwise (and "partial" when the copy stopped short of deleting).
+          h('span', {
+            class: 'muted small',
+            text: entry.archive ? (entry.archive.complete ? ' · R2' : ' · R2 partial') : '',
+          }),
         ),
         h('td', { class: 'mono small', text: shortTime(entry.updatedAt) }),
         h(
           'td',
           { class: 'actions' },
+          // A per-title version of the batch above, so one title can be picked out
+          // of a filtered list instead of running the whole lot.
+          fillInButton(entry, titleCell(entry, 0)),
+          state.settings?.archive?.configured
+            ? h('button', {
+                text: 'to R2',
+                title: 'Copy every rendition, still and caption into R2, verify it, then remove the video from Bunny.',
+                onclick: () => void archiveEntry(entry.key, titleCell(entry, 0)),
+              })
+            : null,
           h('button', { text: 'forget', onclick: () => void forgetLibraryEntry(entry.key, titleCell(entry, 0)) }),
         ),
       );
@@ -956,6 +1421,7 @@
         'div',
         { class: 'box-head' },
         h('strong', { text: `${titleCell(entry, 0)}${entry.episodeTitle ? ` · ${entry.episodeTitle}` : ''}` }),
+        fillInButton(entry, titleCell(entry, 0)),
         h('button', { class: 'link', text: 'close', onclick: () => selectLibraryEntry(entry.key) }),
       ),
       h('div', {
@@ -981,6 +1447,15 @@
       ['origin', `${entry.origin?.kind ?? '—'}${entry.origin?.mode ? ` (${entry.origin.mode})` : ''} · ${entry.origin?.name ?? '—'}${entry.origin?.input ? ` · input ${entry.origin.input}` : ''}`],
       ['scrape options', `min tier ${entry.origin?.minHeight !== undefined ? `${entry.origin.minHeight || 'any'}p` : 'default'}${entry.origin?.only?.length ? ` · hosts ${entry.origin.only.join(', ')}` : ' · every host'}`],
       ['subtitles', entry.subtitles?.length ? entry.subtitles.map((track) => `${track.srclang}${track.translated ? ' (translated)' : ''}${track.uploaded ? '' : ' (not attached)'}`).join(', ') : 'none carried'],
+      [
+        'R2 archive',
+        entry.archive
+          ? `${entry.archive.bucket}/${entry.archive.prefix} · ${(entry.archive.objects ?? []).length} object(s) · ${bytes(entry.archive.bytes)}` +
+            `${entry.archive.videos !== undefined ? ` (${entry.archive.videos} rendition(s), ${bytes(entry.archive.videoBytes)})` : ''}` +
+            `${entry.archive.complete ? '' : ' · INCOMPLETE'} · ${entry.archive.removedFromBunny ? 'removed from Bunny' : 'Bunny still holds it'}` +
+            `${entry.archive.note ? ` · ${entry.archive.note}` : ''}`
+          : 'not archived',
+      ],
       ['job', entry.jobId],
     ];
     box.append(
@@ -1055,9 +1530,19 @@
   }
 
   $('#library-refresh').addEventListener('click', () => void refreshLibrary());
-  $('#library-kind').addEventListener('change', () => void refreshLibrary());
+  $('#library-backfill').addEventListener('click', () => void runBackfill());
+  $('#library-archive').addEventListener('click', () => void runArchive());
+  $('#library-kind').addEventListener('change', () => {
+    closeLibraryDetail();
+    void refreshLibrary();
+  });
+  $('#library-subtitles').addEventListener('change', () => {
+    closeLibraryDetail();
+    void refreshLibrary();
+  });
   let librarySearchTimer;
   $('#library-search').addEventListener('input', () => {
+    closeLibraryDetail();
     clearTimeout(librarySearchTimer);
     librarySearchTimer = setTimeout(() => void refreshLibrary({ quiet: true }), 250);
   });
@@ -1255,6 +1740,19 @@
     const settings = state.settings;
     $('#settings-concurrency').value = String(settings.perAccountConcurrency);
     $('#settings-maxaccounts').value = String(settings.maxAccounts);
+    $('#settings-autofill').checked = settings.subtitles?.autoFill !== false;
+    // The R2 archive can only be switched on when there is somewhere to put it;
+    // a checkbox that cannot work is worse than one that explains why.
+    const archive = settings.archive ?? {};
+    $('#settings-archive').checked = Boolean(archive.configured) && archive.auto !== false;
+    $('#settings-archive').disabled = !archive.configured;
+    $('#settings-archive-note').textContent = archive.configured
+      ? `${archive.bucket} · ${archive.prefix}${archive.keepBunny ? ' · keeps the Bunny copy' : ' · removes the Bunny copy'}`
+      : 'not configured — set R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY and R2_BUCKET';
+    $('#library-archive').disabled = !archive.configured;
+    $('#library-archive').title = archive.configured
+      ? `Copy the titles below into ${archive.bucket} and remove them from Bunny`
+      : 'no R2 destination is configured';
     $('#mode-badge').textContent = settings.mock ? 'MOCK providers' : 'live providers';
 
     const runtime = clear($('#runtime-table tbody'));
@@ -1268,10 +1766,24 @@
         'subtitles',
         settings.subtitles?.enabled
           ? `carried to Bunny` +
-            (settings.subtitles.translator
-              ? ` · ${settings.subtitles.translator.provider}${settings.subtitles.translator.model ? ` (${settings.subtitles.translator.model})` : ''} fills in ${settings.subtitles.targetLanguage}`
-              : ` · no translator configured, so ${settings.subtitles.targetLanguage} is never invented`)
+            (settings.subtitles.translate
+              ? ` · DeepL fills in ${(settings.subtitles.targets ?? []).join(', ')} (${settings.subtitles.endpoint ?? 'deepl.com'})`
+              : ` · translation off, so ${(settings.subtitles.targets ?? []).join(', ')} is never invented`)
           : 'off',
+      ],
+      [
+        'subtitle repair',
+        settings.subtitles?.translate === false
+          ? 'off — translation is off, so nothing can be filled in'
+          : settings.subtitles?.autoFill === false
+            ? 'off — fill in a language by hand from the Library'
+            : `on — a publish that left ${(settings.subtitles?.targets ?? []).join(', ')} missing is filled in automatically`,
+      ],
+      [
+        'R2 archive',
+        settings.archive?.configured
+          ? `${settings.archive.bucket}/${settings.archive.prefix}${settings.archive.keepBunny ? ' · keeps the Bunny copy' : ' · removes the Bunny copy'}${settings.archive.publicBase ? ` · ${settings.archive.publicBase}` : ' · no public base, so playback stays pointed at Bunny'}`
+          : 'not configured',
       ],
       ['scrape pace', `${settings.source?.minIntervalMs ?? 350} ms between hits to one host · first cooldown ${fmtDuration(settings.source?.cooldownMs ?? 60_000)}`],
       [
@@ -1319,6 +1831,10 @@
     const body = {
       perAccountConcurrency: Number($('#settings-concurrency').value),
       maxAccounts: Number($('#settings-maxaccounts').value),
+      subtitleAutoFill: $('#settings-autofill').checked,
+      // Only sent when there is a destination: the server rejects switching an
+      // archive on with nowhere to write it.
+      ...(state.settings?.archive?.configured ? { archiveToR2: $('#settings-archive').checked } : {}),
     };
     const key = $('#settings-key').value.trim();
     const token = $('#settings-token').value.trim();
@@ -1528,29 +2044,29 @@
     await refreshJobs();
     await refreshSettings();
     await refreshTunnel();
+    connectEvents();
+    // The stream carries every change, so these timers only cover what it does
+    // not: the health/tunnel badge, the tabs that are not event-driven, and the
+    // gaps while the stream is reconnecting.
     let tick = 0;
     setInterval(() => {
-      if (!state.autoRefresh) return;
       tick += 1;
-      // Only the visible tab is worth refreshing in full; everywhere else the
-      // header counts are enough. Health (and with it the tunnel badge) is a
-      // slow-moving thing, so it is checked every fifth tick (about 10 s).
-      if (state.activeTab === 'queue') void refreshJobs({ quiet: true });
-      else void refreshStats();
-      if (tick % 5 === 0) {
-        void refreshHealth();
+      if (!state.live) {
+        // While the stream is down, the list is the fallback: re-read it.
+        if (state.activeTab === 'queue') void refreshJobs({ quiet: true });
+        else void refreshStats();
+      }
+      // Health (and with it the tunnel badge) moves slowly — about every 10 s.
+      if (tick % 2 === 0) void refreshHealth();
+      if (tick % 3 === 0) {
         // A title published while the Library tab is open should appear without a click.
         if (state.activeTab === 'library') void refreshLibrary({ quiet: true });
         // The autopilot's own cycle is minutes apart; a slow poll keeps the
         // status and the queue it just filled current.
         if (state.activeTab === 'autopilot') void refreshAutopilot({ quiet: true });
       }
-    }, 2000);
+    }, 5000);
   }
-
-  $('#queue-autorefresh').addEventListener('change', (event) => {
-    state.autoRefresh = event.target.checked;
-  });
 
   void boot();
 })();

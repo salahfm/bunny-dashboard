@@ -8,7 +8,9 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
+import { ArchiveService } from './archive';
 import { authGate } from './auth';
+import { SubtitleAutoRepair, SubtitleBackfill, missingTargets } from './backfill';
 import { Autopilot, AutopilotError } from './autopilot';
 import { DEFAULT_MAX_BULK_JOBS, planBulk, planShow, queuedKeys, withoutQueued, type BulkOptions, type BulkPlan } from './bulk';
 import { BunnyClient, BunnyError } from './bunny';
@@ -21,9 +23,11 @@ import { HostGuard } from './hostguard';
 import { DEFAULT_MIN_HEIGHT, previewScrape } from './stream';
 import { configureScraper, providerCatalog, targetFromEmbedUrl } from './providers';
 import { queueStats } from './queue';
+import { R2Client } from './r2';
 import { RelayHub } from './relay';
-import { Store, type Job, type JobSource, type JobTarget } from './store';
+import { Store, type Job, type JobChangeKind, type JobSource, type JobTarget } from './store';
 import { TmdbClient, TmdbError, lookupTmdb } from './tmdb';
+import { DEEPL_WEB_ENDPOINT } from './translate';
 import { TunnelManager } from './tunnel';
 import { FolderWatcher } from './watch';
 
@@ -81,7 +85,84 @@ const tunnel = new TunnelManager({
   log: (message) => console.log(message),
 });
 
-const jobs = new JobService({ store, config, clientFactory: clientForAccount, relay, tunnel, catalog });
+/**
+ * The subtitle backfill: put the target language onto titles that are already
+ * published without it. Nothing is re-downloaded and nothing is republished —
+ * the Bunny video exists, so only the subtitle half of the pipeline runs again.
+ */
+const backfill = new SubtitleBackfill({
+  config,
+  catalog,
+  client: (entry) => {
+    if (!entry.accountId) return undefined;
+    const account = store.account(entry.accountId);
+    return account ? clientForAccount(account) : undefined;
+  },
+  log: (message) => console.log(message),
+});
+
+/**
+ * The automatic repair: when a publish finishes without a language this machine
+ * could have translated — a refused translation, most often — the same backfill
+ * runs without waiting for the Library button. A rate limit clears with time,
+ * which is why a failed attempt is retried a minute later.
+ */
+const autoRepair = new SubtitleAutoRepair({
+  config,
+  catalog,
+  backfill,
+  enabled: () => store.settings.subtitleAutoFill !== false,
+  log: (message) => console.log(message),
+});
+
+/**
+ * The archive destination, when one is configured.
+ *
+ * Built once and shared: the signer is stateless, and one client keeps the
+ * request count honest for the diagnostics and the tests.
+ */
+const r2 = config.r2
+  ? new R2Client({
+      accountId: config.r2.accountId,
+      accessKeyId: config.r2.accessKeyId,
+      secretAccessKey: config.r2.secretAccessKey,
+      bucket: config.r2.bucket,
+      ...(config.r2.endpoint ? { endpoint: config.r2.endpoint } : {}),
+    })
+  : undefined;
+
+/**
+ * The R2 archive: copy a finished title out of Bunny, verify it, then let Bunny
+ * forget the video. `before` waits for the subtitle repair, because the archive
+ * is the last thing that ever happens to a title and a caption upload that is
+ * still in flight would be lost when the video is deleted.
+ */
+const archive = new ArchiveService({
+  config,
+  catalog,
+  ...(r2 ? { r2 } : {}),
+  client: (entry) => {
+    if (!entry.accountId) return undefined;
+    const account = store.account(entry.accountId);
+    return account ? clientForAccount(account) : undefined;
+  },
+  enabled: () => store.settings.archiveToR2 !== false,
+  before: (key) => autoRepair.settled(key),
+  log: (message) => console.log(message),
+});
+
+const jobs = new JobService({
+  store,
+  config,
+  clientFactory: clientForAccount,
+  relay,
+  tunnel,
+  catalog,
+  onPublished: (entry) => {
+    autoRepair.consider(entry);
+    archive.consider(entry);
+  },
+});
 jobs.recover();
 
 /**
@@ -184,18 +265,27 @@ function settingsView() {
       cooling: hostGuard.snapshot(),
     },
     // Subtitles: whether a scrape carries the stream's caption tracks into
-    // Bunny, and the text engine that fills in the target language when the
-    // stream did not have it (never speech recognition).
+    // Bunny, and the text engine that fills in each missing target language when
+    // the stream did not have it (never speech recognition).
     subtitles: {
       enabled: config.subtitleUpload,
-      targetLanguage: config.subtitleTargetLanguage,
-      translator: config.translator
-        ? {
-            provider: config.translator.provider,
-            model: config.translator.model ?? null,
-            endpoint: config.translator.baseUrl ?? null,
-          }
-        : null,
+      targets: config.subtitleTargetLanguages,
+      translate: config.subtitleTranslate,
+      // Whether a publish that came up short is filled in without being asked.
+      autoFill: store.settings.subtitleAutoFill !== false,
+      endpoint: config.subtitleTranslate ? config.subtitleTranslateEndpoint ?? DEEPL_WEB_ENDPOINT : null,
+    },
+    // The R2 archive: whether it is configured at all, where it writes, and
+    // whether a finished publish is copied without being asked.
+    archive: {
+      configured: Boolean(config.r2),
+      enabled: archive.enabled(),
+      bucket: config.r2?.bucket ?? null,
+      prefix: config.r2?.prefix ?? null,
+      endpoint: config.r2 ? config.r2.endpoint ?? `https://${config.r2.accountId}.r2.cloudflarestorage.com` : null,
+      publicBase: config.r2?.publicBase ?? null,
+      keepBunny: config.r2?.keepBunny ?? false,
+      auto: store.settings.archiveToR2 !== false,
     },
     limits: { maxAccounts: 30, perAccountConcurrency: 10, maxUploadBytes: MAX_UPLOAD_BYTES },
     catalogEntries: catalog.size,
@@ -359,6 +449,8 @@ app.put('/api/settings', (req, res) => {
     maxAccounts?: number;
     watchDir?: string;
     watchEnabled?: boolean;
+    subtitleAutoFill?: boolean;
+    archiveToR2?: boolean;
   } = {};
 
   if (typeof body.tmdbApiKey === 'string' && body.tmdbApiKey.trim()) {
@@ -397,6 +489,17 @@ app.put('/api/settings', (req, res) => {
   if (body.watchEnabled !== undefined) {
     if (typeof body.watchEnabled !== 'boolean') return void res.status(400).json({ error: 'watchEnabled must be true or false' });
     patch.watchEnabled = body.watchEnabled;
+  }
+  if (body.subtitleAutoFill !== undefined) {
+    if (typeof body.subtitleAutoFill !== 'boolean') return void res.status(400).json({ error: 'subtitleAutoFill must be true or false' });
+    patch.subtitleAutoFill = body.subtitleAutoFill;
+  }
+  if (body.archiveToR2 !== undefined) {
+    if (typeof body.archiveToR2 !== 'boolean') return void res.status(400).json({ error: 'archiveToR2 must be true or false' });
+    if (body.archiveToR2 && !config.r2) {
+      return void res.status(400).json({ error: 'no R2 destination is configured — set R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY and R2_BUCKET first' });
+    }
+    patch.archiveToR2 = body.archiveToR2;
   }
 
   store.updateSettings(patch);
@@ -844,6 +947,117 @@ app.get('/api/queue/stats', (_req, res) => {
   res.json(queueStats(store.jobs, store.accounts, store.settings.perAccountConcurrency));
 });
 
+/* ------------------------------ live queue ------------------------------ */
+
+/**
+ * How long job changes are gathered before they go out.
+ *
+ * A downloading job moves its byte counter dozens of times a second; sending
+ * each of those would be a flood of near-identical messages. Everything that
+ * happens inside this window is folded into one batch, and a job that changed
+ * five times is sent once — in the state it holds when the window closes.
+ */
+const LIVE_FLUSH_MS = 250;
+
+/** A comment line now and then keeps idle proxies from closing the stream. */
+const LIVE_HEARTBEAT_MS = 15_000;
+
+/**
+ * The queue, pushed instead of polled.
+ *
+ * The browser opens one long-lived `text/event-stream` and the server sends a
+ * `jobs` delta whenever something changes — only the rows that moved, each with
+ * the same shape as a list row. The browser patches those rows in place, so an
+ * update never rebuilds the table: scroll position, the selection and the open
+ * job detail all survive it. `stats` follows the queue counters, `catalog`
+ * announces a title that finished publishing, and `hello` opens the stream with
+ * the current state so a late subscriber is never showing a stale badge.
+ *
+ * The stream respects the same login gate as every other `/api` route, and the
+ * browser's event source sends the credentials it already cached.
+ */
+app.get('/api/events', (req, res) => {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache, no-transform',
+    connection: 'keep-alive',
+    // Behind a buffering reverse proxy this is what stops events piling up in
+    // the proxy instead of reaching the browser.
+    'x-accel-buffering': 'no',
+  });
+  res.flushHeaders?.();
+
+  let open = true;
+  const write = (chunk: string): void => {
+    if (!open) return;
+    try {
+      res.write(chunk);
+    } catch {
+      // A client that vanished mid-write must not take the server down with it.
+      open = false;
+    }
+  };
+  const send = (event: string, data: unknown): void => write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+
+  const currentStats = () => queueStats(store.jobs, store.accounts, store.settings.perAccountConcurrency);
+  let lastStats = '';
+  const pushStats = (): void => {
+    const next = JSON.stringify(currentStats());
+    if (next === lastStats) return;
+    lastStats = next;
+    send('stats', JSON.parse(next) as unknown);
+  };
+  // Watches the catalogue's revision, not its size: attaching a caption to a
+  // title that already exists changes the Library without adding a record.
+  let lastCatalog = catalog.revision;
+  const pushCatalog = (): void => {
+    if (catalog.revision === lastCatalog) return;
+    lastCatalog = catalog.revision;
+    send('catalog', { size: catalog.size, revision: catalog.revision, stats: catalog.stats() });
+  };
+
+  // `retry` tells the browser how long to wait before reconnecting on its own.
+  write('retry: 3000\n\n');
+  send('hello', { at: new Date().toISOString(), stats: currentStats(), catalog: catalog.size });
+
+  // One pending entry per job, so a burst of progress ticks collapses to the
+  // latest state of each row rather than a burst of messages.
+  const pending = new Map<string, { kind: JobChangeKind; job: Job }>();
+  let flushTimer: NodeJS.Timeout | undefined;
+  const flush = (): void => {
+    flushTimer = undefined;
+    if (pending.size > 0) {
+      const deltas = [...pending.values()].map((entry) => ({ kind: entry.kind, job: jobSummaryView(entry.job) }));
+      pending.clear();
+      send('jobs', { jobs: deltas });
+    }
+    pushStats();
+    pushCatalog();
+  };
+
+  const unsubscribe = store.onJobChange((job, kind) => {
+    pending.set(job.id, { kind, job });
+    if (!flushTimer) {
+      flushTimer = setTimeout(flush, LIVE_FLUSH_MS);
+      flushTimer.unref?.();
+    }
+  });
+
+  const heartbeat = setInterval(() => write(': ping\n\n'), LIVE_HEARTBEAT_MS);
+  heartbeat.unref?.();
+
+  const close = (): void => {
+    if (!open) return;
+    open = false;
+    clearInterval(heartbeat);
+    if (flushTimer) clearTimeout(flushTimer);
+    unsubscribe();
+    res.end();
+  };
+  req.on('close', close);
+  res.on('close', close);
+});
+
 /* ---------------------------- catalogue ---------------------------- */
 
 /**
@@ -861,16 +1075,29 @@ app.get('/api/catalog/stats', (_req, res) => {
   res.json(catalog.stats());
 });
 
-/** Everything that finished publishing, newest first, with a free-text search. */
+/**
+ * Everything that finished publishing, newest first, with a free-text search.
+ *
+ * `subtitles=missing|has` is the Library's "which titles still need a target
+ * language?" filter — the same question the backfill asks, asked of the list so
+ * a title can be picked out and filled in one at a time. A title counts as
+ * missing when *any* configured language is absent, and the count of those comes
+ * back alongside the list, scoped to the same search and kind.
+ */
 app.get('/api/catalog', (req, res) => {
   const query = typeof req.query.q === 'string' ? req.query.q : '';
   const kind = typeof req.query.kind === 'string' ? req.query.kind : '';
+  const subtitles = req.query.subtitles === 'missing' || req.query.subtitles === 'has' ? req.query.subtitles : '';
   const limit = Math.min(2000, Math.max(1, Math.floor(Number(req.query.limit ?? 500)) || 500));
+  const targets = config.subtitleTargetLanguages;
   const matched = catalog.search(query).filter((entry) => !kind || entry.kind === kind);
+  const complete = (entry: CatalogEntry) => missingTargets(entry, targets).length === 0;
+  const filtered = subtitles ? matched.filter((entry) => complete(entry) === (subtitles === 'has')) : matched;
   res.json({
-    items: matched.slice(0, limit).map(catalogSummary),
+    items: filtered.slice(0, limit).map(catalogSummary),
     total: catalog.size,
-    matched: matched.length,
+    matched: filtered.length,
+    subtitles: { targets, missing: matched.filter((entry) => !complete(entry)).length },
     stats: catalog.stats(),
   });
 });
@@ -886,6 +1113,47 @@ app.delete('/api/catalog/:key', (req, res) => {
   if (!catalog.remove(param(req, 'key'))) return void res.status(404).json({ error: 'no such catalogue entry' });
   res.json({ ok: true, stats: catalog.stats() });
 });
+
+/* ---------------------------- R2 archive ---------------------------- */
+
+/** Which published titles still have a Bunny copy waiting to be archived. */
+app.get('/api/archive', (_req, res) => {
+  res.json(archive.preview());
+});
+
+/**
+ * Archive now: the picked titles, or the oldest candidates when none were
+ * picked. One at a time, because every title here is a multi-gigabyte download.
+ */
+app.post('/api/archive', handle(async (req, res) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const keys = Array.isArray(body.keys) ? body.keys.filter((key): key is string => typeof key === 'string') : [];
+  const limit = Math.max(1, Math.min(50, Math.floor(Number(body.limit ?? 10)) || 10));
+  res.json(await archive.archiveKeys(keys, limit));
+}));
+
+/* ------------------------- subtitle backfill ------------------------- */
+
+/** Which published titles are still missing a target language — no work done. */
+app.get('/api/subtitles/backfill', (_req, res) => {
+  res.json(backfill.preview());
+});
+
+/**
+ * Fill them in, a batch at a time.
+ *
+ * `keys` narrows it to what the operator picked; `limit` bounds the batch, because
+ * every title inside it costs a fetch, a translation and a caption upload. What a
+ * batch does not reach is still missing afterwards, and the next request picks it
+ * up.
+ */
+app.post('/api/subtitles/backfill', handle(async (req, res) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const keys = Array.isArray(body.keys) ? body.keys.filter((key): key is string => typeof key === 'string') : [];
+  const limit = Math.max(1, Math.min(100, Math.floor(Number(body.limit ?? 25)) || 25));
+  const report = await backfill.run({ ...(keys.length ? { keys } : {}), limit });
+  res.json(report);
+}));
 
 /* ---------------------------- autopilot ---------------------------- */
 
@@ -961,6 +1229,8 @@ const server = app.listen(config.port, config.host, () => {
 function shutdown(): void {
   jobs.stop();
   autopilot.stop();
+  autoRepair.stop();
+  archive.stop();
   store.flush();
   watcher.stop();
   tunnel.stop();

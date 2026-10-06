@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { Catalog } from '../src/catalog';
+import { Catalog, type CatalogArchive, type CatalogEntry } from '../src/catalog';
 import { newJob, type Account, type Job } from '../src/store';
 import { testConfig } from './helpers';
 
@@ -127,6 +127,48 @@ test('a published job is recorded in full — every source and every quality run
   assert.equal(entry.firstPublishedAt, entry.updatedAt);
 });
 
+test('an archive record is attached, and playback follows it only once it is whole', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bunny-catalog-'));
+  const config = testConfig(dir);
+  const catalog = fresh(config);
+  const entry = catalog.record(readyJob(), ACCOUNT);
+  const base: CatalogArchive = {
+    bucket: 'archive',
+    prefix: 'archive/Shows/Breaking Bad [1396]/Season 02/S02E05 - Breakage',
+    objects: [{ name: 'video/1080p.mp4', key: 'archive/…/video/1080p.mp4', kind: 'video', bytes: 10, sha256: 'a'.repeat(64), contentType: 'video/mp4' }],
+    manifestKey: 'archive/…/manifest.json',
+    bytes: 10,
+    videoBytes: 10,
+    videos: 1,
+    complete: false,
+    videoId: 'video-1',
+    playbackUrl: 'https://pub-abc.r2.dev/archive/playlist.m3u8',
+    removedFromBunny: false,
+    at: '2026-02-01T00:00:00.000Z',
+  };
+
+  // A half-finished archive must not repoint playback at a folder that is
+  // still being filled in.
+  catalog.setArchive(entry.key, base);
+  const partial = catalog.get(entry.key) as CatalogEntry;
+  assert.equal(partial.archive?.complete, false);
+  assert.equal(partial.playbackUrl, 'https://vz-x.b-cdn.net/video-1/playlist.m3u8');
+  // The search knows which titles have moved: "r2" is a real query.
+  assert.equal(catalog.search('r2').length, 1);
+  assert.equal(catalog.stats().archived, 1);
+  assert.equal(catalog.stats().archivedBytes, 10);
+
+  catalog.setArchive(entry.key, { ...base, complete: true, removedFromBunny: true });
+  const whole = catalog.get(entry.key) as CatalogEntry;
+  assert.equal(whole.archive?.removedFromBunny, true);
+  assert.equal(whole.playbackUrl, 'https://pub-abc.r2.dev/archive/playlist.m3u8');
+
+  // The identity of the entry did not move; only the archive block and the URL.
+  assert.equal(whole.videoId, 'video-1');
+  assert.equal(whole.publishes, 1);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('publishing the same title again updates its record instead of adding one', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bunny-catalog-'));
   const config = testConfig(dir);
@@ -148,6 +190,31 @@ test('publishing the same title again updates its record instead of adding one',
   other.target = { ...other.target, season: 2, episode: 6 };
   catalog.record(other, ACCOUNT);
   assert.equal(catalog.size, 2);
+});
+
+test('every catalogue change moves its revision, so a caption landing is visible', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bunny-catalog-'));
+  const config = testConfig(dir);
+  const catalog = fresh(config);
+
+  assert.equal(catalog.revision, 0, 'a fresh catalogue has seen nothing');
+  catalog.record(readyJob(), ACCOUNT);
+  const recorded = catalog.revision;
+  assert.ok(recorded > 0);
+
+  // Reading is not a change.
+  catalog.get('episode:1396:2:5');
+  catalog.all();
+  assert.equal(catalog.revision, recorded);
+
+  // A caption attached to a title that already exists is a change too — this is
+  // the one a plain size cannot see.
+  catalog.setSubtitles('episode:1396:2:5', [{ srclang: 'ar', label: 'العربية', uploaded: true }]);
+  assert.ok(catalog.revision > recorded, 'the backfill landing must be visible to a watcher');
+
+  const afterSubtitles = catalog.revision;
+  assert.equal(catalog.remove('episode:1396:2:5'), true);
+  assert.ok(catalog.revision > afterSubtitles);
 });
 
 test('the catalogue survives a reload and a corrupt file is set aside', () => {

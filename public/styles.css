@@ -376,6 +376,84 @@ button.link {
   border-color: var(--accent);
 }
 
+/* ------------------------------------------------------------------ live */
+
+/*
+ * The queue is pushed, not polled, so it says so: a dot that pulses while the
+ * event stream is up, and a flat amber one while it is reconnecting.
+ */
+.live {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  padding: 3px 7px;
+}
+
+.live em {
+  font-style: normal;
+}
+
+.live i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  flex: none;
+}
+
+.live.is-live {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.live.is-live i {
+  background: var(--ok);
+  animation: livePulse 2s ease-out infinite;
+}
+
+.live.is-down i {
+  background: var(--warn);
+}
+
+@keyframes livePulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(63, 158, 106, 0.55);
+  }
+  70% {
+    box-shadow: 0 0 0 6px rgba(63, 158, 106, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(63, 158, 106, 0);
+  }
+}
+
+/* A row that changed on the live stream flashes once, so the update is visible. */
+@keyframes rowFlash {
+  from {
+    background: var(--panel-2);
+  }
+  to {
+    background: transparent;
+  }
+}
+
+.table tr.flash td {
+  animation: rowFlash 900ms ease-out;
+}
+
+/* Nothing above is essential information, so it can all be switched off. */
+@media (prefers-reduced-motion: reduce) {
+  .live.is-live i,
+  .table tr.flash td {
+    animation: none;
+  }
+}
+
 /* ----------------------------------------------------------------- tables */
 
 .table {

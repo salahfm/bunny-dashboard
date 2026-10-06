@@ -72,13 +72,127 @@ export function bunnyStatusLabel(status: number): string {
   return BUNNY_STATUS_LABELS[status] ?? `status ${status}`;
 }
 
+/**
+ * The pull zone's base URL, from whatever the account stored.
+ *
+ * Every file a finished video exposes — the HLS playlist, the per-resolution
+ * MP4 fallbacks, the thumbnails, the animated previews — is served from the same
+ * host, so the account's `pullZoneHost` is normalised once here (`cdn.b-cdn.net`,
+ * `https://cdn.b-cdn.net/` and `https://cdn.b-cdn.net` all read the same) and
+ * every URL below is built from the result.
+ */
+export function pullZoneBase(pullZoneHost: string | undefined): string | undefined {
+  if (!pullZoneHost) return undefined;
+  const value = pullZoneHost.trim().replace(/\/+$/, '');
+  if (!value) return undefined;
+  // A bare hostname (`vz-abc.b-cdn.net`) is what the dashboard asks for, and
+  // https is the only scheme a real pull zone speaks. An explicit scheme is kept
+  // as given, which is what lets a local stand-in be pointed at in a test.
+  if (/^https?:\/\//i.test(value)) return value;
+  return `https://${value}`;
+}
+
 /** Playback needs the library's pull-zone hostname, which the Stream API does not return. */
 export function playbackUrlFor(pullZoneHost: string | undefined, videoId: string): string | undefined {
-  if (!pullZoneHost) return undefined;
-  const host = pullZoneHost.trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '');
-  if (!host) return undefined;
-  return `https://${host}/${videoId}/playlist.m3u8`;
+  const base = pullZoneBase(pullZoneHost);
+  return base ? `${base}/${videoId}/playlist.m3u8` : undefined;
 }
+
+/** The URL of one file inside a video's folder on the pull zone. */
+export function bunnyFileUrl(base: string, videoId: string, path: string): string {
+  return `${base}/${encodeURIComponent(videoId)}/${path.split('/').map((segment) => encodeURIComponent(segment)).join('/')}`;
+}
+
+/**
+ * The MP4 fallbacks stop at 1080p, however tall the source is: asking for
+ * `play_2160p.mp4` is a 404 even when the ladder has a 4K rung.
+ */
+export const MP4_FALLBACK_MAX_HEIGHT = 1080;
+
+/**
+ * The heights inside `availableResolutions` (`"240p,360p,480p,720p"`).
+ *
+ * The field is absent on some videos and free-form when it is there, so a value
+ * that does not parse as a height is dropped rather than guessed at. The numbers,
+ * not the labels, are what the MP4 fallback URLs are built from.
+ */
+export function parseResolutions(availableResolutions: string | undefined): number[] {
+  if (!availableResolutions) return [];
+  const heights = new Set<number>();
+  for (const match of String(availableResolutions).matchAll(/(\d{3,4})\s*p?/gi)) {
+    const height = Number(match[1]);
+    if (Number.isFinite(height) && height > 0) heights.add(height);
+  }
+  return [...heights].sort((a, b) => b - a);
+}
+
+/**
+ * The ladder tried when `availableResolutions` is missing.
+ *
+ * A finished video that encoded normally has some subset of these; each is
+ * HEAD-ed before it is downloaded, so a rung the library never produced is
+ * skipped rather than guessed at.
+ */
+export const DEFAULT_RESOLUTION_LADDER = [1080, 720, 480, 360, 240];
+
+/** One downloadable file a finished video exposes on its pull zone. */
+export interface BunnyAsset {
+  /** Where it sits inside the video's folder, e.g. `play_720p.mp4`. */
+  path: string;
+  /** The pull-zone URL to download it from. */
+  url: string;
+  contentType: string;
+  kind: 'video' | 'original' | 'playlist' | 'thumbnail' | 'preview';
+}
+
+/**
+ * Every file a finished video exposes that is worth keeping.
+ *
+ * The MP4 fallbacks are the only place the *encoded* video can be downloaded
+ * from (the HLS segments are the same bytes cut into thousands of pieces), so
+ * they are the point of an archive; `original` is the file that was uploaded in
+ * the first place, when the library stores it. The images are every thumbnail
+ * and every animated preview Bunny generated.
+ *
+ * Player seek sprites are not listed here — how many exist is not reported
+ * anywhere, so `BunnyClient`-side callers probe `seek/_<n>.jpg` until one is
+ * missing instead of guessing a count.
+ */
+export function bunnyAssets(video: BunnyVideo, base: string): BunnyAsset[] {
+  const id = video.guid;
+  const assets: BunnyAsset[] = [];
+  const ladder = parseResolutions(video.availableResolutions);
+  const heights = ladder.length ? ladder : DEFAULT_RESOLUTION_LADDER;
+  for (const height of heights) {
+    if (height > MP4_FALLBACK_MAX_HEIGHT) continue;
+    const path = `play_${height}p.mp4`;
+    assets.push({ path, url: bunnyFileUrl(base, id, path), contentType: 'video/mp4', kind: 'video' });
+  }
+  assets.push({ path: 'original', url: bunnyFileUrl(base, id, 'original'), contentType: 'application/octet-stream', kind: 'original' });
+  assets.push({ path: 'playlist.m3u8', url: bunnyFileUrl(base, id, 'playlist.m3u8'), contentType: 'application/vnd.apple.mpegurl', kind: 'playlist' });
+  for (let index = 0; index <= 5; index += 1) {
+    const path = index === 0 ? 'thumbnail.jpg' : `thumbnail_${index}.jpg`;
+    assets.push({ path, url: bunnyFileUrl(base, id, path), contentType: 'image/jpeg', kind: 'thumbnail' });
+  }
+  const previews: Array<[string, string]> = [
+    ['preview.webp', 'image/webp'],
+    ['preview.gif', 'image/gif'],
+    ['preview_hq.webm', 'video/webm'],
+    ['preview_hq.mp4', 'video/mp4'],
+  ];
+  for (const [path, contentType] of previews) {
+    assets.push({ path, url: bunnyFileUrl(base, id, path), contentType, kind: 'preview' });
+  }
+  return assets;
+}
+
+/** One of the player's seek-thumbnail sprite sheets, numbered from `_0.jpg`. */
+export function seekSpriteUrl(base: string, videoId: string, index: number): string {
+  return bunnyFileUrl(base, videoId, `seek/_${index}.jpg`);
+}
+
+/** How many seek sprites to probe before assuming the last one was reached. */
+export const MAX_SEEK_SPRITES = 200;
 
 interface BunnyClientOptions {
   apiKey: string;

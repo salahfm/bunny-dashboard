@@ -10,8 +10,9 @@ Bunny does the encoding; the dashboard tracks every job until it is playable.
 > source URL this machine resolves and downloads before handing the bytes to
 > Bunny. The scraping core is ported from the `ogaro` backend's providers
 > (`lib/providers/*`). Subtitles are carried from the stream's own HLS manifest
-> as Bunny caption tracks, and an English track is translated into Arabic when a
-> title has none — from the **text**, never from the audio (see *Subtitles*).
+> as Bunny caption tracks, and the languages a title is missing — Arabic by
+> default, or a list such as `ar,fr,es` — are translated from the best source
+> track's **text**, never from the audio (see *Subtitles*).
 > Whatever you publish is your responsibility: the hosts are third-party players,
 > and having the tool resolve them is not a licence to redistribute what they
 > serve.
@@ -76,6 +77,9 @@ Paste that URL into **Source URL** and press **Download & upload**.
   (state, public URL, start/stop, cloudflared log).
 - **Queue**: one table of every job with status, byte progress, the stage it is
   in, which host and tier its source came from, and the transport that carried it.
+  It is **live**: the server pushes each change and only the row that moved is
+  redrawn, so a job's progress updates in place and the rest of the table —
+  scroll position, the open detail, a filtered view — is left exactly as it was.
   Click a row for the full candidate ladder, the resolved URL, byte counts and
   the relay state; retry, cancel and delete live per row.
 - **Library**: the permanent record. The moment a job turns *ready* its whole
@@ -88,7 +92,11 @@ Paste that URL into **Source URL** and press **Download & upload**.
   the language and the cue count. It survives deleting the job and a dashboard
   restart; filter it by title, id, quality, host, account or **subtitle
   language**, open a record for the URL-by-URL detail, or forget one (the video
-  stays in Bunny).
+  stays in Bunny). **Fill in subtitles** re-runs just the caption half for titles
+  that are missing a target language — every missing language in one press, the
+  whole list in batches, or one title picked out of a *missing / already has*
+  subtitle filter — see [Filling in a
+  title that is already published](#filling-in-a-title-that-is-already-published).
 - **Preview sources** answers "what would be picked, and why" without downloading
   anything: every probed candidate with its height, host and note.
 - **Accounts**: add/enable/disable/test/delete Bunny Stream accounts; keys are
@@ -115,9 +123,20 @@ Paste that URL into **Source URL** and press **Download & upload**.
   machine's. See *Avoiding blocks*.
 - **Subtitles**: a scraped stream's subtitle tracks are read from its HLS
   manifest, downloaded, converted to WebVTT and attached to the Bunny video as
-  **caption tracks**. When a title has no Arabic, the English subtitle *text* is
-  translated and uploaded against the same timings — no speech recognition is
-  involved. See *Subtitles* below.
+  **caption tracks**. Each missing target language (`SUBTITLE_TARGET_LANG`, one
+  code or a list like `ar,fr,es`) is translated from the best available track's
+  *text* and uploaded against the same timings — no speech recognition is
+  involved, and one press produces every language. See *Subtitles* below.
+- **R2 archive**: once a title has finished encoding, **everything** Bunny made
+  of it is copied into Cloudflare R2 — every MP4 fallback rendition, the
+  original file, the HLS playlist, every thumbnail, every animated preview
+  (`preview.gif`, `preview.webp`, `preview_hq.webm`, `preview_hq.mp4`), the
+  player's seek sprites and every caption track — under a readable, sortable
+  folder with a `manifest.json` that hashes every object. Each upload is
+  confirmed with a `HEAD` against the bucket, and **only then is the video
+  deleted from Bunny**. A title whose MP4 renditions are missing (MP4 Fallback
+  switched off in the library, most often) is left exactly where it is. See
+  *R2 archive* below.
 - **Named by TMDB id**: the video object created in Bunny is called `tmdb:27205`
   for a movie and `tv:1396:S01E02` for an episode, not `Inception (2010)`.
   A library of ids stays unique and joinable back to TMDB (and to this
@@ -138,6 +157,12 @@ npm run mock            # http://127.0.0.1:4747
 # Real mode:
 npm start               # same URL, real TMDB and Bunny APIs
 ```
+
+Mock mode mocks the subtitle translator as well: a caption produced while
+`npm run mock` is running is prefixed with its language (`[AR] …`) and answered
+on this machine, so a demo never reaches deepl.com. Point
+`SUBTITLE_TRANSLATOR_URL` somewhere and that endpoint is used instead, mock mode
+or not — naming one is a choice, not an accident.
 
 Open the dashboard (defaults to `http://127.0.0.1:4747`) and:
 
@@ -177,18 +202,25 @@ at startup and never overrides real environment variables.
 | `SOURCE_TUNNEL_DOWNLOAD` | `1` | fetch `cloudflared` into `.tools/` when it is not installed |
 | `TUNNEL_PUBLIC_URL` | – | use a tunnel you run yourself instead of spawning one (e.g. `https://abc.trycloudflare.com`) |
 | `CLOUDFLARED` | – | path to an existing `cloudflared` binary |
-| `MOCK_PROVIDERS` | `0` | `1` behaves like `npm run mock` |
+| `MOCK_PROVIDERS` | `0` | `1` behaves like `npm run mock` (including the local, unkeyed subtitle translator) |
 | `NETWORK_TIMEOUT_MS` | `30000` | per-attempt ceiling for Bunny API and playlist calls (min 1000) |
 | `NETWORK_RETRIES` | `3` | extra attempts after a transport failure (clamped 0–8, with jittered backoff) |
 | `SCRAPER_MIN_INTERVAL_MS` | `350` | smallest gap between two requests to the same scraping host (`0` disables) |
 | `SCRAPER_COOLDOWN_MS` | `60000` | first cooldown for a host that refused us (min 1000); doubles per repeat, capped at 30 min |
 | `SCRAPER_EGRESS` | – | route a scraping host through a bunny.net pull zone: `host=base,host=base` |
 | `SUBTITLES` | `1` | carry a scraped stream's subtitle tracks into Bunny as caption tracks |
-| `SUBTITLE_TARGET_LANG` | `ar` | the language a title should end up with; filled in by translation when missing |
-| `SUBTITLE_TRANSLATOR` | – | `openai` (any OpenAI-compatible endpoint) or `deepl`; unset = carry tracks only, translate nothing |
-| `SUBTITLE_TRANSLATOR_KEY` | – | that service's API key |
-| `SUBTITLE_TRANSLATOR_URL` | provider default | the endpoint base, e.g. `https://api.openai.com/v1` or a local Ollama |
-| `SUBTITLE_TRANSLATOR_MODEL` | `gpt-4o-mini` | the model, for the `openai` provider |
+| `SUBTITLE_TARGET_LANG` | `ar` | the languages a title should end up with, in order — one code or a list (`ar,fr,es`, `Arabic, French, Spanish`); each one the stream does not already carry is translated and attached |
+| `SUBTITLE_TRANSLATOR` | `deepl` | whether the missing languages are machine-translated; `off` = carry the stream's tracks only, invent nothing |
+| `SUBTITLE_TRANSLATOR_URL` | `https://www2.deepl.com/jsonrpc` | the endpoint the DeepL scraper posts to |
+| `R2_ACCOUNT_ID` | – | Cloudflare account id for the archive (all four `R2_*` credentials are needed together, or none are) |
+| `R2_ACCESS_KEY_ID` | – | R2 API token's access key id |
+| `R2_SECRET_ACCESS_KEY` | – | R2 API token's secret |
+| `R2_BUCKET` | – | the bucket finished titles are copied into |
+| `R2_ENDPOINT` | `https://<account>.r2.cloudflarestorage.com` | overrides the S3 endpoint |
+| `R2_PUBLIC_BASE` | – | a public base (`https://pub-….r2.dev` or a custom domain) so the archive can be played back; without it playback stays pointed at Bunny |
+| `R2_PREFIX` | `archive` | the folder every title is filed under |
+| `R2_ARCHIVE` | `1` | copy a finished publish automatically (also the default of the dashboard switch) |
+| `R2_KEEP_BUNNY` | `0` | `1` keeps the video in Bunny after a successful archive instead of deleting it |
 | `DASHBOARD_USER` | `index` | login user, used only when a password is set |
 | `DASHBOARD_PASSWORD` | – | set it to require the login on every page and API route |
 
@@ -205,6 +237,25 @@ the hard caps). Uploads are capped at 10 GB per file.
    TUS (see below) or calls `POST /videos/fetch` for remote URLs.
 4. Status moves `queued → uploading → encoding → ready` (or `failed`), polling
    Bunny every 10 s. While uploading, `progress` tracks bytes sent to Bunny.
+
+### Live queue
+
+The browser does not poll. It opens one `GET /api/events` event stream and the
+server pushes a delta whenever a job changes — `added`, `updated` or `removed` —
+carrying only the rows that moved, in the same shape the queue list uses. The UI
+patches those rows in place (and skips a row whose rendered fields did not
+change), so an update never rebuilds the table and never costs a full list
+download. Changes made anywhere are announced the same way: the job worker, the
+autopilot, the watched folder and the API routes all go through the store's
+single change hook.
+
+Bursts are coalesced for 250 ms, so a download that moves its byte counter
+dozens of times a second produces one message per job per window rather than a
+flood. Queue counters ride along as a `stats` event, a title finishing
+publishing is announced as `catalog`, and a comment line every 15 s keeps idle
+proxies from closing the connection. `EventSource` reconnects by itself after a
+restart — the Queue tab's **live** badge shows which state it is in, and while
+the stream is down a slow poll keeps the list and the badge current.
 5. Turning `ready` writes the job's full record to the published catalogue
    (`DATA_DIR/catalog.json`), so "what did we publish, at which quality, from
    which URL?" outlives the job and the dashboard.
@@ -303,34 +354,174 @@ Nothing here fails the job: a host that will not hand over its subtitles, or a
 subtitle file that makes no sense, becomes a noted track on the job and the
 video is still published.
 
-### Arabic without speech recognition
+### Missing languages without speech recognition
 
-If the target language (`SUBTITLE_TARGET_LANG`, `ar` by default) is still
-missing, the dashboard translates an existing track into it and uploads that as
-a normal caption.
+Every language in `SUBTITLE_TARGET_LANG` (`ar` by default; `ar,fr,es` works
+too) that a title does not already carry is translated from an existing track
+and uploaded as a normal caption — one caption per language, all from the same
+source text, in one press.
 
 The translation is **text → text**. Bunny's own transcribe/translate runs
 Whisper over the **audio** first — speech recognition — which is slower, costs
 per audio-minute, and is a poor way to reach a given language when the subtitle
-is already sitting there in English. So instead the English cue lines are sent
-to a translation engine and the Arabic comes back against the **same timings**:
-ose only the cue text, and the cue count and order are how the reply is matched
-back, so an Arabic track cannot drift out of sync.
+is already sitting there in English. So instead the source cue lines are sent
+to a translation engine once per language, and each language comes back against
+the **same timings**: only the cue text is sent, and the cue count and order are
+how the reply is matched back, so a translated track cannot drift out of sync.
 
-Two engines are wired, and `openai` is the one to reach for if the Arabic
-quality matters most, because the model sees the whole cue list and keeps names,
-register and pronouns consistent across a film:
+**One engine, and no key.** The cues go to DeepL, on the endpoint deepl.com's
+own translator page calls — `www2.deepl.com/jsonrpc`, JSON-RPC
+`LMT_handle_texts`. There is no account, no API key and nothing to sign up for, so
+a fresh install can produce translated subtitles with no setup at all:
 
-| `SUBTITLE_TRANSLATOR` | What it talks to | Notes |
-| --- | --- | --- |
-| `openai` | Any OpenAI-compatible `/chat/completions` | OpenAI, OpenRouter, Groq, Together, or a local Ollama/LM Studio. Best Arabic for subtitles; cost is per translation call, and nothing is transcribed. |
-| `deepl` | `api-free.deepl.com` / `api.deepl.com` | A dedicated engine with strong Arabic and a free tier. The host is chosen from the key itself (`:fx` = free). |
+| Setting | Value |
+| --- | --- |
+| endpoint | `https://www2.deepl.com/jsonrpc` (`SUBTITLE_TRANSLATOR_URL` points it elsewhere) |
+| target | each configured language, uppercased (`ar` → `AR`, `fr` → `FR`) |
+| source | the track's own language (`en`), or `auto` when the stream did not say |
 
-With no translator configured, nothing is invented: the tracks the stream
-actually had are carried, and the job notes that the target language was missing
-and no translator is set up. A title published without subtitles at all is
+Requests carry the cue text and nothing else, in batches of 25 cues (or 4 000
+characters, whichever comes first) with a short pause between batches, and say
+they come from DeepL's own mobile client — a bare `fetch` is the shape a scraper's
+requests get refused in. That is the trade-off: this is **not a published API**,
+so DeepL can change the shape, rate-limit it or refuse it at any time. A refusal
+is therefore a *note on the job* (the video still publishes, and the track simply
+is not there) rather than a failed job, and `SUBTITLE_TRANSLATOR=off` turns
+machine translation off entirely.
+
+The response is matched back by count: a reply that does not carry exactly one
+translation per cue is refused rather than stitched onto the timings misaligned,
+which is also why a target track can never arrive half-translated.
+
+With translation off, nothing is invented: the tracks the stream actually had are
+carried, and the job notes that each missing language was not created and
+translation is switched off. A title published without subtitles at all is
 recorded as such in the Library, and the catalogue keeps the full list — so
-"which titles have Arabic?" is one search.
+"which titles have Arabic, or French?" is one search.
+
+### Filling in a title that is already published
+
+A title is published once, so a missing Arabic track would otherwise mean
+downloading the whole thing again. **Library → fill in ar, fr, es (n)** does
+neither: the video is already in Bunny, so only the caption half of the pipeline
+runs again — for every language that title is missing, out of one read of the
+source text.
+
+The button counts the published titles missing at least one of the languages in
+`SUBTITLE_TARGET_LANG` and says where each one's text would come from:
+
+1. **The subtitle URL the catalogue recorded** when that track was attached — the
+   exact file used the first time, one request.
+2. Otherwise **the master playlist** the catalogue recorded for the source,
+   re-read so its `#EXT-X-MEDIA:TYPE=SUBTITLES` renditions can be used. The
+   manifest is the one place a stream honestly declares its subtitles, so it is
+   asked rather than guessed at.
+
+English is preferred as the pivot in both cases — it is what the target languages
+were designed to be translated from. The text is read once per title however many
+languages are missing; each language is translated and attached on its own, so
+one refusal does not take the others down, and a partial result says which landed
+and which did not.
+
+A title can be picked out rather than batched: the Library's subtitle filter
+narrows the list to *missing ar, fr, es subtitles* (or *already has ar, fr, es
+subtitles*, to see what the backfill has done), and every row that is missing one
+carries its own **fill in ar, fr** button naming exactly what that row lacks. The
+record's own panel has the same button, so the new tracks can be watched landing
+on the title they belong to. The filter names the languages from
+`SUBTITLE_TARGET_LANG` on both sides.
+
+Work is done in batches (ten at a time from the UI, up to `limit: 100` over the
+API) because every title in a batch costs a fetch, a translation and a caption
+upload; whatever a batch does not reach is still counted afterwards and the next
+press picks it up.
+
+It also happens without anyone pressing anything. When a publish finishes without
+a language this machine could have translated — a refused translation is the
+usual reason, and DeepL rate-limits by design — the same fill-in is queued
+automatically for that title. The queue runs one title at a time, so a burst of
+publishes cannot become a burst of DeepL requests; a failed attempt is retried a
+minute later, doubling, up to three times, because a rate limit clears with time.
+If it still does not land, the title is left to the button above, which reports
+why. Only a title that published a *readable* caption is repaired this way — if
+the source text itself never came down there is nothing to translate from, and
+the preview on the manual action is what says so. **Settings → fill in a missing
+subtitle language as soon as a publish finishes** turns the automatic pass off.
+
+A title that cannot be worked on says so *before* anything is tried — no Bunny
+video id, an account that no longer exists, translation switched off, no source
+recorded — and one that fails half way (a dead source, DeepL refusing) is reported
+against the title with the reason, with the catalogue left exactly as it was.
+
+## R2 archive
+
+Bunny Stream is a player, not a locker. A finished video's own bytes are the
+per-resolution **MP4 fallback** files on the pull zone (`play_1080p.mp4`, …); its
+thumbnails and animated previews exist nowhere else; and deleting the video takes
+all of it away. So the archive exists to make "remove it from Bunny" safe rather
+than destructive: **copy everything out first, prove the copy is there, and only
+then delete.**
+
+Configure it by filling in the four `R2_*` credentials (an R2 API token with
+object read/write on one bucket) and, optionally, `R2_PUBLIC_BASE` if the bucket
+is served through `r2.dev` or a custom domain. With a destination configured,
+**Settings → move a finished title to R2** is on by default, and every publish
+that finishes encoding is archived without being asked. Without one, nothing about
+archiving appears and nothing is ever deleted.
+
+### What gets copied, and where
+
+Every title gets one folder, named so a bucket browser can actually sort it and
+suffixed with the TMDB id so two same-named releases cannot collide:
+
+```
+archive/Movies/Inception (2010) [27205]/
+  video/1080p.mp4          every MP4 fallback rendition (up to 1080p)
+  video/720p.mp4
+  original                 the file that was uploaded, when Bunny kept it
+  hls/playlist.m3u8        the HLS index those renditions belong to
+  images/thumbnail.jpg     every thumbnail Bunny generated
+  images/thumbnail_1.jpg
+  images/preview.gif       every animated preview: gif, webp, and the HQ webm/mp4
+  images/preview.webp
+  images/preview_hq.webm
+  images/preview_hq.mp4
+  sprites/seek_0.jpg       the player's timeline sprites, as many as exist
+  subtitles/en.vtt         every caption track on the video
+  manifest.json            what all of it is, one SHA-256 per object
+
+archive/Shows/Breaking Bad [1396]/Season 02/S02E05 - Breakage/…
+```
+
+Each asset is `HEAD`-ed on the pull zone first, so a rendition the library never
+produced (or a `thumbnail_3.jpg` Bunny did not generate, or a sprite past the
+last one) is *skipped* rather than treated as a failure. Every file that does
+exist is streamed once into R2 — a signed `PUT` when it fits in one request, a
+real S3 multipart upload when it does not — and then `HEAD`-ed **in the bucket**:
+an object only counts once R2 itself says it is there, at the size that was sent.
+`manifest.json` is written last, so its presence is what "this folder is a
+complete archive" means.
+
+### Then, and only then, Bunny is told to forget it
+
+The video is deleted from Bunny only after every object verified and the manifest
+landed. A run that cannot reach the pull zone, that R2 refuses, or that finds **no
+MP4 rendition at all** stops there and leaves the video in place — a folder of
+thumbnails is not a replacement for the film, and Bunny is still the only copy.
+Such a title keeps an `archive` record with `complete: false` and the reason, and
+the automatic pass retries it twice more (five minutes apart, doubling) before
+leaving it to the **move to R2** button in the Library.
+
+Because a subtitle repair may still be attaching captions when a title is
+published, the archive waits for it to settle before it reads the video —
+deleting a video a caption upload is still in flight against would throw that
+translation away.
+
+When the bucket has a public base, playback for an archived title is repointed at
+the R2 copy (`…/hls/playlist.m3u8`); otherwise the old Bunny URL is kept as the
+only link that ever worked. Either way the catalogue record says which bucket,
+which folder, how many objects, how many bytes, whether the copy is whole, and
+whether Bunny still holds the video.
 
 ## Autopilot
 
@@ -432,7 +623,7 @@ keeps the queue honest.
 | --- | --- | --- |
 | `GET` | `/api/health` | liveness + mock flag |
 | `GET` | `/api/diagnostics` | reachability of the Bunny API, each pull zone, the scraper hosts and the relay (what **Settings → Check network** renders) |
-| `GET`/`PUT` | `/api/settings` | TMDB credential, queue limits |
+| `GET`/`PUT` | `/api/settings` | TMDB credential, queue limits, watched folder, automatic subtitle repair |
 | `GET`/`POST` | `/api/accounts` | list / add an account |
 | `PATCH`/`DELETE` | `/api/accounts/:id` | update (incl. `enabled`) / remove |
 | `POST` | `/api/accounts/:id/test` | verify key + library |
@@ -456,10 +647,15 @@ keeps the queue honest.
 | `POST` | `/api/jobs/:id/retry` / `/cancel` | lifecycle |
 | `DELETE` | `/api/jobs/:id` | remove a finished job |
 | `GET` | `/api/queue/stats` | counts + per-account usage |
-| `GET` | `/api/catalog?q=&kind=&limit=` | published titles (search + filter) with stats |
+| `GET` | `/api/events` | the live queue as `text/event-stream`: `hello` (current state), `jobs` (a delta of `{kind, job}`), `stats`, `catalog` — see [Live queue](#live-queue) |
+| `GET` | `/api/catalog?q=&kind=&limit=&subtitles=` | published titles (search + filter) with stats; `subtitles=missing\|has` filters on the target languages and the answer carries the scoped missing count and the target list |
 | `GET` | `/api/catalog/stats` | how many titles/qualities are recorded and how many bytes |
 | `GET` | `/api/catalog/:key` | one record in full: every quality rung and every source URL |
 | `DELETE` | `/api/catalog/:key` | forget a record (Bunny keeps the video) |
+| `GET` | `/api/subtitles/backfill` | which published titles are still missing a target language, which languages each is missing, and what each would be translated from — a report only, nothing is fetched |
+| `POST` | `/api/subtitles/backfill` | fill them in: `{ keys?, limit? }`. Re-reads the recorded subtitle text once, translates and attaches every missing language to the video that already exists — no re-download, no re-publish |
+| `GET` | `/api/archive` | which published titles still have a Bunny copy waiting to be archived — a report only |
+| `POST` | `/api/archive` | archive them: `{ keys?, limit? }`. Copies every rendition, still and caption into R2, verifies each object, writes the manifest, then deletes the video from Bunny; answers one line per title |
 | `GET`/`PUT` | `/api/autopilot` | read / change the autopilot (rating floor, lists, limits, interval) |
 | `POST` | `/api/autopilot/run` | run one cycle now, whatever the schedule says |
 | `POST` | `/api/autopilot/reset` | reset the page cursors to page 1 |
@@ -469,7 +665,10 @@ keeps the queue honest.
 
 - `DATA_DIR/catalog.json` — the published catalogue: one permanent record per
   title that finished publishing, with every source URL, quality rung and
-  subtitle track the job produced. Written on the `ready` transition, atomic, and
+  subtitle track the job produced, and — once a title has been archived — the R2
+  bucket, folder, per-object `{ key, bytes, sha256 }` list, manifest key, sizes and
+  whether Bunny was told to forget the video. Written on the `ready` transition,
+  atomic, and
   set aside (not lost) if it cannot be parsed. Deleting a job does not touch it.
 - `DATA_DIR/autopilot.json` — the autopilot's own state: whether it is on, its
   settings, the page cursor per top-rated list, the last report and a rolling
@@ -578,15 +777,19 @@ right home for the queue. Hosts that build from a git repository only need the
 
 ```bash
 npm run typecheck        # tsc --noEmit
-npm test                 # 157 tests (queue caps, crypto, store, catalogue, clients, TUS, watcher, job lifecycle, crash resume, HLS, source pipeline, subtitles, translation, tunnel, network policy, diagnostics, login, autopilot, host politeness)
+npm test                 # 220 tests (queue caps, crypto, store + its change hook, catalogue, clients, TUS, watcher, job lifecycle, crash resume, HLS, source pipeline, subtitles, DeepL translation, multi-language targets, subtitle backfill and its automatic repair, the R2 archive and its SigV4 signer, tunnel, network policy, diagnostics, login, autopilot, host politeness)
 
 # End-to-end against a running mock server:
 npm run mock &           # or in another terminal
-node scripts/smoke.mjs   # TMDB, accounts, uploads, concurrency cap, the source pipeline, the autopilot, watched folder, cleanup
+node scripts/smoke.mjs   # TMDB, accounts, uploads, concurrency cap, the live event stream, the source pipeline, the subtitle backfill (two titles repaired, one source fetch each), the autopilot, watched folder, cleanup
 
 # …when the dashboard runs with a custom DATA_DIR:
 SMOKE_BASE_URL=http://127.0.0.1:4791 SMOKE_DATA_DIR=data-smoke2 node scripts/smoke.mjs
 ```
+
+`tests/jobs.test.ts` pins the hand-off: when a job finishes, the catalogue entry
+is written first and then handed to the repair hook, tracks and all, so the
+queue always reads the entry the publish actually produced.
 
 `tests/source-flow.test.ts` stands up a real origin CDN (master playlist, media
 playlist, ranged segment responses) and a real relay server, then drives the
@@ -600,22 +803,49 @@ the downloader produced (an AES-encrypted source is shorter once padding is
 stripped) must still be served at the lengths that really exist. The smoke script
 does the same thing once over HTTP: it serves an HLS stream from its own process,
 submits it through `POST /api/jobs/source`, and checks the tier it settled on,
-the byte counts and that nothing was left on disk.
+the byte counts and that nothing was left on disk. It then publishes two
+English-only titles whose cue file the pipeline could not read, runs the
+Library's batch fill-in for both, and — counting the requests its origin
+answered — checks that each title's source track was downloaded exactly once
+before the caption landed on the video that already existed.
 
 `tests/subtitles.test.ts` covers the text side of captions: SRT→WebVTT
 conversion, cue settings and multi-line text surviving a round trip, language
 normalisation (`en-US`, `ENG`, *English*, *العربية*), the HLS timestamp map, and
 the rule that a translated cue keeps its original timing (and falls back to the
-original text rather than blanking). `tests/translate.test.ts` drives both
-engines against a fake endpoint: chunking a long cue list, refusing a reply with
-the wrong number of cues, choosing the free or paid DeepL host from the key,
-reading JSON out of a model reply wrapped in prose, and surfacing a quota refusal
-as a translation error. The source pipeline tests then run it for real: an origin
-that declares English and Arabic renditions has both attached, an origin with
-only English has an Arabic track translated out of the cue **text** (the fake
-translator records exactly what it was sent, and the timings are asserted to be
-untouched), and with no translator configured the missing language is noted
-rather than invented.
+original text rather than blanking). `tests/translate.test.ts` drives the DeepL
+scraper against a fake endpoint: the request shape (no key anywhere, the
+`LMT_handle_texts` body, the `"method"` whitespace that follows the call id, the
+i-count timestamp adjustment, lowercase source and uppercase target), chunking a
+long cue list with the order preserved, a blank cue that is never sent, refusing a
+reply with the wrong number of cues, and surfacing a refusal or a non-JSON answer
+as a translation error rather than a crash. The source pipeline tests then run it
+for real: an origin that declares English and Arabic renditions has both attached,
+an origin with only English has an Arabic track translated out of the cue **text**
+(the fake DeepL records exactly what it was sent, and the timings are asserted to
+be untouched), one English track becomes Arabic, French and Spanish captions from
+one read of the source text, and with translation switched off the missing
+languages are noted rather than invented.
+
+`tests/backfill.test.ts` does the same for the Library action, over a real origin
+and a stand-in for DeepL: a published entry is translated from the subtitle the
+catalogue recorded and the caption lands on its existing video (timings intact),
+a title missing three languages gets all three from one read of the source text,
+a batch of titles is shown to download each source track exactly once (the origin
+counts its requests: three titles times two languages is six translations but
+three downloads, and re-running the batch fetches nothing at all), one language
+refusing still lands the others and says which did not, an entry with no recorded
+track is recovered from its master playlist instead, a source that is gone is
+reported against the title with nothing written, and a batch limit, an explicit
+key list, a missing account and translation switched off each do the right
+nothing. The automatic pass is driven from the same file: a publish that left a
+language missing is queued and healed without a button, a second event for the
+same title is not queued twice, a refusal is retried and then left to the
+Library after the budget, a rate limit that clears lands on the retry, a title
+with no readable source is never queued, and the setting turns it all off. The
+smoke script makes the read-once guarantee end to end: its origin counts what it
+is asked for, and a batch of two published titles must produce exactly two source
+downloads.
 
 `tests/autopilot.test.ts` drives the autopilot against a canned TMDB: it checks
 that a page is processed highest rating first, that a below-floor or **unrated**

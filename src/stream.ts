@@ -409,7 +409,15 @@ const SUBTITLE_TIMEOUT_MS = 20_000;
  * Both shapes end up as one list of cues, because everything downstream works
  * on cues.
  */
-async function fetchSubtitleCues(url: string, headers: Record<string, string>): Promise<SubtitleCue[]> {
+/**
+ * The cue text behind a subtitle URL — a plain `.vtt`/`.srt` file, or a subtitle
+ * playlist whose chunks each carry their own timeline.
+ *
+ * Exported because the subtitle backfill reads tracks out of the catalogue long
+ * after the stream that declared them is gone, and must apply exactly the same
+ * rules then.
+ */
+export async function fetchSubtitleCues(url: string, headers: Record<string, string>): Promise<SubtitleCue[]> {
   const text = await fetchScrapeText(url, headers, SUBTITLE_TIMEOUT_MS);
   if (!looksLikePlaylist(text)) return parseSubtitle(text).cues;
 
@@ -451,11 +459,16 @@ async function carrySubtitles(
   }
   const videoId = options.videoId;
 
-  // Only build a translator when one is actually configured: with none, the
-  // dashboard still carries the tracks the stream had, it just never invents a
-  // language.
-  const translator = config.translator
-    ? createTranslator({ ...config.translator, timeoutMs: config.networkTimeoutMs, retries: config.networkRetries })
+  // Built unless translation was switched off: the engine is DeepL's public
+  // endpoint, so there is no key to wait for. With none, the dashboard still
+  // carries the tracks the stream had — it just never invents a language.
+  const translator = config.subtitleTranslate
+    ? createTranslator({
+        timeoutMs: config.networkTimeoutMs,
+        retries: config.networkRetries,
+        mock: config.mock,
+        ...(config.subtitleTranslateEndpoint ? { endpoint: config.subtitleTranslateEndpoint } : {}),
+      })
     : undefined;
 
   const seen = new Set<string>();
@@ -497,46 +510,51 @@ async function carrySubtitles(
     }
   }
 
-  const target = config.subtitleTargetLanguage;
-  const haveTarget = tracks.some((track) => track.uploaded && track.srclang === target);
-  if (!haveTarget && sources.length) {
-    const pivot = sources.find((source) => source.srclang === 'en') ?? sources[0];
-    if (!pivot) return tracks;
-    if (!translator) {
-      tracks.push({
-        srclang: target,
-        label: languageLabel(target),
-        uploaded: false,
-        translated: true,
-        translatedFrom: pivot.srclang,
-        note: 'no text translator is configured (set SUBTITLE_TRANSLATOR and its key to fill this in)',
-      });
-      return tracks;
-    }
-    try {
-      const translated = await translator.translate(cueTexts(pivot.cues), target, pivot.srclang);
-      const body = toWebVtt(withTranslatedText(pivot.cues, translated), `translated from ${languageLabel(pivot.srclang)} (${translator.provider})`);
-      const label = `${languageLabel(target)} (translated)`;
-      await options.client.addCaption(videoId, target, label, body);
-      tracks.push({
-        srclang: target,
-        label,
-        uploaded: true,
-        translated: true,
-        translatedFrom: pivot.srclang,
-        cues: pivot.cues.length,
-        bytes: Buffer.byteLength(body),
-      });
-      deps.log?.(`[stream] translated ${pivot.cues.length} ${pivot.srclang} cues into ${target} with ${translator.provider}`);
-    } catch (error) {
-      tracks.push({
-        srclang: target,
-        label: languageLabel(target),
-        uploaded: false,
-        translated: true,
-        translatedFrom: pivot.srclang,
-        note: describeError(error),
-      });
+  // Every language the title should end up with. The source track is read once
+  // and translated per language, so three targets cost three translation calls
+  // rather than three subtitle downloads — and each one is filed as its own
+  // caption, so a failure in one leaves the others alone.
+  const targets = config.subtitleTargetLanguages;
+  const pivot = sources.find((source) => source.srclang === 'en') ?? sources[0];
+  if (pivot) {
+    for (const target of targets) {
+      if (tracks.some((track) => track.uploaded && track.srclang === target)) continue;
+      if (!translator) {
+        tracks.push({
+          srclang: target,
+          label: languageLabel(target),
+          uploaded: false,
+          translated: true,
+          translatedFrom: pivot.srclang,
+          note: `translation is switched off (SUBTITLE_TRANSLATOR=off), so ${target} was not created`,
+        });
+        continue;
+      }
+      try {
+        const translated = await translator.translate(cueTexts(pivot.cues), target, pivot.srclang);
+        const body = toWebVtt(withTranslatedText(pivot.cues, translated), `translated from ${languageLabel(pivot.srclang)} (${translator.provider})`);
+        const label = `${languageLabel(target)} (translated)`;
+        await options.client.addCaption(videoId, target, label, body);
+        tracks.push({
+          srclang: target,
+          label,
+          uploaded: true,
+          translated: true,
+          translatedFrom: pivot.srclang,
+          cues: pivot.cues.length,
+          bytes: Buffer.byteLength(body),
+        });
+        deps.log?.(`[stream] translated ${pivot.cues.length} ${pivot.srclang} cues into ${target} with the ${translator.provider} web endpoint`);
+      } catch (error) {
+        tracks.push({
+          srclang: target,
+          label: languageLabel(target),
+          uploaded: false,
+          translated: true,
+          translatedFrom: pivot.srclang,
+          note: describeError(error),
+        });
+      }
     }
   }
 

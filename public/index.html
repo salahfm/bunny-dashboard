@@ -269,7 +269,7 @@
               <option value="failed">failed</option>
               <option value="cancelled">cancelled</option>
             </select>
-            <label class="inline"><input id="queue-autorefresh" type="checkbox" checked /> refresh every 2 s</label>
+            <span id="queue-live" class="live is-down" title="connecting to the live queue"><i></i><em id="queue-live-text">connecting…</em></span>
             <button id="queue-retry-failed">retry all failed</button>
             <span id="queue-summary" class="muted small"></span>
           </div>
@@ -307,7 +307,21 @@
               <option value="movie">movies</option>
               <option value="episode">episodes</option>
             </select>
+            <select id="library-subtitles" title="Which titles to list by their subtitle state">
+              <option value="">any subtitle state</option>
+              <option value="missing">missing the target language</option>
+              <option value="has">already has the target language</option>
+            </select>
             <button id="library-refresh">Refresh</button>
+            <button
+              id="library-backfill"
+              title="Translate the missing target language onto titles that are already published. The video is not re-downloaded or published again — only the caption is attached."
+            >fill in subtitles</button>
+            <button
+              id="library-archive"
+              title="Copy every MP4 rendition, thumbnail, animated preview, sprite and caption of the titles below into Cloudflare R2, verify it, and only then let Bunny forget the video."
+            >move to R2</button>
+            <span id="library-missing" class="muted small"></span>
             <span id="library-summary" class="muted small"></span>
           </div>
           <table class="table" id="library-table">
@@ -417,6 +431,19 @@
               Account limit (1–30)
               <input id="settings-maxaccounts" type="number" min="1" max="30" />
             </label>
+          </div>
+          <div class="row">
+            <label class="inline">
+              <input id="settings-autofill" type="checkbox" />
+              fill in a missing subtitle language as soon as a publish finishes
+            </label>
+          </div>
+          <div class="row">
+            <label class="inline">
+              <input id="settings-archive" type="checkbox" />
+              move a finished title to R2 (every MP4 rendition, still and caption) and remove it from Bunny
+            </label>
+            <span id="settings-archive-note" class="muted small"></span>
           </div>
           <div class="row">
             <button id="settings-save" class="primary">Save settings</button>

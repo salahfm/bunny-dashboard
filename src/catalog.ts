@@ -27,6 +27,57 @@ export interface CatalogTier {
   bandwidth?: number;
 }
 
+/** One object an archive stored in R2. */
+export interface CatalogArchiveObject {
+  /** Where it sits inside the title's folder, e.g. `video/1080p.mp4`. */
+  name: string;
+  /** The full object key in the bucket. */
+  key: string;
+  /** `video`, `original`, `thumbnail`, `preview`, `sprite`, `subtitle`, `playlist` or `manifest`. */
+  kind: string;
+  bytes: number;
+  sha256: string;
+  contentType: string;
+  /** The pull-zone URL it was downloaded from, before Bunny let the video go. */
+  source?: string;
+}
+
+/**
+ * What happened to a title in the R2 archive.
+ *
+ * The point of the record is that it answers, months later, "where is this
+ * video, and can it be checked?": every object's key, size and SHA-256, and
+ * whether Bunny was actually told to forget the video or is still holding a
+ * copy because something did not verify.
+ */
+export interface CatalogArchive {
+  bucket: string;
+  /** The title's folder in the bucket, e.g. `archive/Movies/Inception (2010) [27205]`. */
+  prefix: string;
+  /** The folder's public URL, when the bucket is served through a domain. */
+  base?: string;
+  objects: CatalogArchiveObject[];
+  manifestKey: string;
+  /** The folder's total size, and the share of it that is video renditions. */
+  bytes: number;
+  videoBytes: number;
+  /** How many MP4 renditions were stored. */
+  videos: number;
+  /** Every asset was stored and verified, and the manifest was written. */
+  complete: boolean;
+  /** Why it stopped short, when it did. */
+  note?: string;
+  /** The Bunny video it was copied from. */
+  videoId: string;
+  /** Where it plays now, when the bucket has a public base. */
+  playbackUrl?: string;
+  /** Bunny's own playback URL, which the archive replaces. */
+  bunnyPlaybackUrl?: string;
+  removedFromBunny: boolean;
+  removedAt?: string;
+  at: string;
+}
+
 /** One source the scrape found, kept with the URL and headers it needed. */
 export interface CatalogSource {
   provider: string;
@@ -84,6 +135,15 @@ export interface CatalogEntry {
    */
   subtitles: SubtitleTrack[];
 
+  /*
+   * Where the title lives once Bunny is done with it.
+   *
+   * Absent for a title nobody archived; present with `complete: false` when an
+   * archive started and did not finish, which is also the flag for "Bunny may
+   * still hold this video".
+   */
+  archive?: CatalogArchive;
+
   /* ---- where the job came from ---- */
   origin: {
     kind: JobSource['kind'];
@@ -122,6 +182,9 @@ export interface CatalogStats {
   bytes: number;
   /** How many entries were published at each tier label. */
   byQuality: Record<string, number>;
+  /** Titles copied into R2, and the total size of those folders. */
+  archived: number;
+  archivedBytes: number;
   firstPublishedAt: string | null;
   lastPublishedAt: string | null;
 }
@@ -196,10 +259,24 @@ export function entryFromJob(job: Job, account: Account | undefined, existing: C
 export class Catalog {
   private db: CatalogDb;
   private filePath: string;
+  /** Bumped by every change, so a watcher can tell "nothing moved" cheaply. */
+  private changes = 0;
 
   constructor(config: AppConfig) {
     this.filePath = path.join(config.dataDir, 'catalog.json');
     this.db = this.load();
+  }
+
+  /**
+   * A counter that changes with every record added, rewritten or removed.
+   *
+   * `size` only moves when a *new* title is published, but the interesting
+   * events also include a caption attached to a title that already exists — so
+   * the live event stream watches this instead, and the Library redraws when a
+   * backfill lands without the operator reloading.
+   */
+  get revision(): number {
+    return this.changes;
   }
 
   private load(): CatalogDb {
@@ -255,6 +332,46 @@ export class Catalog {
     const entry = entryFromJob(job, account, existing, new Date().toISOString());
     if (index >= 0) this.db.entries[index] = entry;
     else this.db.entries.push(entry);
+    this.changes += 1;
+    this.save();
+    return entry;
+  }
+
+  /**
+   * Rewrites one entry's subtitle list.
+   *
+   * The video itself did not change — the backfill attached a caption to it — so
+   * nothing else about the record is touched, only the tracks and the timestamp.
+   */
+  setSubtitles(key: string, subtitles: SubtitleTrack[]): CatalogEntry | undefined {
+    const entry = this.get(key);
+    if (!entry) return undefined;
+    entry.subtitles = subtitles.map((track) => ({ ...track }));
+    entry.updatedAt = new Date().toISOString();
+    this.changes += 1;
+    this.save();
+    return entry;
+  }
+
+  /**
+   * Attaches an archive record to an entry.
+   *
+   * The video itself did not change — it was copied somewhere else and, usually,
+   * deleted from Bunny — so nothing but the archive block, the playback URL and
+   * the timestamp move. `playbackUrl` follows the archive only when the bucket
+   * has a public base: otherwise the old Bunny URL is the only link that ever
+   * worked, and it is kept (with the archive's own note) rather than blanked.
+   */
+  setArchive(key: string, archive: CatalogArchive): CatalogEntry | undefined {
+    const entry = this.get(key);
+    if (!entry) return undefined;
+    entry.archive = archive;
+    // The Bunny URL is only replaced once the archive is whole: pointing at a
+    // public R2 folder that is still half-uploaded would break playback for a
+    // title whose Bunny copy works.
+    if (archive.complete && archive.playbackUrl) entry.playbackUrl = archive.playbackUrl;
+    entry.updatedAt = new Date().toISOString();
+    this.changes += 1;
     this.save();
     return entry;
   }
@@ -263,6 +380,7 @@ export class Catalog {
     const index = this.db.entries.findIndex((entry) => entry.key === key);
     if (index === -1) return false;
     this.db.entries.splice(index, 1);
+    this.changes += 1;
     this.save();
     return true;
   }
@@ -287,6 +405,11 @@ export class Catalog {
         ...entry.sources.map((source) => source.provider),
         // A subtitle language is a real search: "which titles have Arabic?".
         ...(entry.subtitles ?? []).flatMap((track) => [track.srclang, track.label]),
+        entry.archive?.bucket,
+        entry.archive?.prefix,
+        // "r2" and "arched"/"local" are how the Library is asked which titles
+        // have been moved and which are still only on Bunny.
+        entry.archive ? 'r2 archived' : 'bunny',
       ]
         .filter((value): value is string => typeof value === 'string')
         .some((value) => value.toLowerCase().includes(needle)),
@@ -298,10 +421,16 @@ export class Catalog {
     let bytes = 0;
     let publishes = 0;
     const byQuality: Record<string, number> = {};
+    let archived = 0;
+    let archivedBytes = 0;
     let first: string | null = null;
     let last: string | null = null;
     for (const entry of entries) {
       publishes += entry.publishes;
+      if (entry.archive) {
+        archived += 1;
+        archivedBytes += entry.archive.bytes;
+      }
       const size = entry.bytes.declared ?? entry.bytes.file ?? entry.bytes.downloaded ?? 0;
       if (Number.isFinite(size)) bytes += size;
       const quality = entry.quality ?? (entry.tiers[0]?.label ?? 'unknown');
@@ -316,6 +445,8 @@ export class Catalog {
       publishes,
       bytes,
       byQuality,
+      archived,
+      archivedBytes,
       firstPublishedAt: first,
       lastPublishedAt: last,
     };

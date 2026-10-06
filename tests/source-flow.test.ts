@@ -771,31 +771,40 @@ async function startDirectJob(
 }
 
 /**
- * A stand-in for the translation engine, speaking the OpenAI chat-completions
- * shape. Every cue it is asked for comes back prefixed, so a test can prove
- * exactly which text was sent and that the timings were not touched.
+ * A stand-in for DeepL, speaking the JSON-RPC shape of the endpoint deepl.com's
+ * own translator page calls. Every cue it is asked for comes back prefixed, so a
+ * test can prove exactly which text was sent and that the timings were not
+ * touched.
  */
-async function startFakeTranslator(): Promise<{ url: string; calls: Array<{ cues: string[]; prompt: string }>; close(): Promise<void> }> {
-  const calls: Array<{ cues: string[]; prompt: string }> = [];
+async function startFakeDeepL(): Promise<{ url: string; calls: Array<{ cues: string[]; target: string; source: string }>; close(): Promise<void> }> {
+  const calls: Array<{ cues: string[]; target: string; source: string }> = [];
   const server = http.createServer((req, res) => {
     let body = '';
     req.on('data', (chunk) => {
       body += chunk;
     });
     req.on('end', () => {
-      const parsed = JSON.parse(body || '{}') as { messages?: Array<{ content?: string }> };
-      const user = JSON.parse(parsed.messages?.[1]?.content ?? '{}') as { cues?: string[] };
-      const cues = user.cues ?? [];
-      calls.push({ cues, prompt: parsed.messages?.[0]?.content ?? '' });
-      const translations = cues.map((cue) => `[ar] ${cue.replace(/\n/g, ' ')}`);
+      const parsed = JSON.parse(body || '{}') as {
+        method?: string;
+        params?: { texts?: Array<{ text?: string }>; lang?: { target_lang?: string; source_lang_user_selected?: string } };
+      };
+      const cues = (parsed.params?.texts ?? []).map((entry) => entry.text ?? '');
+      const target = parsed.params?.lang?.target_lang ?? '';
+      calls.push({
+        cues,
+        target,
+        source: parsed.params?.lang?.source_lang_user_selected ?? '',
+      });
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ translations }) } }] }));
+      // Each language comes back marked with the language it was asked for, so a
+      // test can tell one target's caption from another's.
+      res.end(JSON.stringify({ result: { texts: cues.map((cue) => ({ text: `[${target.toLowerCase()}] ${cue.replace(/\n/g, ' ')}` })) } }));
     });
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const port = (server.address() as AddressInfo).port;
   return {
-    url: `http://127.0.0.1:${port}/v1`,
+    url: `http://127.0.0.1:${port}/jsonrpc`,
     calls,
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
@@ -832,10 +841,11 @@ test('the subtitle tracks a stream declares are carried into Bunny', async () =>
 
 test('with no Arabic track, the English text is translated — and no audio is touched', async () => {
   const origin = await startOrigin({ delayMs: 5, subtitles: 'english' });
-  const translator = await startFakeTranslator();
+  const translator = await startFakeDeepL();
   const rig = await startDirectJob('job-translate', 'Inception', origin, {
-    translator: { provider: 'openai', apiKey: 'test-key', baseUrl: translator.url, model: 'fake-model' },
-    subtitleTargetLanguage: 'ar',
+    subtitleTranslate: true,
+    subtitleTranslateEndpoint: translator.url,
+    subtitleTargetLanguages: ['ar'],
   });
   try {
     await runStreamJob(
@@ -854,7 +864,8 @@ test('with no Arabic track, the English text is translated — and no audio is t
     // the whole point of not using bunny.net's audio-first transcribe.
     assert.equal(translator.calls.length, 1);
     assert.deepEqual(translator.calls[0]?.cues, ['Hello there', 'Second line']);
-    assert.match(translator.calls[0]?.prompt ?? '', /subtitle translator/i);
+    assert.equal(translator.calls[0]?.target, 'AR');
+    assert.equal(translator.calls[0]?.source, 'en');
 
     const caption = rig.captions.find((entry) => entry.srclang === 'ar');
     assert.match(caption?.body ?? '', /\[ar\] Hello there/);
@@ -867,9 +878,62 @@ test('with no Arabic track, the English text is translated — and no audio is t
   }
 });
 
-test('without a translator the missing language is noted, never invented', async () => {
+test('one English track becomes several languages, each its own caption', async () => {
   const origin = await startOrigin({ delayMs: 5, subtitles: 'english' });
-  const rig = await startDirectJob('job-notrans', 'Inception', origin);
+  const translator = await startFakeDeepL();
+  const rig = await startDirectJob('job-multi', 'Inception', origin, {
+    subtitleTranslate: true,
+    subtitleTranslateEndpoint: translator.url,
+    subtitleTargetLanguages: ['ar', 'fr', 'es'],
+  });
+  try {
+    await runStreamJob(
+      'job-multi',
+      rig.deps,
+      { update: (patch) => void rig.store.updateJob('job-multi', patch), isRunning: () => true },
+      rig.target,
+    );
+
+    // Three captions, three languages, one video — and the English source is
+    // carried alongside them.
+    assert.deepEqual(
+      rig.captions.map((caption) => caption.srclang).sort(),
+      ['ar', 'en', 'es', 'fr'],
+    );
+    for (const [language, marker] of [
+      ['ar', '[ar] Hello there'],
+      ['fr', '[fr] Hello there'],
+      ['es', '[es] Hello there'],
+    ] as const) {
+      const caption = rig.captions.find((entry) => entry.srclang === language);
+      assert.ok((caption?.body ?? '').includes(marker), `${language} must carry its own translation`);
+      // The source timings are reused for every language, never re-derived.
+      assert.match(caption?.body ?? '', /00:00:01\.000 --> 00:00:03\.000/);
+    }
+
+    // The cue text is the same for each language, so the read happened once and
+    // only the translation ran per target — in the configured order.
+    assert.deepEqual(
+      translator.calls.map((call) => call.target),
+      ['AR', 'FR', 'ES'],
+    );
+    assert.ok(translator.calls.every((call) => call.cues.join('|') === 'Hello there|Second line'));
+    assert.ok(translator.calls.every((call) => call.source === 'en'));
+
+    const tracks = rig.store.job('job-multi')?.subtitles ?? [];
+    const translated = tracks.filter((track) => track.translated);
+    assert.deepEqual(translated.map((track) => track.srclang).sort(), ['ar', 'es', 'fr']);
+    assert.ok(translated.every((track) => track.uploaded && track.translatedFrom === 'en' && track.cues === 2));
+    assert.equal(tracks.find((track) => track.srclang === 'en')?.uploaded, true, 'the source track is still carried');
+  } finally {
+    await translator.close();
+    await rig.close();
+  }
+});
+
+test('with translation switched off the missing language is noted, never invented', async () => {
+  const origin = await startOrigin({ delayMs: 5, subtitles: 'english' });
+  const rig = await startDirectJob('job-notrans', 'Inception', origin, { subtitleTranslate: false });
   try {
     await runStreamJob(
       'job-notrans',
@@ -881,7 +945,7 @@ test('without a translator the missing language is noted, never invented', async
     const tracks = rig.store.job('job-notrans')?.subtitles ?? [];
     const arabic = tracks.find((track) => track.srclang === 'ar');
     assert.equal(arabic?.uploaded, false, 'nothing was invented');
-    assert.match(arabic?.note ?? '', /no text translator is configured/);
+    assert.match(arabic?.note ?? '', /translation is switched off/);
     assert.ok(!rig.captions.some((caption) => caption.srclang === 'ar'));
     // The track the stream *did* have still made it.
     assert.ok(rig.captions.some((caption) => caption.srclang === 'en'));
