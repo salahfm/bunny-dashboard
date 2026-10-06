@@ -53,6 +53,14 @@ export interface R2ObjectInfo {
   contentType?: string;
 }
 
+/** What reading an object back out of the bucket told us. */
+export interface R2ReadResult {
+  key: string;
+  bytes: number;
+  /** Lowercase hex SHA-256 of everything that was read. */
+  sha256: string;
+}
+
 /** Bodies up to this size go in one signed PUT; bigger ones become multipart. */
 export const SINGLE_PUT_LIMIT_BYTES = 16 * 1024 * 1024;
 
@@ -61,6 +69,25 @@ export const MULTIPART_PART_BYTES = 8 * 1024 * 1024;
 
 /** How long one transfer attempt may take (a part, or a whole small object). */
 const TRANSFER_TIMEOUT_MS = 10 * 60_000;
+
+/** How long a signed playback URL lives by default: long enough to start a film. */
+export const DEFAULT_PRESIGN_SECONDS = 300;
+
+/** S3's own limits on `X-Amz-Expires`; the signing key is only good for 7 days. */
+export const PRESIGN_MAX_SECONDS = 604_800;
+export const PRESIGN_MIN_SECONDS = 1;
+
+/**
+ * A valid `X-Amz-Expires`: whole seconds, clamped to what S3 accepts.
+ *
+ * A missing value falls back; a nonsense one is clamped rather than rejected, so
+ * a typo in the environment can never mint a URL that outlives the signing key.
+ */
+export function clampPresignExpiry(value: unknown, fallback = DEFAULT_PRESIGN_SECONDS): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(PRESIGN_MIN_SECONDS, Math.min(PRESIGN_MAX_SECONDS, Math.floor(n)));
+}
 
 /** Control-plane calls (HEAD, DELETE, create/complete) are small and quick. */
 const CONTROL_TIMEOUT_MS = 30_000;
@@ -267,6 +294,47 @@ export class R2Client {
   }
 
   /**
+   * A presigned GET URL: Signature Version 4 moved out of the `Authorization`
+   * header and into the query string, so it can be handed to a browser — which
+   * cannot sign anything — while the bucket itself stays private.
+   *
+   * This is what lets an archived title play without a public bucket: the
+   * dashboard mints the URL, and it stops working after `expiresIn` seconds
+   * (five minutes by default). Three details are the presigned form's own, and
+   * each is load-bearing: the payload hash is the constant `UNSIGNED-PAYLOAD`
+   * because the URL is made before anyone knows what will be fetched, the
+   * signature covers only `host` — which is exactly what leaves the player free
+   * to send `Range` requests — and `X-Amz-Signature` is added last, after the
+   * canonical query has been built without it.
+   */
+  presign(key: string, options: { expiresIn?: number; now?: Date } = {}): string {
+    const expiresIn = clampPresignExpiry(options.expiresIn);
+    const date = options.now ?? this.now();
+    const amz = amzDate(date);
+    const scope = `${amz.slice(0, 8)}/${this.region}/s3/aws4_request`;
+    const query: Array<[string, string]> = [
+      ['X-Amz-Algorithm', 'AWS4-HMAC-SHA256'],
+      ['X-Amz-Credential', `${this.accessKeyId}/${scope}`],
+      ['X-Amz-Date', amz],
+      ['X-Amz-Expires', String(expiresIn)],
+      ['X-Amz-SignedHeaders', 'host'],
+    ];
+    const signature = signRequest({
+      method: 'GET',
+      path: this.pathFor(key),
+      query,
+      headers: { host: new URL(this.endpoint).host },
+      payloadHash: 'UNSIGNED-PAYLOAD',
+      accessKeyId: this.accessKeyId,
+      secretAccessKey: this.secretAccessKey,
+      region: this.region,
+      service: 's3',
+      date,
+    }).signature;
+    return `${this.endpoint}${this.pathFor(key)}?${canonicalQuery([...query, ['X-Amz-Signature', signature]])}`;
+  }
+
+  /**
    * The bucket path a key signs and requests, each segment RFC 3986-encoded.
    *
    * An empty key is the bucket root — `/<bucket>` with no trailing slash — which
@@ -340,7 +408,7 @@ export class R2Client {
   async put(
     key: string,
     source: AsyncIterable<Buffer> | Buffer | string,
-    options: { contentType?: string; contentLength?: number } = {},
+    options: { contentType?: string; contentLength?: number; onProgress?: (uploadedBytes: number) => void } = {},
   ): Promise<R2UploadResult> {
     const headers: Record<string, string> = options.contentType ? { 'content-type': options.contentType } : {};
     const known = options.contentLength;
@@ -360,6 +428,7 @@ export class R2Client {
       const body = Buffer.isBuffer(source) ? source : Buffer.from(source, 'utf8');
       buffers.push(body);
       bytes = body.length;
+      options.onProgress?.(bytes);
       overflow = bytes > this.singlePutLimitBytes;
     } else {
       // Stepped by hand rather than `for await`, so breaking out on overflow
@@ -372,6 +441,7 @@ export class R2Client {
         const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
         buffers.push(chunk);
         bytes += chunk.length;
+        options.onProgress?.(bytes);
         if (bytes > this.singlePutLimitBytes) {
           overflow = true;
           break;
@@ -408,7 +478,7 @@ export class R2Client {
   private async multipart(
     key: string,
     source: AsyncIterable<Buffer>,
-    options: { contentType?: string; contentLength?: number },
+    options: { contentType?: string; contentLength?: number; onProgress?: (uploadedBytes: number) => void },
     hash: crypto.Hash,
     prefix: Buffer,
   ): Promise<R2UploadResult> {
@@ -420,6 +490,9 @@ export class R2Client {
     if (!uploadId) throw new S3Error(`R2 did not return an upload id for ${key}`);
 
     const parts: R2Part[] = [];
+    // Bytes actually handed to R2, which is what a progress bar is reporting —
+    // not bytes read off the source, which run ahead of the upload.
+    let uploaded = 0;
     const uploadPart = async (part: Buffer): Promise<void> => {
       const response = await this.send('PUT', key, {
         query: [
@@ -432,6 +505,8 @@ export class R2Client {
       const etag = response.headers.get('etag');
       if (!etag) throw new S3Error(`R2 did not return an ETag for part ${parts.length + 1} of ${key}`);
       parts.push({ partNumber: parts.length + 1, etag, bytes: part.length });
+      uploaded += part.length;
+      options.onProgress?.(uploaded);
     };
 
     let pending = prefix;
@@ -510,6 +585,56 @@ export class R2Client {
 
   async exists(key: string): Promise<boolean> {
     return (await this.head(key)) !== undefined;
+  }
+
+  /**
+   * The object's body as a byte stream, or `undefined` when the key is not there.
+   *
+   * This is the read half of `put`: `read` builds on it, and a caller that wants
+   * the bytes somewhere of its own (a restore writes them to disk) can start
+   * here. A `403` is *not* treated as missing, for the same reason `head` does
+   * not: a refusal is not an absent object, and reporting it as one would make a
+   * verification pass look like a success when it never actually looked.
+   */
+  async open(key: string): Promise<ReadableStream<Uint8Array> | undefined> {
+    let response: Response;
+    try {
+      response = await this.send('GET', key, { timeoutMs: this.transferTimeoutMs });
+    } catch (error) {
+      if (error instanceof S3Error && error.status === 404) return undefined;
+      throw error;
+    }
+    return response.body ?? undefined;
+  }
+
+  /**
+   * Reads an object back and hashes it, streaming so a multi-gigabyte rendition
+   * never has to fit in memory. `sink` is handed each chunk as it arrives, which
+   * is how a restore writes the bytes to disk at the same time.
+   *
+   * `undefined` means the object is not in the bucket — the one answer a
+   * verification pass must never confuse with "it matches".
+   */
+  async read(key: string, sink?: (chunk: Buffer) => void | Promise<void>): Promise<R2ReadResult | undefined> {
+    const body = await this.open(key);
+    const hash = crypto.createHash('sha256');
+    let bytes = 0;
+    if (!body) return undefined;
+    const reader = body.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value?.length) continue;
+        const chunk = Buffer.from(value);
+        hash.update(chunk);
+        bytes += chunk.length;
+        await sink?.(chunk);
+      }
+    } finally {
+      reader.releaseLock?.();
+    }
+    return { key, bytes, sha256: hash.digest('hex') };
   }
 
   async delete(key: string): Promise<void> {

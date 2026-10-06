@@ -8,7 +8,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
-import { ArchiveService } from './archive';
+import { ArchiveService, type ArchiveTask, type ArchiveTaskChange } from './archive';
 import { authGate } from './auth';
 import { SubtitleAutoRepair, SubtitleBackfill, missingTargets } from './backfill';
 import { Autopilot, AutopilotError } from './autopilot';
@@ -23,7 +23,7 @@ import { HostGuard } from './hostguard';
 import { DEFAULT_MIN_HEIGHT, previewScrape } from './stream';
 import { configureScraper, providerCatalog, targetFromEmbedUrl } from './providers';
 import { queueStats } from './queue';
-import { R2Client } from './r2';
+import { DEFAULT_PRESIGN_SECONDS, R2Client } from './r2';
 import { RelayHub } from './relay';
 import { Store, type Job, type JobChangeKind, type JobSource, type JobTarget } from './store';
 import { TmdbClient, TmdbError, lookupTmdb } from './tmdb';
@@ -285,6 +285,8 @@ function settingsView() {
       endpoint: config.r2 ? config.r2.endpoint ?? `https://${config.r2.accountId}.r2.cloudflarestorage.com` : null,
       publicBase: config.r2?.publicBase ?? null,
       keepBunny: config.r2?.keepBunny ?? false,
+      // Playback is served through the dashboard, so the TTL is worth showing.
+      urlTtl: config.r2?.urlTtl ?? DEFAULT_PRESIGN_SECONDS,
       auto: store.settings.archiveToR2 !== false,
     },
     limits: { maxAccounts: 30, perAccountConcurrency: 10, maxUploadBytes: MAX_UPLOAD_BYTES },
@@ -1016,13 +1018,18 @@ app.get('/api/events', (req, res) => {
     send('catalog', { size: catalog.size, revision: catalog.revision, stats: catalog.stats() });
   };
 
+  const liveArchive = (): ArchiveTask[] => archive.list().filter((task) => task.status === 'queued' || task.status === 'active');
+
   // `retry` tells the browser how long to wait before reconnecting on its own.
   write('retry: 3000\n\n');
-  send('hello', { at: new Date().toISOString(), stats: currentStats(), catalog: catalog.size });
+  send('hello', { at: new Date().toISOString(), stats: currentStats(), catalog: catalog.size, archive: liveArchive() });
 
   // One pending entry per job, so a burst of progress ticks collapses to the
-  // latest state of each row rather than a burst of messages.
+  // latest state of each row rather than a burst of messages. Archive tasks are
+  // gathered the same way and for the same reason: a multi-gigabyte upload
+  // reports its bytes hundreds of times, and only its latest state matters.
   const pending = new Map<string, { kind: JobChangeKind; job: Job }>();
+  const pendingArchive = new Map<string, { kind: ArchiveTaskChange; task: ArchiveTask }>();
   let flushTimer: NodeJS.Timeout | undefined;
   const flush = (): void => {
     flushTimer = undefined;
@@ -1031,16 +1038,27 @@ app.get('/api/events', (req, res) => {
       pending.clear();
       send('jobs', { jobs: deltas });
     }
+    if (pendingArchive.size > 0) {
+      const tasks = [...pendingArchive.values()].map((entry) => ({ kind: entry.kind, task: entry.task }));
+      pendingArchive.clear();
+      send('archive', { tasks });
+    }
     pushStats();
     pushCatalog();
+  };
+  const scheduleFlush = (): void => {
+    if (flushTimer) return;
+    flushTimer = setTimeout(flush, LIVE_FLUSH_MS);
+    flushTimer.unref?.();
   };
 
   const unsubscribe = store.onJobChange((job, kind) => {
     pending.set(job.id, { kind, job });
-    if (!flushTimer) {
-      flushTimer = setTimeout(flush, LIVE_FLUSH_MS);
-      flushTimer.unref?.();
-    }
+    scheduleFlush();
+  });
+  const unsubscribeArchive = archive.onTaskChange((task, kind) => {
+    pendingArchive.set(task.key, { kind, task });
+    scheduleFlush();
   });
 
   const heartbeat = setInterval(() => write(': ping\n\n'), LIVE_HEARTBEAT_MS);
@@ -1052,6 +1070,7 @@ app.get('/api/events', (req, res) => {
     clearInterval(heartbeat);
     if (flushTimer) clearTimeout(flushTimer);
     unsubscribe();
+    unsubscribeArchive();
     res.end();
   };
   req.on('close', close);
@@ -1116,21 +1135,100 @@ app.delete('/api/catalog/:key', (req, res) => {
 
 /* ---------------------------- R2 archive ---------------------------- */
 
-/** Which published titles still have a Bunny copy waiting to be archived. */
+/**
+ * What is waiting to be archived, what is moving right now, and how far along.
+ *
+ * `candidates` is what is left to copy out; `verify` and `restore` are what the
+ * bucket already holds and could be re-checked or put back; `tasks` is what the
+ * queue knows — queued, moving, and the recent outcomes — which is what the
+ * Library renders progress from on a fresh page load, before any event arrives.
+ */
 app.get('/api/archive', (_req, res) => {
-  res.json(archive.preview());
+  res.json({
+    ...archive.preview(),
+    verify: archive.verifyCandidates(),
+    restore: archive.restoreCandidates(),
+    repair: archive.repairCandidates(),
+    busy: archive.busy,
+    tasks: archive.list(),
+  });
 });
 
 /**
- * Archive now: the picked titles, or the oldest candidates when none were
- * picked. One at a time, because every title here is a multi-gigabyte download.
+ * Queue an archive: the picked titles, or the oldest candidates when none were
+ * picked.
+ *
+ * It answers as soon as they are in line. The copying happens on the archive's
+ * own queue and its progress is streamed on `/api/events`, because moving
+ * several gigabytes must not hold an HTTP request — or a browser tab — open.
  */
-app.post('/api/archive', handle(async (req, res) => {
+app.post('/api/archive', (req, res) => {
   const body = (req.body ?? {}) as Record<string, unknown>;
   const keys = Array.isArray(body.keys) ? body.keys.filter((key): key is string => typeof key === 'string') : [];
   const limit = Math.max(1, Math.min(50, Math.floor(Number(body.limit ?? 10)) || 10));
-  res.json(await archive.archiveKeys(keys, limit));
-}));
+  res.json(archive.enqueueKeys(keys, limit));
+});
+
+/**
+ * Queue a verification pass: re-read every manifest in R2 and re-hash what it
+ * lists against the bucket.
+ *
+ * Like an archive, it answers as soon as the titles are in line: a folder of
+ * several gigabytes takes minutes to re-read, and a request must not hold it.
+ */
+app.post('/api/archive/verify', (req, res) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const keys = Array.isArray(body.keys) ? body.keys.filter((key): key is string => typeof key === 'string') : [];
+  const limit = Math.max(1, Math.min(50, Math.floor(Number(body.limit ?? 25)) || 25));
+  res.json(archive.enqueueKeys(keys, limit, 'verify'));
+});
+
+/**
+ * Queue a restore: stream an archived title back out of R2 into a fresh Bunny
+ * video, captions included.
+ *
+ * The archive in R2 is left alone, so this is a copy rather than a move.
+ */
+app.post('/api/archive/restore', (req, res) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const keys = Array.isArray(body.keys) ? body.keys.filter((key): key is string => typeof key === 'string') : [];
+  const limit = Math.max(1, Math.min(10, Math.floor(Number(body.limit ?? 1)) || 1));
+  res.json(archive.enqueueKeys(keys, limit, 'restore'));
+});
+
+/**
+ * Play an archived title straight out of R2.
+ *
+ * Answers with a redirect to a short-lived signed URL for the title's best
+ * archived rendition, which is what lets the bucket stay private: the browser
+ * gets a link that works for minutes, not a credential and not a public object.
+ * A player follows the redirect and can still send `Range` requests, because
+ * only `host` is signed.
+ *
+ * Nothing is buffered here — the bytes go from R2 to the player, not through the
+ * dashboard — so a feature-length film costs this process nothing but a hop.
+ */
+/**
+ * Queue a targeted repair: mend just the objects the last check flagged.
+ *
+ * Each one is re-fetched from the pull zone it came from and put back only if it
+ * hashes to what the manifest recorded. When Bunny no longer holds the video the
+ * repair falls back to the bucket's intact copies — playback moves onto the
+ * tallest surviving rendition and the objects nothing can supply are dropped from
+ * the record. It runs on the archive's queue like everything else.
+ */
+app.post('/api/archive/repair', (req, res) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const keys = Array.isArray(body.keys) ? body.keys.filter((key): key is string => typeof key === 'string') : [];
+  const limit = Math.max(1, Math.min(25, Math.floor(Number(body.limit ?? 5)) || 5));
+  res.json(archive.enqueueKeys(keys, limit, 'repair'));
+});
+
+app.get('/api/archive/play/:key', (req, res) => {
+  const media = archive.media(catalog.get(param(req, 'key')));
+  if (!media) return void res.status(404).json({ error: 'this title has no archived rendition to play' });
+  res.redirect(302, media.url);
+});
 
 /* ------------------------- subtitle backfill ------------------------- */
 

@@ -593,3 +593,37 @@ button.link {
     min-width: 0;
   }
 }
+
+/*
+ * The archive column of a Library row: a thin filled bar with the percentage
+ * beside it, while the title is being copied into R2.
+ */
+.archive-progress {
+  display: inline-block;
+  width: 84px;
+  margin-left: 8px;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.archive-progress .bar {
+  display: inline-block;
+  height: 4px;
+  min-width: 3px;
+  vertical-align: middle;
+  background: var(--line-strong);
+}
+
+.archive-progress .bar.is-active {
+  background: var(--accent);
+}
+
+.archive-progress .bar.is-failed {
+  background: var(--bad);
+}
+
+.archive-progress .label {
+  margin-left: 6px;
+  vertical-align: middle;
+  color: var(--text-dim);
+}

@@ -157,20 +157,52 @@ check(
 // — it must never look like it deleted a video without keeping a copy.
 check(
   'settings report the R2 archive as unconfigured',
-  result.json?.archive?.configured === false && result.json?.archive?.auto === false,
-  `configured ${result.json?.archive?.configured}, auto ${result.json?.archive?.auto}`,
+  result.json?.archive?.configured === false && result.json?.archive?.auto === false && typeof result.json?.archive?.urlTtl === 'number',
+  `configured ${result.json?.archive?.configured}, auto ${result.json?.archive?.auto}, ttl ${result.json?.archive?.urlTtl}`,
 );
 result = await request('GET', '/api/archive');
 check(
-  'the archive preview answers with no destination configured',
-  result.status === 200 && result.json?.configured === false && Array.isArray(result.json?.candidates),
-  `configured ${result.json?.configured}, ${(result.json?.candidates ?? []).length} candidate(s)`,
+  'the archive queue answers with no destination configured',
+  result.status === 200 && result.json?.configured === false && Array.isArray(result.json?.candidates) && Array.isArray(result.json?.tasks) && result.json?.busy === 0,
+  `configured ${result.json?.configured}, ${(result.json?.candidates ?? []).length} candidate(s), ${(result.json?.tasks ?? []).length} task(s)`,
+);
+result = await request('GET', '/api/archive');
+check(
+  'the preview says what could be re-checked, mended or put back',
+  Array.isArray(result.json?.verify) && Array.isArray(result.json?.restore) && Array.isArray(result.json?.repair),
+  `${(result.json?.verify ?? []).length} checkable, ${(result.json?.repair ?? []).length} mendable, ${(result.json?.restore ?? []).length} restorable`,
 );
 result = await request('POST', '/api/archive', { limit: 5 });
 check(
-  'archiving without a destination does nothing rather than half of it',
-  result.status === 200 && result.json?.configured === false && (result.json?.results ?? []).length === 0,
-  `configured ${result.json?.configured}, ${(result.json?.results ?? []).length} line(s)`,
+  'queueing an archive with nowhere to write queues nothing',
+  result.status === 200 && result.json?.configured === false && (result.json?.queued ?? []).length === 0,
+  `configured ${result.json?.configured}, queued ${(result.json?.queued ?? []).length}`,
+);
+result = await request('POST', '/api/archive/verify', { limit: 5 });
+check(
+  'a verification pass with nothing to read queues nothing',
+  result.status === 200 && result.json?.configured === false && (result.json?.queued ?? []).length === 0,
+  `configured ${result.json?.configured}, queued ${(result.json?.queued ?? []).length}`,
+);
+result = await request('POST', '/api/archive/restore', { limit: 1 });
+check(
+  'a restore with no destination queues nothing',
+  result.status === 200 && result.json?.configured === false && (result.json?.queued ?? []).length === 0,
+  `configured ${result.json?.configured}, queued ${(result.json?.queued ?? []).length}`,
+);
+result = await request('POST', '/api/archive/repair', { limit: 5 });
+check(
+  'a repair with nothing flagged queues nothing',
+  result.status === 200 && result.json?.configured === false && (result.json?.queued ?? []).length === 0,
+  `configured ${result.json?.configured}, queued ${(result.json?.queued ?? []).length}`,
+);
+// Playback is the dashboard's own gate: with nothing archived there is no
+// signed URL to hand out, and that must read as a 404 rather than a crash.
+result = await request('GET', '/api/archive/play/movie%3A27205');
+check(
+  'playing a title that is not in R2 answers 404',
+  result.status === 404 && /no archived rendition/.test(result.json?.error ?? ''),
+  `status ${result.status}`,
 );
 result = await request('PUT', '/api/settings', { archiveToR2: true });
 check(
@@ -262,6 +294,13 @@ check(
   'the greeting carries the queue counters and the catalogue size',
   typeof greet?.data?.stats?.total === 'number' && typeof greet?.data?.catalog === 'number',
   JSON.stringify(greet?.data ?? null),
+);
+// The archive is a real queue too, so a fresh subscriber is handed its current
+// task list up front (empty here — smoke has no R2 destination to write to).
+check(
+  'the greeting carries the archive queue, empty with nowhere to write',
+  Array.isArray(greet?.data?.archive) && greet.data.archive.length === 0,
+  JSON.stringify(greet?.data?.archive ?? null),
 );
 
 result = await request('POST', '/api/jobs/remote', {

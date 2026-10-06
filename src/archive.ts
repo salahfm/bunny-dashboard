@@ -17,6 +17,43 @@
  * downloadable MP4 at all is never deleted (there would be nothing left to
  * play). A failed archive leaves Bunny exactly as it was.
  *
+ * A title is a *task*, not a request. Moving several gigabytes takes minutes, so
+ * nothing here runs inside an HTTP call: `enqueue` puts a title in line and
+ * returns immediately, one title is worked on at a time, and every stage, byte
+ * and object count is published as `ArchiveTask` updates that the server streams
+ * to the browser. The task state is deliberately in memory — it describes work
+ * in progress, and a restart simply means the title is offered again — while
+ * what actually happened is written to the catalogue entry at the end.
+ *
+ * Each task walks five stages a UI can name: `checking` (read the video back
+ * from Bunny), `scanning` (HEAD every asset to measure the job), `uploading`
+ * (download, upload and verify one asset at a time, in bytes), `manifest`
+ * (write the index last) and `deleting` (let Bunny forget it).
+ *
+ * The same queue also carries two operations that work *on* an archive rather
+ * than building one, because a folder of several gigabytes cannot be checked or
+ * put back inside a request either:
+ *
+ *   verify    re-reads `manifest.json` from the bucket and re-hashes every
+ *             object it lists, so "is the copy still intact?" is answered by the
+ *             bytes themselves rather than by a HEAD that only proves they exist
+ *   restore   streams the archived rendition back out of R2 into a fresh Bunny
+ *             video, re-attaches the captions, and points the catalogue at it
+ *
+ * A task therefore carries an `operation`, and the stages it walks depend on it:
+ * an archive ends in `deleting`, a verify in `verifying`, a restore in
+ * `downloading` then `uploading` (into Bunny), and a repair in `repairing`.
+ *
+ * A repair is deliberately narrow. It never re-archives the title: it takes the
+ * objects a verification pass flagged, fetches each one again from the pull zone
+ * it came from, and only overwrites the stored object once the fresh bytes hash
+ * to exactly what the manifest recorded. When Bunny no longer holds the video,
+ * there is nothing to fetch from — so the repair falls back to what the bucket
+ * still has: playback moves to the tallest *intact* rendition, the objects
+ * nothing can supply are dropped from the record, and the manifest is rewritten
+ * so the folder matches the bucket again. What was lost is recorded, never
+ * quietly forgotten.
+ *
  * The layout is deliberately readable, because a bucket full of `video-<guid>`
  * is not something anyone can sort:
  *
@@ -35,11 +72,15 @@
  * complete archive" means, so a half-finished run cannot be mistaken for a
  * finished one.
  */
-import { bunnyAssets, mapBunnyStatus, MAX_SEEK_SPRITES, pullZoneBase, seekSpriteUrl, type BunnyClient, type BunnyVideo } from './bunny';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { bunnyAssets, mapBunnyStatus, MAX_SEEK_SPRITES, playbackUrlFor, pullZoneBase, seekSpriteUrl, type BunnyClient, type BunnyVideo } from './bunny';
 import type { Catalog, CatalogArchive, CatalogArchiveObject, CatalogEntry } from './catalog';
 import type { AppConfig } from './config';
 import { fetchWithPolicy } from './net';
-import { R2Client, type R2UploadResult } from './r2';
+import { clampPresignExpiry, R2Client, type R2UploadResult } from './r2';
 
 /** How long one asset download may take: a feature-length MP4 can be big. */
 const ASSET_TIMEOUT_MS = 30 * 60_000;
@@ -53,6 +94,9 @@ export const ARCHIVE_ATTEMPTS = 3;
 /** The wait before the next attempt, doubled each time (a CDN hiccup clears). */
 export const ARCHIVE_RETRY_MS = 5 * 60_000;
 
+/** How many finished tasks the dashboard keeps around to show. */
+const FINISHED_TASKS_KEPT = 50;
+
 /** One file planned for the archive, before anything has been uploaded. */
 export interface PlannedAsset {
   /** Where it goes inside the title's folder, e.g. `video/1080p.mp4`. */
@@ -61,6 +105,88 @@ export interface PlannedAsset {
   /** The pull-zone URL to download it from. */
   url: string;
   contentType: string;
+}
+
+/** A planned asset that was found on the pull zone, with the size it declared. */
+export interface ProbedAsset extends PlannedAsset {
+  /** `undefined` when the CDN would not answer a HEAD with a length. */
+  bytes?: number;
+}
+
+/**
+ * Where a title's archive has got to.
+ *
+ * `status` is the queue state and `stage` is what is happening inside it, kept
+ * apart because a task waiting out a retry is *queued* (it will run again) while
+ * being at no stage in particular.
+ */
+export type ArchiveStatus = 'queued' | 'active' | 'done' | 'failed' | 'skipped';
+
+export type ArchiveStage =
+  | 'queued'
+  | 'checking'
+  | 'scanning'
+  | 'uploading'
+  | 'manifest'
+  | 'deleting'
+  | 'verifying'
+  | 'downloading'
+  | 'repairing'
+  | 'done'
+  | 'failed'
+  | 'skipped';
+
+/**
+ * What a task is doing: building an archive, checking one, putting one back, or
+ * mending the objects a check found broken. All four move files across the same
+ * two hosts, so they share one queue, one task shape and one stream.
+ */
+export type ArchiveOperation = 'archive' | 'verify' | 'restore' | 'repair';
+
+export type ArchiveTaskChange = 'added' | 'updated' | 'removed';
+
+/** One title's archive, as the queue and the browser see it. */
+export interface ArchiveTask {
+  /** The catalogue key, which is what every update is addressed by. */
+  key: string;
+  /** A readable name, so a progress row needs no second lookup. */
+  title: string;
+  kind: 'movie' | 'episode';
+  /** Whether this task copies out, checks, or puts back. */
+  operation: ArchiveOperation;
+  status: ArchiveStatus;
+  stage: ArchiveStage;
+  /** The asset being moved right now, e.g. `video/1080p.mp4`. */
+  asset?: string;
+  /** How many assets the scan found, and how many are already stored. */
+  assets: number;
+  stored: number;
+  /** Bytes handed to R2 so far, against the size of the whole plan. */
+  bytes: number;
+  totalBytes: number;
+  percent: number;
+  /** How many times this title has been attempted. */
+  attempts: number;
+  /** For a queued task: its place in line (1 = next to run). */
+  position?: number;
+  startedAt?: string;
+  updatedAt: string;
+  finishedAt?: string;
+  /** Why it stopped short, or what it is waiting for. */
+  note?: string;
+  /** The failure that ended it, when one did. */
+  error?: string;
+  removedFromBunny?: boolean;
+  /** For a verify: how many objects have been re-read and hashed so far. */
+  checked?: number;
+  /** For a verify: the objects the pass found missing or changed. */
+  bad?: string[];
+  /** For a restore: the Bunny video it put the title back into. */
+  restoredVideoId?: string;
+  /** For a repair: the objects it rewrote in the bucket, from Bunny. */
+  repaired?: string[];
+  /** For a repair: the objects nothing could supply, dropped from the record. */
+  dropped?: string[];
 }
 
 /**
@@ -84,6 +210,12 @@ export function archiveSlug(value: string | undefined, fallback: string): string
 
 function pad(value: number | undefined): string {
   return String(Math.max(0, Math.floor(value ?? 0))).padStart(2, '0');
+}
+
+/** A readable label for a title, used for progress rows and log lines. */
+export function archiveLabel(entry: CatalogEntry): string {
+  if (entry.kind === 'episode') return `${entry.title} S${pad(entry.season)}E${pad(entry.episode)}`;
+  return `${entry.title}${entry.year ? ` (${entry.year})` : ''}`;
 }
 
 /** The folder every asset of one title is filed under. */
@@ -114,7 +246,7 @@ export function captionLanguages(entry: CatalogEntry, video: BunnyVideo): string
  * What a finished video's folder will contain, before anything is downloaded.
  *
  * The seek sprites are left out: how many Bunny generated is not reported
- * anywhere, so they are discovered by probing (`spriteIndexes`) rather than
+ * anywhere, so they are discovered by probing (`seekSpriteUrl`) rather than
  * guessed into the plan.
  */
 export function planAssets(video: BunnyVideo, base: string, captions: string[]): PlannedAsset[] {
@@ -144,21 +276,123 @@ export function planAssets(video: BunnyVideo, base: string, captions: string[]):
   return planned;
 }
 
+/**
+ * The height named at the end of a rendition key (`video/1080p.mp4` → 1080).
+ * Used to put the best rendition back first; an unreadable name sorts last.
+ */
+function renditionHeight(name: string): number {
+  const match = /(\d{3,4})p?\.[a-z0-9]+$/i.exec(name);
+  const height = Number(match?.[1] ?? Number.NaN);
+  return Number.isFinite(height) ? height : 0;
+}
+
+/**
+ * The archived file that *is* the title: the one a restore uploads back into
+ * Bunny and the one the dashboard streams for playback.
+ *
+ * The MP4 renditions are preferred, tallest first: they are the encoded video
+ * Bunny itself produced, so they play directly and put back without a second
+ * transcode pass being the only copy. `original` is the fallback for an archive
+ * whose renditions are gone, and `undefined` means there is nothing to play at
+ * all — a folder of thumbnails is neither a restorable title nor a playable one.
+ */
+export function playableObject(objects: CatalogArchiveObject[] | undefined): CatalogArchiveObject | undefined {
+  const videos = (objects ?? []).filter((object) => object.kind === 'video');
+  if (videos.length) return [...videos].sort((a, b) => renditionHeight(b.name) - renditionHeight(a.name))[0];
+  return (objects ?? []).find((object) => object.kind === 'original');
+}
+
+/**
+ * The best intact copy left in the folder: the tallest object that is *not* one
+ * of the ones a check flagged.
+ *
+ * This is what a repair falls back to when Bunny no longer holds the video — a
+ * title whose 1080p rendition rotted can still play from its 720p neighbour,
+ * which is a real repair rather than a note about one.
+ */
+export function intactPlayableObject(objects: CatalogArchiveObject[] | undefined, flagged: ReadonlySet<string>): CatalogArchiveObject | undefined {
+  return playableObject((objects ?? []).filter((object) => !flagged.has(object.name)));
+}
+
+/** The names a verification pass flagged as missing or changed. */
+export function flaggedObjects(verify: CatalogArchive['verify'] | undefined): string[] {
+  if (!verify) return [];
+  return [...new Set([...(verify.missing ?? []), ...(verify.mismatched ?? [])])];
+}
+
+/**
+ * The dashboard's own route for an archived title's playback.
+ *
+ * Relative on purpose: the record is data, and the dashboard may be reached on
+ * any hostname. What that route answers with is a fresh signed URL, so this link
+ * never carries a credential and never expires.
+ */
+export function playbackRoute(key: string): string {
+  return `/api/archive/play/${encodeURIComponent(key)}`;
+}
+
+/** The language code inside a stored caption key (`subtitles/en.vtt` → `en`). */
+export function captionLanguage(name: string): string {
+  const base = name.split('/').pop() ?? name;
+  return base.replace(/\.[a-z0-9]+$/i, '').trim().toLowerCase() || base.toLowerCase();
+}
+
+/** One sentence describing a verification pass, for a task note and a log line. */
+function verifyNote(verify: NonNullable<CatalogArchive['verify']>): string {
+  if (verify.ok) return `every one of ${verify.checked} object(s) still hashes to what the manifest recorded`;
+  const parts: string[] = [];
+  if (verify.missing.length) parts.push(`${verify.missing.length} missing (${verify.missing.slice(0, 3).join(', ')})`);
+  if (verify.mismatched.length) parts.push(`${verify.mismatched.length} changed (${verify.mismatched.slice(0, 3).join(', ')})`);
+  return `${verify.checked} object(s) checked — ${parts.join('; ')}`;
+}
+
 export interface ArchiveOutcome {
-  status: 'archived' | 'partial' | 'skipped';
+  /** `ok` finished the job, `partial` failed, `skipped` never had anything to do. */
+  status: 'ok' | 'partial' | 'skipped';
   note?: string;
   archive?: CatalogArchive;
+  /** The Bunny video a restore created. */
+  videoId?: string;
 }
 
 interface QueuedArchive {
   key: string;
   attempts: number;
+  /** Whether a failure is tried again (`false` for a titled clicked by hand). */
+  retry: boolean;
+  operation: ArchiveOperation;
 }
 
-/** What a manual batch of archives did, one line per title. */
+/** One title the Library may offer for an operation, without doing any work. */
+export interface ArchiveCandidate {
+  key: string;
+  title: string;
+  kind: string;
+  videoId?: string;
+  /** For a verification candidate: how many objects its manifest lists. */
+  objects?: number;
+  bytes?: number;
+  verifiedAt?: string;
+  /** For a verification candidate: what the last pass found. */
+  verified?: boolean;
+  restoredAt?: string;
+  /** For a repair candidate: whether Bunny still holds the video to re-fetch from. */
+  fromBunny?: boolean;
+  /** For a repair candidate: the intact rendition playback would move onto. */
+  switchedTo?: string;
+}
+
+/** What a manual batch did, one line per title. */
 export interface ArchiveBatchReport {
   configured: boolean;
   results: string[];
+}
+
+/** What a manual batch queued, before any of it has run. */
+export interface ArchiveEnqueueReport {
+  configured: boolean;
+  queued: ArchiveTask[];
+  skipped: Array<{ key: string; reason: string }>;
 }
 
 export interface ArchiveDeps {
@@ -183,14 +417,28 @@ export interface ArchiveDeps {
   retryDelayMs?: number;
 }
 
+/** The bytes of a plan that are known: an unmeasurable asset counts as zero. */
+function planBytes(assets: ProbedAsset[]): number {
+  return assets.reduce((total, asset) => total + (asset.bytes ?? 0), 0);
+}
+
+function percentOf(task: ArchiveTask): number {
+  if (task.status === 'done') return 100;
+  if (task.totalBytes <= 0) return 0;
+  // 99 until it is actually done: a plan whose sizes were partly unreported must
+  // never read as finished while a byte is still moving.
+  return Math.max(0, Math.min(99, Math.round((task.bytes / task.totalBytes) * 100)));
+}
+
 /**
  * Copies finished titles into R2 and, once they verify, lets Bunny forget them.
  *
  * It has the same shape as the subtitle repair: `consider(entry)` is called from
  * the publish hook with the record a finished job just wrote, work runs one
  * title at a time, and a failure is retried a few minutes later rather than
- * reported and dropped. Nothing is persisted — the catalogue entry the archive
- * writes *is* the record of what happened.
+ * reported and dropped. What it adds is that every title is a *task* with a
+ * status and a byte count, published to listeners as it moves, so a browser can
+ * watch gigabytes move without anything being held open.
  */
 export class ArchiveService {
   private deps: ArchiveDeps;
@@ -198,6 +446,9 @@ export class ArchiveService {
   private timers = new Map<string, NodeJS.Timeout>();
   /** Keys queued, waiting on a retry, or in flight — never two of them at once. */
   private active = new Set<string>();
+  /** Every task the dashboard knows about, by catalogue key. */
+  private tasks = new Map<string, ArchiveTask>();
+  private listeners = new Set<(task: ArchiveTask, change: ArchiveTaskChange) => void>();
   private draining: Promise<void> | undefined;
   private stopped = false;
   private logLine: (message: string) => void;
@@ -216,6 +467,99 @@ export class ArchiveService {
     return this.deps.config.r2?.prefix ?? 'archive';
   }
 
+  private nowIso(): string {
+    return (this.deps.now?.() ?? new Date()).toISOString();
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Task state                                                        */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * Watch the queue, the way the store's own change hook is watched.
+   *
+   * The live event stream is the subscriber: it is told *which* title moved, so
+   * it can push that one row instead of the browser re-reading everything.
+   */
+  onTaskChange(listener: (task: ArchiveTask, change: ArchiveTaskChange) => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  /** A listener that throws must never be able to break an archive. */
+  private notify(task: ArchiveTask, change: ArchiveTaskChange): void {
+    for (const listener of [...this.listeners]) {
+      try {
+        listener(task, change);
+      } catch (error) {
+        console.error('[archive] a task listener failed:', error);
+      }
+    }
+  }
+
+  /** Every task, most recently moved first. */
+  list(): ArchiveTask[] {
+    return [...this.tasks.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  task(key: string): ArchiveTask | undefined {
+    return this.tasks.get(key);
+  }
+
+  /** How many titles are queued or moving — the "N archiving" in the Library. */
+  get busy(): number {
+    return [...this.tasks.values()].filter((task) => task.status === 'queued' || task.status === 'active').length;
+  }
+
+  /** Records a patch and publishes it. */
+  private touch(task: ArchiveTask, patch: Partial<ArchiveTask> = {}, change: ArchiveTaskChange = 'updated'): ArchiveTask {
+    Object.assign(task, patch, { updatedAt: this.nowIso() });
+    task.percent = percentOf(task);
+    if (task.status === 'queued') task.position = Math.max(1, this.queue.findIndex((item) => item.key === task.key) + 1) || undefined;
+    else task.position = undefined;
+    this.tasks.set(task.key, task);
+    this.prune();
+    this.notify(task, change);
+    return task;
+  }
+
+  private createTask(entry: CatalogEntry, operation: ArchiveOperation): ArchiveTask {
+    const task: ArchiveTask = {
+      key: entry.key,
+      title: archiveLabel(entry),
+      kind: entry.kind,
+      operation,
+      status: 'queued',
+      stage: 'queued',
+      assets: 0,
+      stored: 0,
+      bytes: 0,
+      totalBytes: 0,
+      percent: 0,
+      attempts: 0,
+      updatedAt: this.nowIso(),
+    };
+    this.tasks.set(entry.key, task);
+    return task;
+  }
+
+  /** Keeps the finished tasks from growing without bound over a long run. */
+  private prune(): void {
+    const finished = [...this.tasks.values()]
+      .filter((task) => task.status === 'done' || task.status === 'failed' || task.status === 'skipped')
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    for (const task of finished.slice(FINISHED_TASKS_KEPT)) {
+      this.tasks.delete(task.key);
+      this.notify(task, 'removed');
+    }
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* The queue                                                        */
+  /* ---------------------------------------------------------------- */
+
   /**
    * Whether this entry still has something to archive: a Bunny video, an
    * account whose pull zone can be read, and no finished archive of that same
@@ -227,8 +571,38 @@ export class ArchiveService {
     return !(entry.archive?.complete && entry.archive.videoId === entry.videoId);
   }
 
+  /**
+   * Whether this entry has an archive worth re-reading: a manifest to check
+   * against and objects listed inside it.
+   */
+  verifyEligible(entry: CatalogEntry): boolean {
+    return Boolean(entry.archive?.manifestKey && (entry.archive.objects?.length ?? 0) > 0);
+  }
+
+  /**
+   * Whether this entry can be put back: an archived rendition to upload, and an
+   * account that is still in the store to upload it into.
+   */
+  restoreEligible(entry: CatalogEntry): boolean {
+    if (!entry.archive || !playableObject(entry.archive.objects)) return false;
+    return this.deps.client(entry) !== undefined;
+  }
+
+  /**
+   * Whether this entry has something to mend: a check that failed, naming at
+   * least one object.
+   *
+   * A repair is only ever offered *because* a verification pass found something
+   * wrong, so there is no guessing about what needs mending — the flagged names
+   * are the work list, and the manifest says what each one should be.
+   */
+  repairEligible(entry: CatalogEntry): boolean {
+    if (!entry.archive) return false;
+    return entry.archive.verify?.ok === false && flaggedObjects(entry.archive.verify).length > 0;
+  }
+
   /** What the Library asks before offering an archive: which titles are left. */
-  preview(): { configured: boolean; enabled: boolean; candidates: Array<{ key: string; title: string; kind: string; videoId?: string }> } {
+  preview(): { configured: boolean; enabled: boolean; candidates: ArchiveCandidate[] } {
     const candidates = this.deps.catalog
       .all()
       .filter((entry) => this.eligible(entry))
@@ -241,8 +615,122 @@ export class ArchiveService {
     return { configured: this.configured, enabled: this.enabled(), candidates };
   }
 
+  /** What is in R2 and could be re-checked, with what the last pass found. */
+  verifyCandidates(): ArchiveCandidate[] {
+    return this.deps.catalog
+      .all()
+      .filter((entry) => this.verifyEligible(entry))
+      .map((entry) => ({
+        key: entry.key,
+        title: entry.title,
+        kind: entry.kind,
+        objects: entry.archive?.objects.length ?? 0,
+        bytes: entry.archive?.bytes ?? 0,
+        ...(entry.archive?.verifiedAt ? { verifiedAt: entry.archive.verifiedAt } : {}),
+        ...(entry.archive?.verify ? { verified: entry.archive.verify.ok } : {}),
+      }));
+  }
+
+  /**
+   * Whether the record says Bunny still holds the video — the one place a broken
+   * object's original bytes can come from.
+   *
+   * This is only what a *row* shows before it is pressed; the repair itself asks
+   * Bunny, because the answer can have changed since the archive was written.
+   */
+  private stillInBunny(entry: CatalogEntry): boolean {
+    return this.deps.client(entry) !== undefined && entry.archive?.removedFromBunny === false;
+  }
+
+  /** What a check found broken and could be mended, and by which route. */
+  repairCandidates(): ArchiveCandidate[] {
+    return this.deps.catalog
+      .all()
+      .filter((entry) => this.repairEligible(entry))
+      .map((entry) => {
+        const flagged = flaggedObjects(entry.archive?.verify);
+        const fromBunny = this.stillInBunny(entry);
+        const intact = intactPlayableObject(entry.archive?.objects, new Set(flagged));
+        return {
+          key: entry.key,
+          title: entry.title,
+          kind: entry.kind,
+          // What a repair could do, so the row can say so before it is pressed.
+          fromBunny,
+          objects: flagged.length,
+          ...(intact && flagged.includes(playableObject(entry.archive?.objects)?.name ?? '') ? { switchedTo: intact.name } : {}),
+        };
+      });
+  }
+
+  /** What could be put back into Bunny, and whether it already was. */
+  restoreCandidates(): ArchiveCandidate[] {
+    return this.deps.catalog
+      .all()
+      .filter((entry) => this.restoreEligible(entry))
+      .map((entry) => ({
+        key: entry.key,
+        title: entry.title,
+        kind: entry.kind,
+        ...(entry.archive?.restoredAt ? { restoredAt: entry.archive.restoredAt } : {}),
+      }));
+  }
+
+  /**
+   * A short-lived signed URL that plays an archived title straight out of R2.
+   *
+   * The dashboard is the gatekeeper: the bucket stays private, the URL is minted
+   * per request, and it stops working after `expiresIn` seconds (the configured
+   * `R2_URL_TTL`, five minutes by default). `undefined` means there is nothing to
+   * play — no destination, no archive, or a folder of stills with no rendition in
+   * it.
+   */
+  media(
+    entry: CatalogEntry | undefined,
+    options: { expiresIn?: number } = {},
+  ): { url: string; key: string; name: string; expiresIn: number } | undefined {
+    const r2 = this.deps.r2;
+    if (!r2 || !entry?.archive) return undefined;
+    const object = playableObject(entry.archive.objects);
+    if (!object) return undefined;
+    const expiresIn = clampPresignExpiry(options.expiresIn ?? this.deps.config.r2?.urlTtl);
+    return { url: r2.presign(object.key, { expiresIn }), key: object.key, name: object.name, expiresIn };
+  }
+
   enabled(): boolean {
     return this.configured && (this.deps.enabled?.() ?? true);
+  }
+
+  /** Whether this entry has anything to do for the given operation right now. */
+  private eligibleFor(entry: CatalogEntry, operation: ArchiveOperation): boolean {
+    if (operation === 'verify') return this.verifyEligible(entry);
+    if (operation === 'restore') return this.restoreEligible(entry);
+    if (operation === 'repair') return this.repairEligible(entry);
+    return this.eligible(entry);
+  }
+
+  /**
+   * Puts one title in line and returns at once. `retry` decides whether a
+   * failure comes back round; an operator clicking a button is watching, so
+   * their answer belongs on screen rather than in a queue five minutes later.
+   *
+   * `operation` picks the work — copy out, check, or put back. Only an archive
+   * honours the operator's on/off switch: a verification or a restore acts on a
+   * folder that is already there, so needing a destination is enough.
+   */
+  enqueue(entry: CatalogEntry, options: { retry?: boolean; operation?: ArchiveOperation } = {}): ArchiveTask | undefined {
+    const operation = options.operation ?? 'archive';
+    if (this.stopped) return undefined;
+    if (!this.configured) return undefined;
+    if (operation === 'archive' && !this.enabled()) return undefined;
+    if (!this.eligibleFor(entry, operation)) return undefined;
+    if (this.active.has(entry.key)) return undefined;
+    this.active.add(entry.key);
+    const task = this.createTask(entry, operation);
+    this.touch(task, { stage: 'queued' }, 'added');
+    this.queue.push({ key: entry.key, attempts: 0, retry: options.retry ?? true, operation });
+    void this.drain();
+    return task;
   }
 
   /**
@@ -251,41 +739,76 @@ export class ArchiveService {
    * archive, no destination, or the title is already queued).
    */
   consider(entry: CatalogEntry): boolean {
-    if (this.stopped) return false;
-    if (!this.enabled()) return false;
-    if (!this.eligible(entry)) return false;
-    if (this.active.has(entry.key)) return false;
-    this.active.add(entry.key);
-    this.queue.push({ key: entry.key, attempts: 0 });
+    const task = this.enqueue(entry, { retry: true });
+    if (!task) return false;
     this.logLine(`[archive] ${entry.key} finished encoding — copying it to R2 before Bunny lets it go`);
-    void this.drain();
     return true;
   }
 
+  /** The keys a batch would walk when the caller did not name any. */
+  private candidatesFor(operation: ArchiveOperation): ArchiveCandidate[] {
+    if (operation === 'verify') return this.verifyCandidates();
+    if (operation === 'restore') return this.restoreCandidates();
+    if (operation === 'repair') return this.repairCandidates();
+    return this.preview().candidates;
+  }
+
+  /** Why a title the operator named cannot be queued for this operation. */
+  private skipReason(entry: CatalogEntry, operation: ArchiveOperation): string {
+    if (operation === 'verify') return this.verifyEligible(entry) ? 'nothing to check' : 'this title has no archive to check';
+    if (operation === 'restore') return this.restoreEligible(entry) ? 'nothing to restore' : 'nothing in R2 can be put back into Bunny';
+    if (operation === 'repair') return this.repairEligible(entry) ? 'nothing to mend' : 'the last check on this title found nothing to mend';
+    return this.enabled() ? 'nothing left to archive' : 'archiving is switched off';
+  }
+
   /**
-   * Archives the given keys now and reports what happened to each.
+   * Queues the given keys — or the oldest candidates when none were given — and
+   * answers immediately with what went into the queue and what did not.
    *
-   * The manual path: same worker as the automatic one, run one key at a time so
-   * a batch cannot open a dozen multi-gigabyte downloads at once.
+   * This is what the API calls: the work itself runs on the queue, so a click
+   * that moves ten gigabytes does not hold a request open for an hour. The same
+   * shape serves all three operations; only what the queue then does differs.
    */
-  async archiveKeys(keys: string[], limit = 25): Promise<ArchiveBatchReport> {
-    if (!this.configured) return { configured: false, results: [] };
-    const wanted = keys.length ? keys : this.preview().candidates.map((candidate) => candidate.key);
-    const results: string[] = [];
+  enqueueKeys(keys: string[], limit = 25, operation: ArchiveOperation = 'archive'): ArchiveEnqueueReport {
+    if (!this.configured) return { configured: false, queued: [], skipped: [] };
+    const wanted = keys.length ? keys : this.candidatesFor(operation).map((candidate) => candidate.key);
+    const queued: ArchiveTask[] = [];
+    const skipped: Array<{ key: string; reason: string }> = [];
     for (const key of wanted.slice(0, Math.max(1, limit))) {
       const entry = this.deps.catalog.get(key);
       if (!entry) {
-        results.push(`${key}: no such catalogue entry`);
+        skipped.push({ key, reason: 'no such catalogue entry' });
         continue;
       }
       if (this.active.has(key)) {
-        results.push(`${key}: already archiving`);
+        const busy =
+          operation === 'archive' ? 'already archiving' : operation === 'verify' ? 'already checking this title' : operation === 'restore' ? 'already restoring this title' : 'already mending this title';
+        skipped.push({ key, reason: busy });
         continue;
       }
-      // An explicit click is not retried: the operator is watching, and the
-      // reason belongs on screen rather than in a queue five minutes from now.
-      const outcome = await this.execute(entry, this.budget);
-      results.push(`${key}: ${outcome.status}${outcome.note ? ` — ${outcome.note}` : ''}`);
+      const task = this.enqueue(entry, { retry: false, operation });
+      if (task) queued.push(task);
+      else skipped.push({ key, reason: this.skipReason(entry, operation) });
+    }
+    return { configured: true, queued, skipped };
+  }
+
+  /**
+   * Queues the given keys and waits for the queue to finish, answering one line
+   * per title — the shape the tests use, and the shape a caller who genuinely
+   * wants to block would want.
+   */
+  async archiveKeys(keys: string[], limit = 25, timeoutMs = 30 * 60_000): Promise<ArchiveBatchReport> {
+    if (!this.configured) return { configured: false, results: [] };
+    const report = this.enqueueKeys(keys, limit);
+    const results = report.skipped.map((entry) => `${entry.key}: skipped — ${entry.reason}`);
+    if (report.queued.length) {
+      await this.idle(timeoutMs);
+      for (const task of report.queued) {
+        const settled = this.tasks.get(task.key) ?? task;
+        const outcome = settled.status === 'done' ? 'archived' : settled.status === 'failed' ? 'partial' : 'skipped';
+        results.push(`${settled.key}: ${outcome}${settled.note ? ` — ${settled.note}` : ''}`);
+      }
     }
     return { configured: true, results };
   }
@@ -297,7 +820,7 @@ export class ArchiveService {
       while (this.queue.length) {
         const item = this.queue.shift();
         if (!item) break;
-        await this.execute(this.deps.catalog.get(item.key), item.attempts + 1);
+        await this.execute(this.deps.catalog.get(item.key), item);
       }
     })().finally(() => {
       this.draining = undefined;
@@ -313,28 +836,85 @@ export class ArchiveService {
    * destination may simply have been unreachable, so it is tried again after a
    * pause, and after the budget it is logged and forgotten.
    */
-  private async execute(entry: CatalogEntry | undefined, attempt: number): Promise<ArchiveOutcome> {
+  private async execute(entry: CatalogEntry | undefined, item: QueuedArchive): Promise<ArchiveOutcome> {
     if (!entry) return { status: 'skipped', note: 'the catalogue no longer has this title' };
+    const attempt = item.attempts + 1;
     this.active.add(entry.key);
+    const task = this.tasks.get(entry.key) ?? this.createTask(entry, item.operation);
+    // A retry starts the counters over: the bytes from the failed attempt were
+    // not stored, and leaving them in would make the bar lie.
+    this.touch(task, {
+      operation: item.operation,
+      status: 'active',
+      stage: 'checking',
+      asset: undefined,
+      assets: 0,
+      stored: 0,
+      bytes: 0,
+      totalBytes: 0,
+      checked: undefined,
+      bad: undefined,
+      restoredVideoId: undefined,
+      repaired: undefined,
+      dropped: undefined,
+      attempts: attempt,
+      note: undefined,
+      error: undefined,
+      startedAt: task.startedAt ?? this.nowIso(),
+      finishedAt: undefined,
+    });
+
     try {
-      const outcome = await this.archive(entry);
+      const outcome =
+        item.operation === 'verify'
+          ? await this.verify(entry, task)
+          : item.operation === 'restore'
+            ? await this.restore(entry, task)
+            : item.operation === 'repair'
+              ? await this.repair(entry, task)
+              : await this.archive(entry, task);
       if (outcome.status === 'skipped') {
         this.active.delete(entry.key);
+        this.touch(task, { status: 'skipped', stage: 'skipped', note: outcome.note, finishedAt: this.nowIso(), asset: undefined });
         this.logLine(`[archive] ${entry.key}: nothing to do — ${outcome.note ?? 'skipped'}`);
         return outcome;
       }
-      if (outcome.status === 'archived') {
+      if (outcome.status === 'ok') {
         this.active.delete(entry.key);
         const archive = outcome.archive;
-        this.logLine(
-          `[archive] ${entry.key}: ${archive?.objects.length ?? 0} object(s), ${Math.round((archive?.bytes ?? 0) / 1_048_576)} MB — ${archive?.removedFromBunny ? 'removed from Bunny' : 'Bunny still holds it'}`,
-        );
+        this.touch(task, {
+          status: 'done',
+          stage: 'done',
+          note: outcome.note,
+          ...(item.operation === 'archive' ? { removedFromBunny: archive?.removedFromBunny } : {}),
+          ...(outcome.videoId ? { restoredVideoId: outcome.videoId } : {}),
+          finishedAt: this.nowIso(),
+          asset: undefined,
+        });
+        this.logLine(this.finishedLine(entry.key, item.operation, task, outcome));
         return outcome;
       }
-      return this.retryOrGiveUp(entry.key, outcome.note ?? 'it did not finish', attempt);
+      return this.retryOrGiveUp(task, outcome.note ?? 'it did not finish', attempt, item.retry);
     } catch (error) {
-      return this.retryOrGiveUp(entry.key, describeError(error), attempt);
+      return this.retryOrGiveUp(task, describeError(error), attempt, item.retry);
     }
+  }
+
+  /** One log line per finished operation, because each one moved something different. */
+  private finishedLine(key: string, operation: ArchiveOperation, task: ArchiveTask, outcome: ArchiveOutcome): string {
+    if (operation === 'verify') {
+      return `[archive] ${key}: checked ${task.checked ?? 0} object(s) — ${outcome.note ?? 'ok'}`;
+    }
+    if (operation === 'restore') {
+      return `[archive] ${key}: put back into Bunny as ${outcome.videoId ?? 'a new video'} — ${outcome.note ?? 'ok'}`;
+    }
+    if (operation === 'repair') {
+      return `[archive] ${key}: mended ${(task.repaired ?? []).length} object(s), dropped ${(task.dropped ?? []).length} — ${outcome.note ?? 'ok'}`;
+    }
+    const archive = outcome.archive;
+    return `[archive] ${key}: ${archive?.objects.length ?? 0} object(s), ${Math.round((archive?.bytes ?? 0) / 1_048_576)} MB — ${
+      archive?.removedFromBunny ? 'removed from Bunny' : 'Bunny still holds it'
+    }`;
   }
 
   /**
@@ -342,15 +922,34 @@ export class ArchiveService {
    * once is very often answering a minute later. After the budget the title is
    * logged and dropped; Bunny still holds the video, which is the safe outcome.
    */
-  private retryOrGiveUp(key: string, reason: string, attempt: number): ArchiveOutcome {
-    if (attempt >= this.budget) {
-      this.active.delete(key);
-      this.logLine(`[archive] ${key}: gave up after ${attempt} attempt(s) — ${reason}`);
+  private retryOrGiveUp(task: ArchiveTask, reason: string, attempt: number, retry: boolean): ArchiveOutcome {
+    if (!retry || attempt >= this.budget) {
+      this.active.delete(task.key);
+      this.touch(task, {
+        status: 'failed',
+        stage: 'failed',
+        note: reason,
+        error: reason,
+        finishedAt: this.nowIso(),
+        asset: undefined,
+        // Only an archive has a Bunny copy to talk about; a failed check or mend
+        // must not rewrite what the last archive run recorded.
+        ...(task.operation === 'archive' ? { removedFromBunny: false } : {}),
+      });
+      this.logLine(`[archive] ${task.key}: gave up after ${attempt} attempt(s) — ${reason}`);
       return { status: 'partial', note: reason };
     }
     const waitMs = this.retryDelay(attempt);
-    this.logLine(`[archive] ${key}: ${reason} — trying again in ${Math.round(waitMs / 1000)} s`);
-    this.schedule({ key, attempts: attempt }, waitMs);
+    const nextIn = `trying again in ${Math.round(waitMs / 1000)} s`;
+    this.logLine(`[archive] ${task.key}: ${reason} — ${nextIn}`);
+    this.touch(task, {
+      status: 'queued',
+      stage: 'queued',
+      note: `${reason} — ${nextIn}`,
+      error: reason,
+      asset: undefined,
+    });
+    this.schedule({ key: task.key, attempts: attempt, retry, operation: task.operation }, waitMs);
     return { status: 'partial', note: `${reason} (retrying)` };
   }
 
@@ -378,7 +977,7 @@ export class ArchiveService {
   /* The work itself                                                   */
   /* ---------------------------------------------------------------- */
 
-  private async archive(entry: CatalogEntry): Promise<ArchiveOutcome> {
+  private async archive(entry: CatalogEntry, task: ArchiveTask): Promise<ArchiveOutcome> {
     const config = this.deps.config.r2;
     const r2 = this.deps.r2;
     if (!config || !r2) return { status: 'skipped', note: 'no R2 destination is configured' };
@@ -397,41 +996,34 @@ export class ArchiveService {
       return { status: 'skipped', note: `Bunny has not finished with it (${video.status})` };
     }
 
+    // Measure first. Every asset is HEAD-ed up front so the task knows what the
+    // whole job is — that is what turns a bare spinner into "video/1080p.mp4,
+    // 42% of 3.4 GB" — and so an unreachable pull zone fails before a single
+    // byte has been copied.
     const folder = archiveFolder(config.prefix, entry);
-    const captions = captionLanguages(entry, video);
-    const planned = planAssets(video, base, captions);
+    this.touch(task, { stage: 'scanning' });
+    const assets = await this.scan(base, entry, video, task);
+
     const objects: CatalogArchiveObject[] = [];
     let bytes = 0;
     let videoBytes = 0;
     let videos = 0;
-
-    for (const asset of planned) {
-      const stored = await this.store(asset, `${folder}/${asset.name}`);
-      if (!stored) continue;
+    for (const asset of assets) {
+      this.touch(task, { stage: 'uploading', asset: asset.name, stored: objects.length, bytes, assets: assets.length, totalBytes: planBytes(assets) });
+      const stored = await this.move(asset, `${folder}/${asset.name}`, task, bytes);
       objects.push(stored);
       bytes += stored.bytes;
       if (stored.kind === 'video') {
         videoBytes += stored.bytes;
         videos += 1;
       }
+      this.touch(task, { stored: objects.length, bytes });
     }
 
-    // The player's seek sprites: numbered from `_0.jpg`, however many Bunny
-    // generated, so they are probed until the first one that is not there.
-    for (let index = 0; index < MAX_SEEK_SPRITES; index += 1) {
-      const url = seekSpriteUrl(base, entry.videoId, index);
-      const stored = await this.store(
-        { name: `sprites/seek_${index}.jpg`, kind: 'sprite', url, contentType: 'image/jpeg' },
-        `${folder}/sprites/seek_${index}.jpg`,
-      );
-      if (!stored) break;
-      objects.push(stored);
-      bytes += stored.bytes;
-    }
-
-    const now = (this.deps.now?.() ?? new Date()).toISOString();
+    const now = this.nowIso();
     const note = videos === 0 ? 'no MP4 rendition could be downloaded — enable MP4 Fallback on the Bunny library, or the video has no finished renditions' : undefined;
 
+    const media = playableObject(objects);
     const archive: CatalogArchive = {
       bucket: config.bucket,
       prefix: folder,
@@ -445,7 +1037,11 @@ export class ArchiveService {
       ...(note ? { note } : {}),
       videoId: entry.videoId,
       ...(entry.playbackUrl ? { bunnyPlaybackUrl: entry.playbackUrl } : {}),
-      ...(config.publicBase ? { playbackUrl: R2Client.publicUrl(config.publicBase, `${folder}/hls/playlist.m3u8`) } : {}),
+      // Playback moves to the dashboard, which signs a short-lived R2 URL for
+      // every request: the bucket can stay private, a shared link cannot be
+      // passed around forever, and the title still plays whether or not Bunny
+      // was allowed to keep the video.
+      ...(media ? { playbackUrl: playbackRoute(entry.key), mediaKey: media.key } : {}),
       removedFromBunny: false,
       at: now,
     };
@@ -461,6 +1057,7 @@ export class ArchiveService {
 
     // The manifest is written last, so its presence is what a complete archive
     // means. It is also the index a later reader checks the folder against.
+    this.touch(task, { stage: 'manifest', asset: 'manifest.json' });
     const manifest = {
       version: 1,
       key: entry.key,
@@ -494,10 +1091,11 @@ export class ArchiveService {
     archive.complete = true;
 
     if (!config.keepBunny) {
+      this.touch(task, { stage: 'deleting', asset: undefined });
       try {
         await client.deleteVideo(entry.videoId);
         archive.removedFromBunny = true;
-        archive.removedAt = (this.deps.now?.() ?? new Date()).toISOString();
+        archive.removedAt = this.nowIso();
       } catch (error) {
         // The copy is safe either way; Bunny keeping the video is a warning, not
         // a lost archive.
@@ -508,7 +1106,486 @@ export class ArchiveService {
     }
 
     this.writeRecord(entry.key, archive);
-    return { status: 'archived', archive };
+    return { status: 'ok', archive };
+  }
+
+  /**
+   * Re-reads the manifest from the bucket and re-hashes every object it lists.
+   *
+   * A HEAD only proves an object is *there*; this downloads each one and compares
+   * its SHA-256 and size to what the manifest recorded when it was written, which
+   * is the only way to answer "is the copy still the copy?". The manifest is read
+   * from R2 rather than from the catalogue so the check does not trust the same
+   * local record it is checking, and a mismatch is reported rather than retried
+   * away — the point is to find out, not to hide it.
+   */
+  private async verify(entry: CatalogEntry, task: ArchiveTask): Promise<ArchiveOutcome> {
+    const r2 = this.deps.r2;
+    const archive = entry.archive;
+    if (!r2) return { status: 'skipped', note: 'no R2 destination is configured' };
+    if (!archive) return { status: 'skipped', note: 'this title has no archive to check' };
+
+    this.touch(task, { stage: 'checking' });
+    const manifest = await this.readManifest(r2, archive.manifestKey);
+    if (!manifest) {
+      const at = this.nowIso();
+      const verify = { at, ok: false, checked: 0, missing: [archive.manifestKey], mismatched: [] };
+      this.recordVerify(entry.key, verify);
+      this.touch(task, { bad: [archive.manifestKey] });
+      return { status: 'partial', note: `the manifest is not in the bucket (${archive.manifestKey})`, archive: { ...archive, verify, verifiedAt: at } };
+    }
+
+    const objects = (manifest.objects ?? []).filter((object): object is CatalogArchiveObject => Boolean(object?.key));
+    if (!objects.length) return { status: 'skipped', note: 'the manifest lists no objects to check' };
+
+    this.touch(task, {
+      stage: 'verifying',
+      assets: objects.length,
+      totalBytes: objects.reduce((total, object) => total + (object.bytes ?? 0), 0),
+      stored: 0,
+      bytes: 0,
+      checked: 0,
+    });
+
+    const missing: string[] = [];
+    const mismatched: string[] = [];
+    let checkedCount = 0;
+    let bytes = 0;
+    for (const object of objects) {
+      const name = object.name || object.key;
+      const digest = await r2.read(object.key);
+      if (!digest) missing.push(name);
+      else if (digest.sha256 !== object.sha256 || (object.bytes !== undefined && digest.bytes !== object.bytes)) mismatched.push(name);
+      else bytes += digest.bytes;
+      checkedCount += 1;
+      this.touch(task, { checked: checkedCount, stored: checkedCount, bytes, asset: name });
+    }
+
+    const at = this.nowIso();
+    const ok = missing.length === 0 && mismatched.length === 0;
+    const verify = { at, ok, checked: checkedCount, missing, mismatched };
+    this.recordVerify(entry.key, verify);
+    const note = verifyNote(verify);
+    const updated = { ...archive, verify, verifiedAt: at };
+    if (!ok) {
+      this.touch(task, { bad: [...missing, ...mismatched], note });
+      return { status: 'partial', note, archive: updated };
+    }
+    // An empty list, not an absent one: "this pass found nothing wrong" and "no
+    // pass has run" are different answers, and the row shows the difference.
+    this.touch(task, { bad: [] });
+    return { status: 'ok', note, archive: updated };
+  }
+
+  /**
+   * Puts an archived title back into Bunny.
+   *
+   * The best archived rendition is streamed out of R2 — hashing it on the way, so
+   * a corrupt object is caught *before* it becomes a Bunny video — uploaded as a
+   * fresh video, and the captions are re-attached from the folder's own copies.
+   * The R2 archive is left exactly where it is: a restore adds a copy rather than
+   * moving one, so a title can be restored, and archived again, as often as it is
+   * asked to.
+   */
+  private async restore(entry: CatalogEntry, task: ArchiveTask): Promise<ArchiveOutcome> {
+    const r2 = this.deps.r2;
+    const archive = entry.archive;
+    if (!r2) return { status: 'skipped', note: 'no R2 destination is configured' };
+    if (!archive) return { status: 'skipped', note: 'this title has no archive to restore from' };
+    const client = this.deps.client(entry);
+    if (!client) return { status: 'skipped', note: 'the account that would receive it is gone' };
+    const source = playableObject(archive.objects);
+    if (!source) return { status: 'skipped', note: 'the archive holds no rendition to put back' };
+
+    // The bar counts both halves of the round trip — the bytes out of R2 and the
+    // bytes back into Bunny — so it only reads 100% once the title is playable.
+    const total = Math.max(1, source.bytes * 2);
+    this.touch(task, { stage: 'downloading', asset: source.name, assets: 1, stored: 0, bytes: 0, totalBytes: total });
+
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bunny-restore-'));
+    const tempPath = path.join(dir, path.basename(source.name) || 'restore.mp4');
+    try {
+      const downloaded = await this.download(r2, source, task, tempPath);
+      if (downloaded.sha256 !== source.sha256) throw new Error(`${source.name} no longer matches the archive (its SHA-256 changed)`);
+
+      const title = archiveLabel(entry);
+      const video = await client.createVideo(title);
+      this.touch(task, { stage: 'uploading', asset: source.name, stored: 1, bytes: source.bytes });
+      try {
+        await this.upload(client, video.guid, tempPath, title, source, task);
+      } catch (error) {
+        // A half-uploaded video would sit in the library with nothing playable:
+        // let Bunny forget it rather than leave the shell behind.
+        await client.deleteVideo(video.guid).catch(() => undefined);
+        throw error;
+      }
+
+      const failedCaptions = await this.reapplyCaptions(client, video.guid, entry, archive, r2);
+      const at = this.nowIso();
+      const playbackUrl = playbackUrlFor(entry.pullZoneHost, video.guid);
+      this.writeRestore(entry.key, { videoId: video.guid, ...(playbackUrl ? { playbackUrl } : {}), ...(video.status !== undefined ? { bunnyStatus: video.status } : {}), at });
+      const note = `back in Bunny as ${video.guid}${failedCaptions.length ? ` — ${failedCaptions.length} caption(s) could not be re-attached (${failedCaptions.join(', ')})` : ''}`;
+      return { status: 'ok', note, videoId: video.guid };
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  /**
+   * Mends the objects a verification pass flagged, then proves the mend.
+   *
+   * Each flagged object is fetched again from the pull zone it originally came
+   * from and spooled to disk, so the fresh bytes can be hashed *before* the
+   * stored object is touched: a copy that hashes to exactly what the manifest
+   * recorded replaces what is in the bucket, while a copy that no longer matches
+   * is stored *and* recorded as drift (with its new hash), because Bunny is the
+   * origin and the record is what has gone stale. Nothing is re-encoded, nothing
+   * is invented, and only the flagged objects move.
+   *
+   * When Bunny no longer holds the video there is nothing to fetch from, so the
+   * repair falls back to what the bucket still has: playback moves to the tallest
+   * *intact* rendition, the objects nothing can supply are dropped from the
+   * record, and `manifest.json` is rewritten so the folder agrees with the bucket
+   * again. Every one of those moves is recorded on the catalogue, never quietly
+   * forgotten.
+   *
+   * The last step is a full verification of the folder as it now stands — a mend
+   * nobody checked is just another claim — so the verdict on the record always
+   * describes the bucket, not the intention.
+   */
+  private async repair(entry: CatalogEntry, task: ArchiveTask): Promise<ArchiveOutcome> {
+    const r2 = this.deps.r2;
+    const archive = entry.archive;
+    if (!r2) return { status: 'skipped', note: 'no R2 destination is configured' };
+    if (!archive) return { status: 'skipped', note: 'this title has no archive to mend' };
+    const flagged = flaggedObjects(archive.verify);
+    if (!flagged.length) return { status: 'skipped', note: 'the last check found nothing to mend' };
+
+    const objects = archive.objects ?? [];
+    const byName = new Map(objects.map((object) => [object.name, object]));
+    const client = this.deps.client(entry);
+    // Ask Bunny rather than trust the record: the video may have been deleted
+    // since the archive was written, and a 404 is an answer, not a failure.
+    const reachable = client && entry.videoId ? await this.bunnyHasVideo(client, entry.videoId) : false;
+
+    this.touch(task, {
+      stage: 'repairing',
+      assets: flagged.length,
+      stored: 0,
+      bytes: 0,
+      totalBytes: flagged.reduce((total, name) => total + (byName.get(name)?.bytes ?? 0), 0),
+    });
+
+    const recopied: string[] = [];
+    const drifted: string[] = [];
+    const unrecoverable: CatalogArchiveObject[] = [];
+    const updated = new Map<string, CatalogArchiveObject>();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bunny-repair-'));
+    try {
+      let bytes = 0;
+      let handled = 0;
+      for (const name of flagged) {
+        const object = byName.get(name);
+        // A name the record no longer carries (already dropped) is nothing to do.
+        if (!object) continue;
+        this.touch(task, { asset: name });
+        const result: RepairResult = reachable && object.source ? await this.recopy(object, task, bytes, dir) : { status: 'unavailable' };
+        if (result.status === 'repaired') {
+          recopied.push(name);
+          updated.set(name, object);
+          bytes += object.bytes;
+        } else if (result.status === 'drifted') {
+          // The bytes Bunny serves have changed since the archive was written, so
+          // the *record* is the stale half: accept them and say so.
+          drifted.push(name);
+          updated.set(name, { ...object, bytes: result.bytes, sha256: result.sha256 });
+          bytes += result.bytes;
+        } else {
+          unrecoverable.push(object);
+        }
+        handled += 1;
+        this.touch(task, { stored: handled, bytes });
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+
+    if (recopied.length + drifted.length + unrecoverable.length === 0) {
+      return { status: 'skipped', note: 'nothing the last check named is still in the record' };
+    }
+
+    // Whatever is left has no source at all, so the repair falls back to the
+    // bucket's own intact copies: keep the best one playable, and stop claiming
+    // the objects that are gone.
+    const lostNames = new Set(unrecoverable.map((object) => object.name));
+    const current = playableObject(objects);
+    const intact = intactPlayableObject(objects, lostNames);
+    const switchedTo = current && lostNames.has(current.name) && intact ? intact.name : undefined;
+    const dropped = unrecoverable.map((object) => object.name);
+    const kept = objects
+      .filter((object) => !lostNames.has(object.name))
+      .map((object) => updated.get(object.name) ?? object);
+    const at = this.nowIso();
+    const nextPlayable = playableObject(kept);
+
+    const repaired: CatalogArchive = {
+      ...archive,
+      objects: kept,
+      bytes: kept.reduce((total, object) => total + object.bytes, 0),
+      videoBytes: kept.filter((object) => object.kind === 'video').reduce((total, object) => total + object.bytes, 0),
+      videos: kept.filter((object) => object.kind === 'video').length,
+      // A folder that lost an object is no longer the complete set it claimed.
+      complete: dropped.length > 0 ? false : archive.complete,
+      repairedAt: at,
+      repair: { at, recopied, dropped, drifted, ...(switchedTo ? { switchedTo } : {}) },
+    };
+    // The previous verdict is spent — it named objects that have just been mended
+    // or dropped — and the verification at the end writes the fresh one.
+    delete repaired.verify;
+    // Playback follows what survived: when the rendition it named is gone, the
+    // record must point at the intact neighbour rather than a hole.
+    if (nextPlayable) repaired.mediaKey = nextPlayable.key;
+    else delete repaired.mediaKey;
+
+    // On the task too, so the row can say what was mended without a second read.
+    this.touch(task, { repaired: [...recopied, ...drifted], dropped: [...dropped] });
+
+    await this.writeManifest(r2, entry, repaired);
+    this.writeRecord(entry.key, repaired);
+
+    const mended = repairNote({ recopied, dropped, drifted, switchedTo });
+    const verified = await this.verify({ ...entry, archive: repaired }, task);
+    if (verified.status === 'skipped') return { status: 'skipped', note: `${mended}; ${verified.note ?? 'nothing left to check'}` };
+    if (verified.status === 'ok') return { status: 'ok', note: `${mended}; ${verified.note ?? 'verified'}` };
+    return { status: 'partial', note: `${mended}; but the folder still does not verify — ${verified.note ?? 'unknown reason'}` };
+  }
+
+  /**
+   * Fetches one flagged object again from the pull zone and puts it back.
+   *
+   * The fresh copy is spooled to disk and hashed *before* the stored object is
+   * touched, which is what keeps a changed pull zone from silently redefining the
+   * archive mid-repair. Nothing is uploaded for an object the pull zone no longer
+   * has.
+   */
+  private async recopy(object: CatalogArchiveObject, task: ArchiveTask, completedBytes: number, dir: string): Promise<RepairResult> {
+    const r2 = this.deps.r2 as R2Client;
+    const url = object.source;
+    if (!url) return { status: 'unavailable' };
+
+    // A HEAD that says it is gone saves downloading nothing at all.
+    if ((await this.assetSize(url)) === null) return { status: 'missing' };
+
+    const upstream = await fetchWithPolicy(
+      url,
+      { method: 'GET' },
+      { what: 'the Bunny pull zone', fetchImpl: this.deps.fetchImpl ?? fetch, timeoutMs: ASSET_TIMEOUT_MS, retries: 2, backoffMs: 1_000 },
+    );
+    const body = upstream.body;
+    if (!upstream.ok || !body) {
+      await body?.cancel().catch(() => undefined);
+      if (upstream.status === 404 || upstream.status === 403) return { status: 'missing' };
+      throw new Error(`the pull zone answered HTTP ${upstream.status} for ${object.name}`);
+    }
+
+    const filePath = path.join(dir, path.basename(object.name) || 'object.bin');
+    const fetched = await spoolToFile(body, filePath, (written) => this.touch(task, { bytes: completedBytes + written }));
+    const upload = await r2.put(object.key, chunksOfFile(filePath), {
+      contentType: object.contentType,
+      ...(fetched.bytes > 0 ? { contentLength: fetched.bytes } : {}),
+      onProgress: (sent) => this.touch(task, { bytes: completedBytes + sent }),
+    });
+    const stored = await r2.head(object.key);
+    if (!stored || stored.bytes === undefined || stored.bytes !== upload.bytes) throw new Error(`${object.name} did not verify in R2 after being mended`);
+
+    return upload.sha256 === object.sha256 ? { status: 'repaired' } : { status: 'drifted', bytes: upload.bytes, sha256: upload.sha256 };
+  }
+
+  /**
+   * Rewrites `manifest.json` for an archive whose object list just changed.
+   *
+   * The original manifest is the base, so the history it carries — which Bunny
+   * video this came from, when it was archived — is preserved; only the object
+   * list and the sizes follow the mend. A manifest that is gone (the very thing a
+   * check may have flagged) is rebuilt from the catalogue record instead.
+   */
+  private async writeManifest(r2: R2Client, entry: CatalogEntry, archive: CatalogArchive): Promise<void> {
+    const previous = (await this.readManifest(r2, archive.manifestKey)) as { bunny?: unknown; archivedAt?: string } | undefined;
+    const body = Buffer.from(
+      `${JSON.stringify(
+        {
+          version: 1,
+          key: entry.key,
+          kind: entry.kind,
+          tmdbId: entry.tmdbId,
+          title: entry.title,
+          ...(entry.year ? { year: entry.year } : {}),
+          ...(entry.kind === 'episode' ? { season: entry.season ?? null, episode: entry.episode ?? null, episodeTitle: entry.episodeTitle ?? null } : {}),
+          bunny: previous?.bunny ?? {
+            accountId: entry.accountId ?? null,
+            libraryId: entry.libraryId ?? null,
+            videoId: entry.videoId ?? null,
+            playbackUrl: entry.playbackUrl ?? null,
+            resolutions: null,
+          },
+          archivedAt: previous?.archivedAt ?? archive.at,
+          bucket: archive.bucket,
+          prefix: archive.prefix,
+          base: archive.base ?? null,
+          bytes: archive.bytes,
+          videoBytes: archive.videoBytes,
+          videos: archive.videos,
+          objects: archive.objects,
+          repairedAt: archive.repairedAt ?? null,
+        },
+        null,
+        2,
+      )}\n`,
+      'utf8',
+    );
+    await r2.put(archive.manifestKey, body, { contentType: 'application/json' });
+    const head = await r2.head(archive.manifestKey);
+    if (!head || head.bytes !== body.length) throw new Error(`the mended manifest did not verify in R2 (${archive.manifestKey})`);
+  }
+
+  /** Whether Bunny still holds the video, asked of Bunny rather than assumed. */
+  private async bunnyHasVideo(client: BunnyClient, videoId: string): Promise<boolean> {
+    try {
+      const video = await client.getVideo(videoId);
+      // Only a finished video has renditions on the pull zone to fetch.
+      return mapBunnyStatus(video.status) === 'ready';
+    } catch {
+      return false;
+    }
+  }
+
+  /** Reads and parses a manifest out of the bucket; `undefined` when it is not there. */
+  private async readManifest(r2: R2Client, key: string): Promise<{ objects?: CatalogArchiveObject[] } | undefined> {
+    const text = await this.readText(r2, key);
+    if (text === undefined) return undefined;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new Error(`the manifest at ${key} is not valid JSON`);
+    }
+    if (!parsed || typeof parsed !== 'object') throw new Error(`the manifest at ${key} is not an object`);
+    return parsed as { objects?: CatalogArchiveObject[] };
+  }
+
+  /** Reads a small object (a manifest, a caption) whole, as text. */
+  private async readText(r2: R2Client, key: string): Promise<string | undefined> {
+    const chunks: Buffer[] = [];
+    const digest = await r2.read(key, (chunk) => {
+      chunks.push(chunk);
+    });
+    if (!digest) return undefined;
+    return Buffer.concat(chunks).toString('utf8');
+  }
+
+  /** Streams one archived object to disk, hashing and reporting as it goes. */
+  private async download(r2: R2Client, object: CatalogArchiveObject, task: ArchiveTask, filePath: string): Promise<{ bytes: number; sha256: string }> {
+    const handle = await fs.promises.open(filePath, 'w');
+    let written = 0;
+    try {
+      const digest = await r2.read(object.key, async (chunk) => {
+        await handle.write(chunk, 0, chunk.length, written);
+        written += chunk.length;
+        this.touch(task, { bytes: written });
+      });
+      if (!digest) throw new Error(`${object.name} is not in the bucket (${object.key})`);
+      if (digest.bytes !== written) throw new Error(`${object.name} stopped short at ${written} of ${digest.bytes} bytes`);
+      return { bytes: digest.bytes, sha256: digest.sha256 };
+    } finally {
+      await handle.close();
+    }
+  }
+
+  /** Hands the downloaded rendition to Bunny, by whichever transport is configured. */
+  private async upload(client: BunnyClient, videoId: string, filePath: string, title: string, object: CatalogArchiveObject, task: ArchiveTask): Promise<void> {
+    if (this.deps.config.uploadMode === 'tus') {
+      await client.uploadVideoResumable(videoId, filePath, {
+        title,
+        fileName: path.basename(object.name) || 'restore.mp4',
+        chunkBytes: this.deps.config.tusChunkBytes,
+        onProgress: (sent) => this.touch(task, { bytes: object.bytes + sent }),
+        shouldContinue: () => !this.stopped,
+      });
+      return;
+    }
+    await client.uploadVideo(videoId, filePath);
+    this.touch(task, { bytes: object.bytes * 2 });
+  }
+
+  /** Re-attaches every caption the folder holds, keyed by the language in its name. */
+  private async reapplyCaptions(client: BunnyClient, videoId: string, entry: CatalogEntry, archive: CatalogArchive, r2: R2Client): Promise<string[]> {
+    const captions = (archive.objects ?? []).filter((object) => object.kind === 'subtitle');
+    const failed: string[] = [];
+    for (const object of captions) {
+      const srclang = captionLanguage(object.name);
+      try {
+        const text = await this.readText(r2, object.key);
+        if (text === undefined) throw new Error('the caption is not in the bucket');
+        const label = entry.subtitles?.find((track) => track.srclang === srclang)?.label ?? srclang.toUpperCase();
+        await client.addCaption(videoId, srclang, label, text);
+      } catch (error) {
+        failed.push(srclang);
+        this.logLine(`[archive] ${entry.key}: could not re-attach the ${srclang} caption — ${describeError(error)}`);
+      }
+    }
+    return failed;
+  }
+
+  /** Writes a verification result onto the catalogue entry, and never fails the pass for it. */
+  private recordVerify(key: string, verify: NonNullable<CatalogArchive['verify']>): void {
+    try {
+      this.deps.catalog.setArchiveVerify(key, verify);
+    } catch (error) {
+      this.logLine(`[archive] could not record the verification of ${key}: ${describeError(error)}`);
+    }
+  }
+
+  /** Writes a restored video onto the catalogue entry, and never fails the run for it. */
+  private writeRestore(key: string, restore: { videoId: string; playbackUrl?: string; bunnyStatus?: number; at: string }): void {
+    try {
+      this.deps.catalog.setRestored(key, restore);
+    } catch (error) {
+      this.logLine(`[archive] could not record the restore of ${key}: ${describeError(error)}`);
+    }
+  }
+
+  /**
+   * Measures the whole job before any of it moves.
+   *
+   * Every file the plan names is HEAD-ed, and the files Bunny did not generate
+   * simply drop out — a `thumbnail_3.jpg` that does not exist is not a failure,
+   * it is a smaller job. The seek sprites are discovered here too: they are
+   * numbered from `_0.jpg` with no count published anywhere, so they are probed
+   * until the first one that is not there.
+   */
+  private async scan(base: string, entry: CatalogEntry, video: BunnyVideo, task: ArchiveTask): Promise<ProbedAsset[]> {
+    const assets: ProbedAsset[] = [];
+    const measure = async (planned: PlannedAsset): Promise<boolean> => {
+      const size = await this.assetSize(planned.url);
+      if (size === null) return false;
+      assets.push({ ...planned, ...(size !== undefined ? { bytes: size } : {}) });
+      this.touch(task, { assets: assets.length, totalBytes: planBytes(assets) });
+      return true;
+    };
+
+    for (const planned of planAssets(video, base, captionLanguages(entry, video))) await measure(planned);
+
+    const videoId = video.guid;
+    for (let index = 0; index < MAX_SEEK_SPRITES; index += 1) {
+      const planned: PlannedAsset = {
+        name: `sprites/seek_${index}.jpg`,
+        kind: 'sprite',
+        url: seekSpriteUrl(base, videoId, index),
+        contentType: 'image/jpeg',
+      };
+      if (!(await measure(planned))) break;
+    }
+    return assets;
   }
 
   /** Writes the archive onto the catalogue entry, and never fails the run for it. */
@@ -521,20 +1598,17 @@ export class ArchiveService {
   }
 
   /**
-   * One asset: look it up, stream it into R2 once, and confirm it landed.
+   * One asset: stream it into R2 once, confirm it landed, and report the bytes
+   * as they go.
    *
-   * The HEAD comes first so a missing asset is a skip rather than a failed
-   * download, and so R2 is told the length up front (which is what lets a big
-   * file become a real multipart upload instead of a buffered PUT). The HEAD
-   * against R2 afterwards is the verification: the archive only counts objects
-   * the bucket itself says are there, at the size that was uploaded.
+   * The size came from the scan, so R2 is told the length up front (which is
+   * what lets a big file become a real multipart upload instead of a buffered
+   * PUT). The HEAD against R2 afterwards is the verification: the archive only
+   * counts objects the bucket itself says are there, at the size that was
+   * uploaded.
    */
-  private async store(asset: PlannedAsset, key: string): Promise<CatalogArchiveObject | undefined> {
-    const r2 = this.deps.r2;
-    if (!r2) return undefined;
-    const size = await this.assetSize(asset.url);
-    if (size === null) return undefined;
-
+  private async move(asset: ProbedAsset, key: string, task: ArchiveTask, completedBytes: number): Promise<CatalogArchiveObject> {
+    const r2 = this.deps.r2 as R2Client;
     const upstream = await fetchWithPolicy(
       asset.url,
       { method: 'GET' },
@@ -550,15 +1624,16 @@ export class ArchiveService {
     try {
       upload = await r2.put(key, chunksOf(body), {
         contentType: asset.contentType,
-        ...(size !== undefined ? { contentLength: size } : {}),
+        ...(asset.bytes !== undefined ? { contentLength: asset.bytes } : {}),
+        onProgress: (uploaded) => this.touch(task, { bytes: completedBytes + uploaded }),
       });
     } catch (error) {
       // Give the download back rather than leaving it half-read on a socket.
       await body.cancel().catch(() => undefined);
       throw error;
     }
-    if (size !== undefined && upload.bytes !== size) {
-      throw new Error(`${asset.name} uploaded ${upload.bytes} bytes but the pull zone declared ${size}`);
+    if (asset.bytes !== undefined && upload.bytes !== asset.bytes) {
+      throw new Error(`${asset.name} uploaded ${upload.bytes} bytes but the pull zone declared ${asset.bytes}`);
     }
     const stored = await r2.head(key);
     if (!stored || stored.bytes === undefined || stored.bytes !== upload.bytes) {
@@ -607,6 +1682,54 @@ export class ArchiveService {
     this.timers.clear();
     this.queue.length = 0;
   }
+}
+
+/** One sentence describing what a repair did, for a task note and a log line. */
+function repairNote(repair: { recopied: string[]; dropped: string[]; drifted: string[]; switchedTo?: string }): string {
+  const parts: string[] = [];
+  if (repair.recopied.length) parts.push(`re-copied ${repair.recopied.length} object(s) from Bunny`);
+  if (repair.drifted.length) parts.push(`Bunny's copy of ${repair.drifted.length} object(s) had changed, so their recorded hashes were updated`);
+  if (repair.dropped.length) parts.push(`${repair.dropped.length} object(s) could not be mended (${repair.dropped.slice(0, 3).join(', ')}) and were dropped`);
+  if (repair.switchedTo) parts.push(`playback moved to the intact ${repair.switchedTo}`);
+  return parts.length ? parts.join('; ') : 'nothing needed mending';
+}
+
+/**
+ * Streams a response body to disk, hashing and counting as it lands.
+ *
+ * The hash is what decides whether the fresh bytes are the object the manifest
+ * recorded, so it has to be taken *before* anything is overwritten — which is
+ * why a repair spools to disk instead of streaming straight into the bucket.
+ */
+async function spoolToFile(body: ReadableStream<Uint8Array>, filePath: string, onProgress: (written: number) => void): Promise<{ bytes: number; sha256: string }> {
+  const handle = await fs.promises.open(filePath, 'w');
+  const hash = crypto.createHash('sha256');
+  const reader = body.getReader();
+  let written = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value?.length) continue;
+      const chunk = Buffer.from(value);
+      hash.update(chunk);
+      await handle.write(chunk, 0, chunk.length, written);
+      written += chunk.length;
+      onProgress(written);
+    }
+  } finally {
+    reader.releaseLock?.();
+    await handle.close();
+  }
+  return { bytes: written, sha256: hash.digest('hex') };
+}
+
+/** One flagged object, and what fetching it again produced. */
+type RepairResult = { status: 'repaired' } | { status: 'drifted'; bytes: number; sha256: string } | { status: 'missing' } | { status: 'unavailable' };
+
+/** A file on disk, as the chunk stream the R2 client uploads from. */
+async function* chunksOfFile(filePath: string): AsyncIterable<Buffer> {
+  for await (const chunk of fs.createReadStream(filePath)) yield Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
 }
 
 /** A web `ReadableStream`, as the chunk stream the R2 client uploads from. */

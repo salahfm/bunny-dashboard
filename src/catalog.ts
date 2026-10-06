@@ -69,12 +69,49 @@ export interface CatalogArchive {
   note?: string;
   /** The Bunny video it was copied from. */
   videoId: string;
-  /** Where it plays now, when the bucket has a public base. */
+  /**
+   * Where it plays now: the public URL when the bucket is served through a
+   * domain, otherwise the dashboard's own play route, which mints a short-lived
+   * signed R2 URL for every request.
+   */
   playbackUrl?: string;
+  /**
+   * The archived object the dashboard streams for playback — the tallest MP4
+   * rendition, or the original file when that is all there is.
+   */
+  mediaKey?: string;
   /** Bunny's own playback URL, which the archive replaces. */
   bunnyPlaybackUrl?: string;
   removedFromBunny: boolean;
   removedAt?: string;
+  /** The last time every object was re-read from the bucket and hashed. */
+  verifiedAt?: string;
+  /** What that pass found: how many objects were checked, and which failed. */
+  verify?: {
+    at: string;
+    ok: boolean;
+    checked: number;
+    /** Objects the manifest lists that are no longer in the bucket. */
+    missing: string[];
+    /** Objects whose bytes no longer hash to what the manifest recorded. */
+    mismatched: string[];
+  };
+  /** The Bunny video a restore created, and when it did. */
+  restoredAt?: string;
+  restoredVideoId?: string;
+  /** The last time the objects a check flagged were repaired, and what happened. */
+  repairedAt?: string;
+  repair?: {
+    at: string;
+    /** Objects re-copied from Bunny that hashed to the manifest and verified again. */
+    recopied: string[];
+    /** Objects nothing could supply; dropped from the record and the manifest. */
+    dropped: string[];
+    /** Bunny's copy of these no longer matches what was archived (left as found). */
+    drifted: string[];
+    /** The rendition playback was moved onto, when the flagged one was lost. */
+    switchedTo?: string;
+  };
   at: string;
 }
 
@@ -370,6 +407,47 @@ export class Catalog {
     // public R2 folder that is still half-uploaded would break playback for a
     // title whose Bunny copy works.
     if (archive.complete && archive.playbackUrl) entry.playbackUrl = archive.playbackUrl;
+    entry.updatedAt = new Date().toISOString();
+    this.changes += 1;
+    this.save();
+    return entry;
+  }
+
+  /**
+   * Records the outcome of a verification pass on an archived title.
+   *
+   * Only the verify block and the timestamp move: the copy itself did not
+   * change, it was re-read, so nothing about where the title plays is touched.
+   */
+  setArchiveVerify(key: string, verify: NonNullable<CatalogArchive['verify']>): CatalogEntry | undefined {
+    const entry = this.get(key);
+    if (!entry?.archive) return undefined;
+    entry.archive.verify = verify;
+    entry.archive.verifiedAt = verify.at;
+    entry.updatedAt = new Date().toISOString();
+    this.changes += 1;
+    this.save();
+    return entry;
+  }
+
+  /**
+   * Points an entry at the Bunny video a restore just created.
+   *
+   * The copy in R2 is untouched — a restore puts a *second* copy back in Bunny
+   * rather than moving the archive — so the archive block only gains the note
+   * that the title is live in Bunny again, and the top-level playback fields
+   * follow the new video.
+   */
+  setRestored(key: string, restore: { videoId: string; playbackUrl?: string; bunnyStatus?: number; at: string }): CatalogEntry | undefined {
+    const entry = this.get(key);
+    if (!entry) return undefined;
+    entry.videoId = restore.videoId;
+    if (restore.playbackUrl !== undefined) entry.playbackUrl = restore.playbackUrl;
+    if (restore.bunnyStatus !== undefined) entry.bunnyStatus = restore.bunnyStatus;
+    if (entry.archive) {
+      entry.archive.restoredAt = restore.at;
+      entry.archive.restoredVideoId = restore.videoId;
+    }
     entry.updatedAt = new Date().toISOString();
     this.changes += 1;
     this.save();

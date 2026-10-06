@@ -31,6 +31,20 @@
     librarySubtitles: null,
     librarySelectedKey: null,
     libraryEntry: null,
+    /**
+     * The R2 archive queue, by catalogue key.
+     *
+     * Archiving runs on the server's own queue, so this is the only place the
+     * browser learns how far a title has got: seeded from `/api/archive` when the
+     * Library is read, then kept current by the `archive` events on the stream.
+     */
+    archiveTasks: {},
+    /** What R2 holds and could be re-checked, as `/api/archive` reports it. */
+    archiveVerify: [],
+    /** What R2 holds and could be put back into Bunny. */
+    archiveRestore: [],
+    /** What a check flagged and a targeted repair could mend. */
+    archiveRepair: [],
     tunnel: null,
     autopilot: null,
     only: new Set(),
@@ -877,9 +891,14 @@
       if (payload) applyJobsDelta(payload.jobs ?? []);
     });
     source.addEventListener('catalog', () => {
-      // A title finished publishing: the Library tab should show it, not wait
-      // for the next click.
+      // A title finished publishing — or an archive recorded what it did: the
+      // Library tab should show it, not wait for the next click.
       if (state.activeTab === 'library') void refreshLibrary({ quiet: true });
+    });
+    source.addEventListener('archive', (event) => {
+      const payload = parseEvent(event);
+      if (!payload) return;
+      applyArchiveDelta(payload.tasks ?? []);
     });
   }
 
@@ -1074,6 +1093,17 @@
     state.libraryStats = data.stats ?? null;
     state.libraryMatched = typeof data.matched === 'number' ? data.matched : null;
     state.librarySubtitles = data.subtitles ?? null;
+    // The archive queue lives on the server, so a fresh page (or a reconnect)
+    // has to read it once before the `archive` events can keep it current.
+    try {
+      const queue = await api('GET', '/api/archive');
+      seedArchiveTasks(queue?.tasks ?? []);
+      state.archiveVerify = queue?.verify ?? [];
+      state.archiveRestore = queue?.restore ?? [];
+      state.archiveRepair = queue?.repair ?? [];
+    } catch {
+      /* the archive is optional: a failure to read it must not blank the Library */
+    }
     renderLibrary();
     renderLibraryDetail();
     // The backfill count is the same list, read the same way, so it is refreshed
@@ -1148,6 +1178,13 @@
    * button walks through them rather than opening a dozen at once.
    */
   const ARCHIVE_BATCH = 5;
+
+  /**
+   * One click's worth of checks. Bigger than the archive batch because a check
+   * only reads: nothing is uploaded and nothing is deleted, so the whole bucket
+   * can be walked in one pass.
+   */
+  const VERIFY_BATCH = 25;
 
   /** The languages being filled in — known from settings, or from the preview itself. */
   function subtitleTargets() {
@@ -1242,27 +1279,183 @@
     }
   }
 
+  /** A signed playback URL's life, as a person reads it. */
+  function archiveTtlLabel(seconds) {
+    const value = Number(seconds);
+    if (!Number.isFinite(value) || value <= 0) return '5 min';
+    if (value < 90) return `${Math.round(value)} s`;
+    if (value < 5400) return `${Math.round(value / 60)} min`;
+    return `${Math.round(value / 3600)} h`;
+  }
+
+  /* ------------------------------------------------ the R2 archive queue */
+
+  /** The task the archive queue has for a title, while it is still worth showing. */
+  function archiveTaskFor(entry) {
+    const task = state.archiveTasks?.[entry.key];
+    if (!task) return null;
+    if (task.status === 'queued' || task.status === 'active') return task;
+    // A finished task matters only until the catalogue catches up: once the
+    // record itself carries the archive, the row shows that instead.
+    return entry.archive ? null : task;
+  }
+
+  /** Replaces what is known about a set of titles (a fresh page, or a reconnect). */
+  function seedArchiveTasks(tasks) {
+    for (const task of tasks) if (task?.key) state.archiveTasks[task.key] = task;
+  }
+
   /**
-   * Copies one title into R2 and lets Bunny forget it.
+   * Applies the deltas the stream pushes.
    *
-   * The server does the whole thing — download every rendition, still and
-   * caption, verify each against the bucket, then delete — and answers with one
-   * line per title, which is what the toast shows.
+   * Archive tasks move by the byte, so the server coalesces them and sends each
+   * task's *latest* state; this only has to store it and redraw.
+   */
+  function applyArchiveDelta(deltas) {
+    let touched = false;
+    for (const delta of deltas) {
+      const task = delta?.task;
+      if (!task?.key) continue;
+      if (delta.kind === 'removed') delete state.archiveTasks[task.key];
+      else state.archiveTasks[task.key] = task;
+      touched = true;
+    }
+    if (touched && state.activeTab === 'library') renderLibrary();
+  }
+
+  /** One line describing what an archive task is doing right now. */
+  function archiveStageLabel(task) {
+    switch (task.stage) {
+      case 'queued':
+        return task.position ? `queued (#${task.position})` : 'queued';
+      case 'checking':
+        if (task.operation === 'verify') return 'reading the index out of R2';
+        if (task.operation === 'restore') return 'reading the archive record';
+        return 'reading the video back from Bunny';
+      case 'scanning':
+        return task.assets ? `measuring ${task.assets} file(s)` : 'measuring the folder';
+      case 'verifying':
+        return `re-hashing ${task.stored ?? 0}/${task.assets ?? 0} object(s) against the manifest`;
+      case 'downloading':
+        return `downloading ${task.asset ?? 'the rendition'} from R2`;
+      case 'repairing':
+        return task.assets ? `mending ${task.stored ?? 0}/${task.assets} flagged object(s)` : 'mending the flagged objects';
+      case 'uploading':
+        return task.operation === 'restore'
+          ? `uploading ${task.asset ?? 'the rendition'} to Bunny`
+          : `${task.asset ?? 'uploading'} · ${task.stored}/${task.assets} file(s)`;
+      case 'manifest':
+        return 'writing the index';
+      case 'deleting':
+        return 'removing it from Bunny';
+      case 'done':
+        if (task.operation === 'verify') return task.bad?.length ? 'checked · problems found' : 'checked · every object matches';
+        if (task.operation === 'restore') return 'restored into Bunny';
+        if (task.operation === 'repair') return `mended ${(task.repaired ?? []).length} object(s)${(task.dropped ?? []).length ? `, dropped ${(task.dropped ?? []).length}` : ''}`;
+        return task.removedFromBunny ? 'done · removed from Bunny' : 'done · Bunny kept the video';
+      case 'failed':
+        if (task.operation === 'verify') return 'check failed';
+        if (task.operation === 'restore') return 'restore failed';
+        if (task.operation === 'repair') return 'repair could not mend it';
+        return 'failed';
+      default:
+        return task.stage;
+    }
+  }
+
+  /** The archive detail row: what the queue is doing now, or what it did. */
+  function archiveDetailLine(entry) {
+    const task = archiveTaskFor(entry);
+    if (task) {
+      const size = task.totalBytes ? ` (${bytes(task.bytes)} of ${bytes(task.totalBytes)})` : '';
+      return `${archiveStageLabel(task)} · ${task.percent ?? 0}%${size}${task.note ? ` · ${task.note}` : ''}`;
+    }
+    if (!entry.archive) return 'not archived';
+    const verify = entry.archive.verify;
+    return (
+      `${entry.archive.bucket}/${entry.archive.prefix} · ${(entry.archive.objects ?? []).length} object(s) · ${bytes(entry.archive.bytes)}` +
+      `${entry.archive.videos !== undefined ? ` (${entry.archive.videos} rendition(s), ${bytes(entry.archive.videoBytes)})` : ''}` +
+      `${entry.archive.complete ? '' : ' · INCOMPLETE'} · ${entry.archive.removedFromBunny ? 'removed from Bunny' : 'Bunny still holds it'}` +
+      (entry.archive.mediaKey
+        ? ` · plays ${entry.archive.base ? 'from the bucket directly' : `through the dashboard with a signed URL (${archiveTtlLabel(state.settings?.archive?.urlTtl)})`}`
+        : '') +
+      `${entry.archive.restoredAt ? ` · put back into Bunny ${shortTime(entry.archive.restoredAt)}` : ''}` +
+      `${
+        entry.archive.verifiedAt || verify
+          ? ` · checked ${shortTime(entry.archive.verifiedAt ?? verify?.at)}${verify && !verify.ok ? ` (${(verify.missing ?? []).length} missing, ${(verify.mismatched ?? []).length} changed)` : ''}`
+          : ''
+      }` +
+      `${
+        entry.archive.repairedAt
+          ? ` · mended ${shortTime(entry.archive.repairedAt)} (${entry.archive.repair?.recopied?.length ?? 0} re-copied` +
+            `${entry.archive.repair?.drifted?.length ? `, ${entry.archive.repair.drifted.length} changed` : ''}` +
+            `${entry.archive.repair?.dropped?.length ? `, ${entry.archive.repair.dropped.length} dropped` : ''}` +
+            `${entry.archive.repair?.switchedTo ? `, now playing ${entry.archive.repair.switchedTo}` : ''})`
+          : ''
+      }` +
+      `${entry.archive.note ? ` · ${entry.archive.note}` : ''}`
+    );
+  }
+
+  /**
+   * The archive column of a Library row: a bar while a title is moving, and the
+   * plain marker for one that is already in R2.
+   */
+  function archiveCell(entry) {
+    const task = archiveTaskFor(entry);
+    if (!task) {
+      return h('span', {
+        class: 'muted small',
+        text: entry.archive ? (entry.archive.complete ? 'R2' : 'R2 partial') : '—',
+        title: entry.archive
+          ? `${entry.archive.bucket}/${entry.archive.prefix} · ${(entry.archive.objects ?? []).length} object(s)` +
+            `${entry.archive.verify ? (entry.archive.verify.ok ? ' · verified' : ' · CHECK FAILED') : ''}` +
+            `${entry.archive.restoredAt ? ' · also back in Bunny' : ''}`
+          : 'still only on Bunny',
+      });
+    }
+    const moving = task.status === 'active';
+    const percent = Math.max(0, Math.min(100, task.percent ?? 0));
+    return h(
+      'span',
+      {
+        class: 'archive-progress',
+        title: `${archiveStageLabel(task)}${task.totalBytes ? ` — ${bytes(task.bytes)} of ${bytes(task.totalBytes)}` : ''}${task.note ? ` — ${task.note}` : ''}`,
+      },
+      h('span', { class: `bar${task.status === 'failed' ? ' is-failed' : moving ? ' is-active' : ''}`, style: `width:${moving ? Math.max(3, percent) : 100}%` }),
+      h('span', { class: 'label mono small', text: moving ? `${percent}%` : task.status === 'failed' ? 'failed' : 'queued' }),
+    );
+  }
+
+  /**
+   * Queues one title into R2 and lets Bunny forget it.
+   *
+   * The request only puts the title in line — the copying happens on the
+   * server's archive queue and its progress arrives on the event stream — so
+   * this returns as soon as the title is queued, however big it is.
    */
   async function archiveEntry(key, label) {
     try {
       const report = await api('POST', '/api/archive', { keys: [key], limit: 1 });
-      const line = (report.results ?? [])[0] ?? '';
-      const note = line.startsWith(`${key}: `) ? line.slice(key.length + 2) : line;
-      toast(`${label}: ${note || 'nothing to do'}`, /^archived\b/.test(note) ? 'ok' : 'bad');
-      await refreshLibrary();
-      if (state.librarySelectedKey === key) await refreshLibraryDetail(key);
+      seedArchiveTasks(report.queued ?? []);
+      const skipped = (report.skipped ?? [])[0];
+      if (skipped && !(report.queued ?? []).length) {
+        toast(`${label}: ${skipped.reason}`, 'bad');
+        return;
+      }
+      toast(`${label}: queued — the copy runs in the background, and its progress is in the row`, 'ok');
+      renderLibrary();
     } catch (error) {
       toast(describeError(error), 'bad');
     }
   }
 
-  /** The batch above: whatever the current filter lists, a few titles at a time. */
+  /**
+   * The batch above: whatever the current filter lists, a few titles at a time.
+   *
+   * Since the work is queued rather than done here, the button is free again as
+   * soon as the titles are in line.
+   */
   async function runArchive() {
     const button = $('#library-archive');
     if (!state.settings?.archive?.configured) {
@@ -1271,13 +1464,129 @@
     }
     const label = button.textContent;
     button.disabled = true;
-    button.textContent = 'moving to R2…';
+    button.textContent = 'queueing…';
     try {
       const report = await api('POST', '/api/archive', { limit: ARCHIVE_BATCH });
-      const lines = report.results ?? [];
-      toast(lines.length ? lines.join(' · ') : 'nothing is waiting to be archived', lines.some((line) => /partial|failed/.test(line)) ? 'bad' : 'ok');
-      await refreshLibrary();
-      if (state.librarySelectedKey) await refreshLibraryDetail(state.librarySelectedKey);
+      seedArchiveTasks(report.queued ?? []);
+      const queuedCount = (report.queued ?? []).length;
+      const skipped = report.skipped ?? [];
+      if (!queuedCount) {
+        toast(skipped.length ? `nothing queued — ${skipped[0]?.reason ?? 'nothing to do'}` : 'nothing is waiting to be archived', 'bad');
+      } else {
+        toast(`queued ${queuedCount} title(s) — they copy in the background${skipped.length ? `, ${skipped.length} skipped` : ''}`, 'ok');
+      }
+      renderLibrary();
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    } finally {
+      button.disabled = false;
+      button.textContent = label;
+    }
+  }
+
+  /** What a targeted repair would do for this title, as a tooltip. */
+  function repairHint(entry) {
+    const verify = entry.archive?.verify ?? {};
+    const flagged = (verify.missing ?? []).length + (verify.mismatched ?? []).length;
+    const candidate = (state.archiveRepair ?? []).find((item) => item.key === entry.key);
+    const route = candidate?.fromBunny
+      ? 'each one is fetched again from Bunny and put back only if it still hashes to the manifest'
+      : 'Bunny no longer holds the video, so playback moves onto the intact rendition and what nothing can supply is dropped';
+    return `${flagged} object(s) failed the last check — ${route}. Nothing is re-archived.`;
+  }
+
+  /**
+   * Mends just the objects the last check flagged.
+   *
+   * The alternative — archiving the title again — would re-download gigabytes to
+   * fix one file, and would not be possible at all once Bunny has let the video
+   * go. This touches only what is broken.
+   */
+  async function repairEntry(key, label) {
+    try {
+      const report = await api('POST', '/api/archive/repair', { keys: [key], limit: 1 });
+      seedArchiveTasks(report.queued ?? []);
+      const skipped = (report.skipped ?? [])[0];
+      if (skipped && !(report.queued ?? []).length) {
+        toast(`${label}: ${skipped.reason}`, 'bad');
+        return;
+      }
+      toast(`${label}: mending the flagged objects — the result lands in the row`, 'ok');
+      renderLibrary();
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    }
+  }
+
+  /**
+   * Queues one title for a re-check: the manifest is re-read from R2 and every
+   * object it lists is re-hashed against the bucket.
+   */
+  async function verifyEntry(key, label) {
+    try {
+      const report = await api('POST', '/api/archive/verify', { keys: [key], limit: 1 });
+      seedArchiveTasks(report.queued ?? []);
+      const skipped = (report.skipped ?? [])[0];
+      if (skipped && !(report.queued ?? []).length) {
+        toast(`${label}: ${skipped.reason}`, 'bad');
+        return;
+      }
+      toast(`${label}: checking R2 against its manifest — the result lands in the row`, 'ok');
+      renderLibrary();
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    }
+  }
+
+  /**
+   * Puts one title back into Bunny from its R2 archive.
+   *
+   * The archive is left where it is — this is a copy, not a move — so the title
+   * ends up in both places and can be archived again later.
+   */
+  async function restoreEntry(key, label) {
+    if (!confirm(`Put “${label}” back into Bunny from R2? The archive copy stays where it is.`)) return;
+    try {
+      const report = await api('POST', '/api/archive/restore', { keys: [key], limit: 1 });
+      seedArchiveTasks(report.queued ?? []);
+      const skipped = (report.skipped ?? [])[0];
+      if (skipped && !(report.queued ?? []).length) {
+        toast(`${label}: ${skipped.reason}`, 'bad');
+        return;
+      }
+      toast(`${label}: restoring into Bunny — the row shows how far it has got`, 'ok');
+      renderLibrary();
+    } catch (error) {
+      toast(describeError(error), 'bad');
+    }
+  }
+
+  /**
+   * The batch: re-check every archive the bucket holds.
+   *
+   * Reading is cheap next to copying, so this walks up to [VERIFY_BATCH] titles
+   * per press; the queue does the work and the rows report what it found.
+   */
+  async function runVerify() {
+    const button = $('#library-verify');
+    if (!state.settings?.archive?.configured) {
+      toast('no R2 destination is configured', 'bad');
+      return;
+    }
+    const label = button.textContent;
+    button.disabled = true;
+    button.textContent = 'queueing…';
+    try {
+      const report = await api('POST', '/api/archive/verify', { limit: VERIFY_BATCH });
+      seedArchiveTasks(report.queued ?? []);
+      const queuedCount = (report.queued ?? []).length;
+      const skipped = report.skipped ?? [];
+      if (!queuedCount) {
+        toast(skipped.length ? `nothing queued — ${skipped[0]?.reason ?? 'nothing to do'}` : 'nothing in R2 to check', 'bad');
+      } else {
+        toast(`checking ${queuedCount} archive(s) — the rows report what the hashes say${skipped.length ? `, ${skipped.length} skipped` : ''}`, 'ok');
+      }
+      renderLibrary();
     } catch (error) {
       toast(describeError(error), 'bad');
     } finally {
@@ -1299,8 +1608,11 @@
     // The missing count is only worth showing once the list itself is narrowed:
     // unfiltered, the heading's own hint already says it.
     const narrowed = Boolean($('#library-search').value.trim() || $('#library-kind').value || $('#library-subtitles').value);
+    const archiving = Object.values(state.archiveTasks ?? {}).filter((task) => task.status === 'queued' || task.status === 'active').length;
     $('#library-summary').textContent = stats
       ? `${stats.total} title(s) · ${stats.movies} movie(s) · ${stats.episodes} episode(s) · ${bytes(stats.bytes)} published` +
+        (stats.archived ? ` · ${stats.archived} in R2 (${bytes(stats.archivedBytes)})` : '') +
+        (archiving ? ` · ${archiving} copying to R2` : '') +
         (state.libraryMatched !== null && state.libraryMatched !== stats.total ? ` · ${state.libraryMatched} match the filter` : '') +
         (narrowed && scoped ? ` · ${scoped.missing} of them have no ${(scoped.targets ?? []).join(', ')}` : '')
       : '';
@@ -1334,12 +1646,9 @@
           entry.playbackUrl
             ? h('a', { href: entry.playbackUrl, target: '_blank', rel: 'noreferrer', text: 'play' })
             : h('span', { class: 'muted small', text: '—' }),
-          // Where the bytes actually are now: R2 once the copy verified, Bunny
-          // otherwise (and "partial" when the copy stopped short of deleting).
-          h('span', {
-            class: 'muted small',
-            text: entry.archive ? (entry.archive.complete ? ' · R2' : ' · R2 partial') : '',
-          }),
+          // Where the bytes are now, and how far the copy has got: a bar while
+          // the archive is moving this title, then the plain R2 marker.
+          archiveCell(entry),
         ),
         h('td', { class: 'mono small', text: shortTime(entry.updatedAt) }),
         h(
@@ -1351,8 +1660,37 @@
           state.settings?.archive?.configured
             ? h('button', {
                 text: 'to R2',
-                title: 'Copy every rendition, still and caption into R2, verify it, then remove the video from Bunny.',
+                title: 'Queue every rendition, still and caption for Cloudflare R2, verify it, then remove the video from Bunny. It runs in the background.',
+                ...(archiveTaskFor(entry) ? { disabled: true } : {}),
                 onclick: () => void archiveEntry(entry.key, titleCell(entry, 0)),
+              })
+            : null,
+          // A title already in R2 can be re-checked (its manifest re-read and
+          // every object re-hashed) and, once whole, put back into Bunny.
+          state.settings?.archive?.configured && entry.archive
+            ? h('button', {
+                text: entry.archive.verify && !entry.archive.verify.ok ? 're-check' : 'check',
+                title: 'Re-read this title’s manifest from R2 and re-hash every object it lists against the bucket. It runs in the background.',
+                ...(archiveTaskFor(entry) ? { disabled: true } : {}),
+                onclick: () => void verifyEntry(entry.key, titleCell(entry, 0)),
+              })
+            : null,
+          // A check that failed is the one signal a repair needs: the flagged
+          // objects are the work list, so the button only appears after one.
+          state.settings?.archive?.configured && entry.archive?.verify && !entry.archive.verify.ok
+            ? h('button', {
+                text: 'repair',
+                title: repairHint(entry),
+                ...(archiveTaskFor(entry) ? { disabled: true } : {}),
+                onclick: () => void repairEntry(entry.key, titleCell(entry, 0)),
+              })
+            : null,
+          state.settings?.archive?.configured && entry.archive?.complete
+            ? h('button', {
+                text: 'restore',
+                title: 'Stream the best archived rendition back out of R2 into a fresh Bunny video, captions included. The archive stays where it is.',
+                ...(archiveTaskFor(entry) ? { disabled: true } : {}),
+                onclick: () => void restoreEntry(entry.key, titleCell(entry, 0)),
               })
             : null,
           h('button', { text: 'forget', onclick: () => void forgetLibraryEntry(entry.key, titleCell(entry, 0)) }),
@@ -1447,15 +1785,7 @@
       ['origin', `${entry.origin?.kind ?? '—'}${entry.origin?.mode ? ` (${entry.origin.mode})` : ''} · ${entry.origin?.name ?? '—'}${entry.origin?.input ? ` · input ${entry.origin.input}` : ''}`],
       ['scrape options', `min tier ${entry.origin?.minHeight !== undefined ? `${entry.origin.minHeight || 'any'}p` : 'default'}${entry.origin?.only?.length ? ` · hosts ${entry.origin.only.join(', ')}` : ' · every host'}`],
       ['subtitles', entry.subtitles?.length ? entry.subtitles.map((track) => `${track.srclang}${track.translated ? ' (translated)' : ''}${track.uploaded ? '' : ' (not attached)'}`).join(', ') : 'none carried'],
-      [
-        'R2 archive',
-        entry.archive
-          ? `${entry.archive.bucket}/${entry.archive.prefix} · ${(entry.archive.objects ?? []).length} object(s) · ${bytes(entry.archive.bytes)}` +
-            `${entry.archive.videos !== undefined ? ` (${entry.archive.videos} rendition(s), ${bytes(entry.archive.videoBytes)})` : ''}` +
-            `${entry.archive.complete ? '' : ' · INCOMPLETE'} · ${entry.archive.removedFromBunny ? 'removed from Bunny' : 'Bunny still holds it'}` +
-            `${entry.archive.note ? ` · ${entry.archive.note}` : ''}`
-          : 'not archived',
-      ],
+      ['R2 archive', archiveDetailLine(entry)],
       ['job', entry.jobId],
     ];
     box.append(
@@ -1532,6 +1862,7 @@
   $('#library-refresh').addEventListener('click', () => void refreshLibrary());
   $('#library-backfill').addEventListener('click', () => void runBackfill());
   $('#library-archive').addEventListener('click', () => void runArchive());
+  $('#library-verify').addEventListener('click', () => void runVerify());
   $('#library-kind').addEventListener('change', () => {
     closeLibraryDetail();
     void refreshLibrary();
@@ -1747,11 +2078,16 @@
     $('#settings-archive').checked = Boolean(archive.configured) && archive.auto !== false;
     $('#settings-archive').disabled = !archive.configured;
     $('#settings-archive-note').textContent = archive.configured
-      ? `${archive.bucket} · ${archive.prefix}${archive.keepBunny ? ' · keeps the Bunny copy' : ' · removes the Bunny copy'}`
+      ? `${archive.bucket} · ${archive.prefix}${archive.keepBunny ? ' · keeps the Bunny copy' : ' · removes the Bunny copy'}` +
+        ` · plays with signed URLs (${archiveTtlLabel(archive.urlTtl)})`
       : 'not configured — set R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY and R2_BUCKET';
     $('#library-archive').disabled = !archive.configured;
     $('#library-archive').title = archive.configured
       ? `Copy the titles below into ${archive.bucket} and remove them from Bunny`
+      : 'no R2 destination is configured';
+    $('#library-verify').disabled = !archive.configured;
+    $('#library-verify').title = archive.configured
+      ? `Re-read every manifest in ${archive.bucket} and re-hash the objects it lists`
       : 'no R2 destination is configured';
     $('#mode-badge').textContent = settings.mock ? 'MOCK providers' : 'live providers';
 
@@ -1782,7 +2118,9 @@
       [
         'R2 archive',
         settings.archive?.configured
-          ? `${settings.archive.bucket}/${settings.archive.prefix}${settings.archive.keepBunny ? ' · keeps the Bunny copy' : ' · removes the Bunny copy'}${settings.archive.publicBase ? ` · ${settings.archive.publicBase}` : ' · no public base, so playback stays pointed at Bunny'}`
+          ? `${settings.archive.bucket}/${settings.archive.prefix}${settings.archive.keepBunny ? ' · keeps the Bunny copy' : ' · removes the Bunny copy'}` +
+            ` · plays through the dashboard with signed URLs (${archiveTtlLabel(settings.archive.urlTtl)}, R2_URL_TTL)` +
+            `${settings.archive.publicBase ? ` · also served at ${settings.archive.publicBase}` : ' · no public base needed'}`
           : 'not configured',
       ],
       ['scrape pace', `${settings.source?.minIntervalMs ?? 350} ms between hits to one host · first cooldown ${fmtDuration(settings.source?.cooldownMs ?? 60_000)}`],

@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { clampPresignExpiry } from './r2';
 import { normalizeLanguage } from './subtitles';
 import { clampChunkBytes } from './tus';
 
@@ -113,6 +114,14 @@ export interface R2ArchiveConfig {
   enabled: boolean;
   /** Keep the video in Bunny after a successful archive (default: remove it). */
   keepBunny: boolean;
+  /**
+   * How long a signed playback URL stays valid, in seconds (default 300).
+   *
+   * The dashboard serves an archived title by redirecting to a presigned R2 URL,
+   * so playback needs no public bucket and the link expires on its own. Clamped
+   * to S3's own 1 s – 7 day range.
+   */
+  urlTtl: number;
 }
 
 export function clampConcurrency(value: unknown, fallback = DEFAULT_CONCURRENCY): number {
@@ -213,6 +222,7 @@ export function parseR2(env: NodeJS.ProcessEnv): { config?: R2ArchiveConfig; not
   const prefix = read('R2_PREFIX').replace(/^\/+|\/+$/g, '');
   const publicBase = read('R2_PUBLIC_BASE').replace(/\/+$/, '');
   const endpoint = read('R2_ENDPOINT');
+  const urlTtl = read('R2_URL_TTL');
   return {
     config: {
       accountId: read('R2_ACCOUNT_ID'),
@@ -224,6 +234,7 @@ export function parseR2(env: NodeJS.ProcessEnv): { config?: R2ArchiveConfig; not
       prefix: prefix || 'archive',
       enabled: envFlag(env.R2_ARCHIVE, true),
       keepBunny: envFlag(env.R2_KEEP_BUNNY, false),
+      urlTtl: clampPresignExpiry(urlTtl === '' ? undefined : urlTtl),
     },
   };
 }

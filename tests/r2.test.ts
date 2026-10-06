@@ -17,11 +17,14 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import test from 'node:test';
 import {
+  DEFAULT_PRESIGN_SECONDS,
   MULTIPART_PART_BYTES,
+  PRESIGN_MAX_SECONDS,
   SINGLE_PUT_LIMIT_BYTES,
   R2Client,
   canonicalHeaders,
   canonicalQuery,
+  clampPresignExpiry,
   encodeRfc3986,
   extractTag,
   sha256Hex,
@@ -176,6 +179,64 @@ for (const vector of VECTORS) {
     assert.ok(result.authorization.endsWith(`Signature=${vector.signature}`), result.authorization);
   });
 }
+
+/* ------------------------------------------------------------------ */
+/* The presigned form of the same signature                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * AWS publishes one worked presigned example — `test.txt` in `examplebucket`,
+ * for 24 hours, on 24 May 2013 — and its canonical request, string-to-sign and
+ * signature are used here verbatim. It is the only published pin for the three
+ * things presigning changes: the query string joins the canonical request, the
+ * payload hash becomes the constant `UNSIGNED-PAYLOAD`, and only `host` is
+ * signed (which is what leaves a player free to send `Range` requests).
+ *
+ * The signature is checked directly rather than through `R2Client.presign`
+ * because the example is virtual-hosted (`examplebucket.s3.amazonaws.com`,
+ * path `/test.txt`) while this client is deliberately path-style
+ * (`<endpoint>/<bucket>/<key>`, which is what R2 wants); the same signer sits
+ * under both, so pinning it here pins the URL below.
+ */
+test('the signer reproduces AWS’s published presigned-URL example', () => {
+  const result = signRequest({
+    method: 'GET',
+    path: '/test.txt',
+    query: [
+      ['X-Amz-Algorithm', 'AWS4-HMAC-SHA256'],
+      ['X-Amz-Credential', 'AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request'],
+      ['X-Amz-Date', '20130524T000000Z'],
+      ['X-Amz-Expires', '86400'],
+      ['X-Amz-SignedHeaders', 'host'],
+    ],
+    headers: { host: 'examplebucket.s3.amazonaws.com' },
+    payloadHash: 'UNSIGNED-PAYLOAD',
+    accessKeyId: 'AKIAIOSFODNN7EXAMPLE',
+    secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+    region: 'us-east-1',
+    service: 's3',
+    date: new Date('2013-05-24T00:00:00Z'),
+  });
+  const query =
+    'X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request' +
+    '&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host';
+  assert.equal(result.canonicalRequest, ['GET', '/test.txt', query, 'host:examplebucket.s3.amazonaws.com', '', 'host', 'UNSIGNED-PAYLOAD'].join('\n'));
+  assert.equal(
+    result.stringToSign,
+    ['AWS4-HMAC-SHA256', '20130524T000000Z', '20130524/us-east-1/s3/aws4_request', '3bfa292879f6447bbcda7001decf97f4a54dc650c8942174ae0a9121cf58ad04'].join('\n'),
+  );
+  assert.equal(result.signature, 'aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404');
+});
+
+test('the presign expiry is clamped to what S3 accepts', () => {
+  assert.equal(clampPresignExpiry(undefined), DEFAULT_PRESIGN_SECONDS);
+  assert.equal(clampPresignExpiry('nonsense'), DEFAULT_PRESIGN_SECONDS);
+  assert.equal(clampPresignExpiry(60), 60);
+  assert.equal(clampPresignExpiry(12.7), 12);
+  assert.equal(clampPresignExpiry(0), 1);
+  assert.equal(clampPresignExpiry(-5), 1);
+  assert.equal(clampPresignExpiry(99_999_999), PRESIGN_MAX_SECONDS);
+});
 
 /* ------------------------------------------------------------------ */
 /* The small pieces the signer is built from                           */
@@ -378,6 +439,86 @@ test('a refused HEAD surfaces instead of reading as a missing object', async () 
     await assert.rejects(() => r2.head('present.bin'), /403/);
     // A real 404 is still the quiet answer it should be.
     assert.equal(await r2.head('absent.bin'), undefined);
+  } finally {
+    await fake.close();
+  }
+});
+
+test('presign builds an expiring, signed URL for the bucket path', async () => {
+  const fake = await startFakeR2();
+  try {
+    const r2 = clientFor(fake);
+    const signed = r2.presign('archive/a b/one.mp4', { expiresIn: 60 });
+    // The same instant signs the same URL; a different one signs differently.
+    assert.equal(r2.presign('archive/a b/one.mp4', { expiresIn: 60 }), signed);
+
+    const url = new URL(signed);
+    assert.equal(url.origin, fake.url);
+    // Path-style and RFC 3986 encoded: a space is `%20`, never `+`.
+    assert.ok(url.pathname.endsWith('/archive/archive/a%20b/one.mp4'), url.pathname);
+    assert.equal(url.searchParams.get('X-Amz-Algorithm'), 'AWS4-HMAC-SHA256');
+    assert.equal(url.searchParams.get('X-Amz-Credential'), 'key-id/20240102/auto/s3/aws4_request');
+    assert.equal(url.searchParams.get('X-Amz-Date'), '20240102T030405Z');
+    assert.equal(url.searchParams.get('X-Amz-Expires'), '60');
+    assert.equal(url.searchParams.get('X-Amz-SignedHeaders'), 'host');
+    assert.match(url.searchParams.get('X-Amz-Signature') ?? '', /^[0-9a-f]{64}$/);
+
+    const later = new URL(r2.presign('archive/a b/one.mp4', { expiresIn: 60, now: new Date('2024-01-02T03:05:05Z') }));
+    assert.notEqual(later.searchParams.get('X-Amz-Signature'), url.searchParams.get('X-Amz-Signature'));
+    assert.equal(new URL(r2.presign('k')).searchParams.get('X-Amz-Expires'), String(DEFAULT_PRESIGN_SECONDS));
+  } finally {
+    await fake.close();
+  }
+});
+
+test('a presigned URL fetches the object it names', async () => {
+  const fake = await startFakeR2();
+  try {
+    const r2 = clientFor(fake);
+    const body = Buffer.from('signed playback bytes');
+    await r2.put('archive/one.mp4', body);
+    const fetched = await fetch(r2.presign('archive/one.mp4', { expiresIn: 60 }));
+    assert.equal(fetched.status, 200);
+    assert.deepEqual(Buffer.from(await fetched.arrayBuffer()), body);
+    // And the key it was signed for is the only one it names.
+    assert.equal(await r2.exists('archive/one.mp4'), true);
+  } finally {
+    await fake.close();
+  }
+});
+
+test('read streams an object back, counting the bytes and hashing what it read', async () => {
+  const fake = await startFakeR2();
+  try {
+    const r2 = clientFor(fake);
+    const body = Buffer.from('the quick brown fox jumps over the lazy dog');
+    const uploaded = await r2.put('archive/one.mp4', body);
+    const chunks: Buffer[] = [];
+    const read = await r2.read('archive/one.mp4', (chunk) => {
+      chunks.push(chunk);
+    });
+    assert.ok(read);
+    assert.equal(read.bytes, body.length);
+    assert.equal(read.sha256, uploaded.sha256);
+    assert.deepEqual(Buffer.concat(chunks), body);
+    // An object that is not there is `undefined`, never an empty success.
+    assert.equal(await r2.read('archive/absent.mp4'), undefined);
+    assert.equal(await r2.open('archive/absent.mp4'), undefined);
+  } finally {
+    await fake.close();
+  }
+});
+
+test('a refused read surfaces instead of reading as a missing object', async () => {
+  const fake = await startFakeR2();
+  try {
+    const r2 = clientFor(fake);
+    await r2.put('archive/one.mp4', Buffer.from('x'));
+    fake.failGets(1, 403);
+    // A verification pass must fail loudly here: treating a refusal as "gone"
+    // would report a healthy archive as full of missing objects.
+    await assert.rejects(() => r2.read('archive/one.mp4'), /403/);
+    assert.equal(fake.transcript.gets, 1);
   } finally {
     await fake.close();
   }

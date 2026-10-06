@@ -135,8 +135,15 @@ Paste that URL into **Source URL** and press **Download & upload**.
   folder with a `manifest.json` that hashes every object. Each upload is
   confirmed with a `HEAD` against the bucket, and **only then is the video
   deleted from Bunny**. A title whose MP4 renditions are missing (MP4 Fallback
-  switched off in the library, most often) is left exactly where it is. See
-  *R2 archive* below.
+  switched off in the library, most often) is left exactly where it is. It runs
+  as its **own background queue** — one title at a time, with a live per-title
+  percentage in the Library — so nothing ever waits on a multi-gigabyte copy.
+  The same queue re-checks a folder later by **re-hashing every object against
+  its manifest** in R2, **mends the specific objects a check flags** (re-fetching
+  them from Bunny, or falling back to the bucket's intact copies), and can **put
+  a title back into Bunny** from the archive. Archived titles play **through the
+  dashboard with short-lived signed URLs**, so the bucket never needs to be
+  public. See *R2 archive* below.
 - **Named by TMDB id**: the video object created in Bunny is called `tmdb:27205`
   for a movie and `tv:1396:S01E02` for an episode, not `Inception (2010)`.
   A library of ids stays unique and joinable back to TMDB (and to this
@@ -217,8 +224,9 @@ at startup and never overrides real environment variables.
 | `R2_SECRET_ACCESS_KEY` | – | R2 API token's secret |
 | `R2_BUCKET` | – | the bucket finished titles are copied into |
 | `R2_ENDPOINT` | `https://<account>.r2.cloudflarestorage.com` | overrides the S3 endpoint |
-| `R2_PUBLIC_BASE` | – | a public base (`https://pub-….r2.dev` or a custom domain) so the archive can be played back; without it playback stays pointed at Bunny |
+| `R2_PUBLIC_BASE` | – | an *optional* public base (`https://pub-….r2.dev` or a custom domain); not needed for playback, which the dashboard serves with signed URLs |
 | `R2_PREFIX` | `archive` | the folder every title is filed under |
+| `R2_URL_TTL` | `300` | how long a signed playback URL stays valid, in seconds (clamped 1 s – 7 days). The bucket can stay private |
 | `R2_ARCHIVE` | `1` | copy a finished publish automatically (also the default of the dashboard switch) |
 | `R2_KEEP_BUNNY` | `0` | `1` keeps the video in Bunny after a successful archive instead of deleting it |
 | `DASHBOARD_USER` | `index` | login user, used only when a password is set |
@@ -502,6 +510,31 @@ an object only counts once R2 itself says it is there, at the size that was sent
 `manifest.json` is written last, so its presence is what "this folder is a
 complete archive" means.
 
+### It runs as a background queue, not inside a request
+
+Moving several gigabytes takes minutes, so a title is a **task on a queue**, not
+a long HTTP call. `POST /api/archive` puts the picked titles in line and answers
+immediately; one title moves at a time, and every title reports its own status
+(`queued` → `active` → `done`/`failed`/`skipped`) and its own stage —
+`checking` (read the video back from Bunny), `scanning` (HEAD every asset to
+measure the job), `uploading` (one file at a time, in bytes), `manifest`,
+`deleting`.
+
+The measurement happens up front, which is what makes a progress bar honest —
+the task knows the whole plan before it moves a byte, so the Library can show
+`video/1080p.mp4 · 42% (1.4 GB of 3.4 GB)` rather than a spinner — and an
+unreachable pull zone fails the title before anything is copied. A title waiting
+behind another says where it is in line.
+
+Progress is pushed, not polled: the same live event stream that carries the
+queue carries `archive` deltas, each task coalesced to its latest state over the
+same 250 ms window the job rows use — a multi-gigabyte upload reports its bytes
+hundreds of times, and only the newest reading is sent. A page that reloads
+mid-copy reads the current queue from `/api/archive` and carries on watching.
+The task state itself is in memory (it describes work in progress, and a restart
+simply offers the title again); what actually happened is the catalogue record
+written at the end.
+
 ### Then, and only then, Bunny is told to forget it
 
 The video is deleted from Bunny only after every object verified and the manifest
@@ -517,11 +550,75 @@ published, the archive waits for it to settle before it reads the video —
 deleting a video a caption upload is still in flight against would throw that
 translation away.
 
-When the bucket has a public base, playback for an archived title is repointed at
-the R2 copy (`…/hls/playlist.m3u8`); otherwise the old Bunny URL is kept as the
-only link that ever worked. Either way the catalogue record says which bucket,
-which folder, how many objects, how many bytes, whether the copy is whole, and
-whether Bunny still holds the video.
+Playback moves to the dashboard: an archived title's `playbackUrl` is the
+dashboard's own `/api/archive/play/<key>` route, which answers with a **redirect
+to a short-lived signed R2 URL** for the best archived rendition. The bucket
+therefore never has to be public — the dashboard is the gatekeeper, the link it
+hands out expires in `R2_URL_TTL` seconds, and a title Bunny was told to forget
+still plays. Only `host` is signed, so the player can still send `Range`
+requests; the bytes go straight from R2 to the player, not through the
+dashboard. `R2_PUBLIC_BASE` remains optional and, when set, the folder's public
+URL is recorded as `archive.base` for direct browsing. Either way the catalogue
+record says which bucket, which folder, how many objects, how many bytes, which
+object is the playable rendition, whether the copy is whole, and whether Bunny
+still holds the video.
+
+### Checking a copy, months later
+
+An archive is only worth having if it is still the thing it claims to be, so the
+**check R2** button in the Library (or `POST /api/archive/verify`) re-reads each
+title's `manifest.json` **out of the bucket** — not out of the local catalogue —
+and then downloads every object the manifest lists and compares its SHA-256 and
+its size to what was recorded when it was written. A `HEAD` would only prove the
+object is still *there*; hashing the bytes is what proves it is still the *same*
+bytes.
+
+Like an archive, a check is a task on the background queue: `checking` →
+`verifying` (one object at a time, counted in the row) → `done`. **check R2**
+walks up to 25 archived titles per press. The verdict is written onto the
+catalogue entry — `verifiedAt`, plus `ok`, `checked`, `missing` and `mismatched`
+lists — so "when was this last checked, and did it pass?" survives a reload. A
+title whose bytes no longer match is reported rather than quietly repaired: the
+row turns up in the red with the object's name, and the stored object is left
+exactly as it was found.
+
+### Mending what a check finds
+
+A failed check names its objects, and `repair` on the row (or
+`POST /api/archive/repair`) mends **just those** — the alternative, archiving the
+title again, would re-download gigabytes to fix one file, and would not be
+possible at all once Bunny has let the video go.
+
+Each flagged object is fetched again from the pull zone it originally came from
+and spooled to disk, so the fresh bytes are hashed *before* the stored object is
+touched. A copy that hashes to exactly what the manifest recorded replaces what is
+in the bucket; a copy Bunny now serves differently is stored **and recorded as
+drift**, with its new hash, because Bunny is the origin and the record is the half
+that has gone stale. Nothing is re-encoded, nothing is invented, and only the
+flagged objects move.
+
+When Bunny no longer holds the video there is nothing to fetch from, so the
+repair falls back to what the bucket still has: playback moves onto the tallest
+**intact** rendition, the objects nothing can supply are dropped from the record,
+and `manifest.json` is rewritten so the folder agrees with the bucket again. The
+repair finishes by verifying the folder as it now stands — a mend nobody checked
+is just another claim — so the verdict on the record always describes the bucket
+rather than the intention. Everything it did is recorded under `archive.repair`
+(`recopied`, `drifted`, `dropped`, and the rendition playback moved to).
+
+### Putting a title back into Bunny
+
+The opposite trip is a **restore** (`restore` on a Library row, or
+`POST /api/archive/restore`). It streams the **tallest archived MP4 rendition**
+back out of R2 — hashing it on the way, so a corrupt object is caught before it
+becomes a Bunny video — creates a fresh video, uploads the file, and re-attaches
+every caption the folder holds. The Bunny URL the archive replaced is then the
+video's playback URL again, and the catalogue follows the new video id.
+
+A restore is a **copy, not a move**: the R2 archive is left exactly where it is,
+so a title can live in both places, and be archived again afterwards. The task
+runs on the same queue and reports both halves of the round trip in one bar —
+bytes out of R2, then bytes into Bunny.
 
 ## Autopilot
 
@@ -647,15 +744,19 @@ keeps the queue honest.
 | `POST` | `/api/jobs/:id/retry` / `/cancel` | lifecycle |
 | `DELETE` | `/api/jobs/:id` | remove a finished job |
 | `GET` | `/api/queue/stats` | counts + per-account usage |
-| `GET` | `/api/events` | the live queue as `text/event-stream`: `hello` (current state), `jobs` (a delta of `{kind, job}`), `stats`, `catalog` — see [Live queue](#live-queue) |
+| `GET` | `/api/events` | the live queue as `text/event-stream`: `hello` (current state), `jobs` (a delta of `{kind, job}`), `archive` (a delta of `{kind, task}` while titles copy to R2), `stats`, `catalog` — see [Live queue](#live-queue) |
 | `GET` | `/api/catalog?q=&kind=&limit=&subtitles=` | published titles (search + filter) with stats; `subtitles=missing\|has` filters on the target languages and the answer carries the scoped missing count and the target list |
 | `GET` | `/api/catalog/stats` | how many titles/qualities are recorded and how many bytes |
 | `GET` | `/api/catalog/:key` | one record in full: every quality rung and every source URL |
 | `DELETE` | `/api/catalog/:key` | forget a record (Bunny keeps the video) |
 | `GET` | `/api/subtitles/backfill` | which published titles are still missing a target language, which languages each is missing, and what each would be translated from — a report only, nothing is fetched |
 | `POST` | `/api/subtitles/backfill` | fill them in: `{ keys?, limit? }`. Re-reads the recorded subtitle text once, translates and attaches every missing language to the video that already exists — no re-download, no re-publish |
-| `GET` | `/api/archive` | which published titles still have a Bunny copy waiting to be archived — a report only |
-| `POST` | `/api/archive` | archive them: `{ keys?, limit? }`. Copies every rendition, still and caption into R2, verifies each object, writes the manifest, then deletes the video from Bunny; answers one line per title |
+| `GET` | `/api/archive` | which published titles still have a Bunny copy waiting to be archived, what R2 holds and could be re-checked (`verify`), mended (`repair`) or put back (`restore`), plus the queue's live tasks (status, stage, bytes) |
+| `POST` | `/api/archive` | **queue** them: `{ keys?, limit? }`. Answers at once with what was queued and what was skipped; the copying runs on the archive's own queue and reports progress on `/api/events` |
+| `POST` | `/api/archive/verify` | **queue a verification pass**: re-read each manifest from R2 and re-hash every object it lists. `{ keys?, limit? }`, answers at once |
+| `POST` | `/api/archive/repair` | **queue a targeted repair**: mend just the objects the last check flagged, from Bunny or from the bucket's intact copies. `{ keys?, limit? }`, answers at once |
+| `POST` | `/api/archive/restore` | **queue a restore**: stream an archived title back into a fresh Bunny video, captions included. `{ keys?, limit? }`, answers at once |
+| `GET` | `/api/archive/play/:key` | **play an archived title**: `302` to a short-lived signed R2 URL for its best rendition, so the bucket can stay private |
 | `GET`/`PUT` | `/api/autopilot` | read / change the autopilot (rating floor, lists, limits, interval) |
 | `POST` | `/api/autopilot/run` | run one cycle now, whatever the schedule says |
 | `POST` | `/api/autopilot/reset` | reset the page cursors to page 1 |
@@ -777,7 +878,7 @@ right home for the queue. Hosts that build from a git repository only need the
 
 ```bash
 npm run typecheck        # tsc --noEmit
-npm test                 # 220 tests (queue caps, crypto, store + its change hook, catalogue, clients, TUS, watcher, job lifecycle, crash resume, HLS, source pipeline, subtitles, DeepL translation, multi-language targets, subtitle backfill and its automatic repair, the R2 archive and its SigV4 signer, tunnel, network policy, diagnostics, login, autopilot, host politeness)
+npm test                 # 243 tests (queue caps, crypto, store + its change hook, catalogue, clients, TUS, watcher, job lifecycle, crash resume, HLS, source pipeline, subtitles, DeepL translation, multi-language targets, subtitle backfill and its automatic repair, the R2 archive background queue with its verification pass, targeted repair, restore and signed-URL playback, and its SigV4 signer/presigner, tunnel, network policy, diagnostics, login, autopilot, host politeness)
 
 # End-to-end against a running mock server:
 npm run mock &           # or in another terminal

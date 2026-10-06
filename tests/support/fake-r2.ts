@@ -41,11 +41,18 @@ export interface FakeR2 {
     completes: number;
     aborts: number;
     heads: number;
+    gets: number;
     deletes: number;
     lists: number;
     requests: FakeR2Request[];
   };
   objects(): Map<string, FakeR2Object>;
+  /**
+   * Replaces an object's bytes in place, so a test can watch a verification pass
+   * notice that what is stored no longer hashes to what the manifest recorded.
+   * Returns false when the key was not there to begin with.
+   */
+  tamper(key: string, body: Buffer | string): boolean;
   /** Make the next `count` part uploads answer `status` (default 500). */
   failParts(count?: number, status?: number): void;
   /** Make the next `count` completion calls answer `status` (default 500). */
@@ -54,6 +61,8 @@ export interface FakeR2 {
   failPuts(count?: number, status?: number): void;
   /** Make the next `count` `HEAD`s answer `status` (default 500). */
   failHeads(count?: number, status?: number): void;
+  /** Make the next `count` object `GET`s answer `status` (default 500). */
+  failGets(count?: number, status?: number): void;
   close(): Promise<void>;
 }
 
@@ -85,6 +94,8 @@ export async function startFakeR2(bucket = 'archive'): Promise<FakeR2> {
   let failPutStatus = 500;
   let failHead = 0;
   let failHeadStatus = 500;
+  let failGet = 0;
+  let failGetStatus = 500;
   const transcript: FakeR2['transcript'] = {
     puts: 0,
     multipartCreates: 0,
@@ -92,6 +103,7 @@ export async function startFakeR2(bucket = 'archive'): Promise<FakeR2> {
     completes: 0,
     aborts: 0,
     heads: 0,
+    gets: 0,
     deletes: 0,
     lists: 0,
     requests: [],
@@ -239,6 +251,12 @@ export async function startFakeR2(bucket = 'archive'): Promise<FakeR2> {
     }
 
     if (method === 'GET') {
+      transcript.gets += 1;
+      if (failGet > 0) {
+        failGet -= 1;
+        xml(response, failGetStatus, '<Error><Code>AccessDenied</Code><Message>denied</Message></Error>');
+        return;
+      }
       const object = objects.get(key);
       if (!object) {
         xml(response, 404, '<Error><Code>NoSuchKey</Code></Error>');
@@ -266,6 +284,13 @@ export async function startFakeR2(bucket = 'archive'): Promise<FakeR2> {
     bucket,
     transcript,
     objects: () => new Map([...objects.entries()]),
+    tamper: (key: string, body: Buffer | string) => {
+      const object = objects.get(key);
+      if (!object) return false;
+      const next = Buffer.isBuffer(body) ? body : Buffer.from(body, 'utf8');
+      objects.set(key, { ...object, body: next, etag: md5(next) });
+      return true;
+    },
     failParts: (count = 1, status = 500) => {
       failPart = count;
       failPartStatus = status;
@@ -281,6 +306,10 @@ export async function startFakeR2(bucket = 'archive'): Promise<FakeR2> {
     failHeads: (count = 1, status = 500) => {
       failHead = count;
       failHeadStatus = status;
+    },
+    failGets: (count = 1, status = 500) => {
+      failGet = count;
+      failGetStatus = status;
     },
     close: () =>
       new Promise<void>((resolve) => {

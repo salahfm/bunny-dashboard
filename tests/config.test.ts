@@ -76,6 +76,7 @@ test('the R2 archive needs all of its keys, or none of them', () => {
     prefix: 'videos',
     enabled: true,
     keepBunny: false,
+    urlTtl: 300,
   });
 });
 
@@ -87,6 +88,12 @@ test('the archive switches read like every other flag, and the prefix has a defa
   // Keeping the Bunny copy is the opposite switch, and off by default.
   assert.equal(parseR2({ ...base, R2_KEEP_BUNNY: '1' }).config?.keepBunny, true);
   assert.equal(parseR2({ ...base, R2_PREFIX: '   ' }).config?.prefix, 'archive');
+  // The signed playback URL's life: five minutes by default, clamped to S3's range.
+  assert.equal(parseR2(base).config?.urlTtl, 300);
+  assert.equal(parseR2({ ...base, R2_URL_TTL: '900' }).config?.urlTtl, 900);
+  assert.equal(parseR2({ ...base, R2_URL_TTL: '0' }).config?.urlTtl, 1);
+  assert.equal(parseR2({ ...base, R2_URL_TTL: '99999999' }).config?.urlTtl, 604_800);
+  assert.equal(parseR2({ ...base, R2_URL_TTL: 'soon' }).config?.urlTtl, 300);
 });
 
 test('the TUS chunk size is clamped to sane bounds', () => {

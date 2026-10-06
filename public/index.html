@@ -321,6 +321,10 @@
               id="library-archive"
               title="Copy every MP4 rendition, thumbnail, animated preview, sprite and caption of the titles below into Cloudflare R2, verify it, and only then let Bunny forget the video."
             >move to R2</button>
+            <button
+              id="library-verify"
+              title="Re-read each archive's manifest from R2 and re-hash every object it lists against the bucket, so a copy that has rotted is found rather than assumed."
+            >check R2</button>
             <span id="library-missing" class="muted small"></span>
             <span id="library-summary" class="muted small"></span>
           </div>
