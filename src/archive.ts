@@ -146,6 +146,20 @@ export type ArchiveStage =
  */
 export type ArchiveOperation = 'archive' | 'verify' | 'restore' | 'repair';
 
+/**
+ * What one pass over the titles Bunny still holds did.
+ *
+ * `removed` is what it took out; `failed` is what Bunny refused again, which the
+ * next pass tries once more; `skipped` counts entries whose account is gone, so
+ * there is nobody left to delete the video with.
+ */
+export interface ArchiveRemovalReport {
+  attempted: number;
+  removed: string[];
+  failed: Array<{ key: string; error: string }>;
+  skipped: number;
+}
+
 export type ArchiveTaskChange = 'added' | 'updated' | 'removed';
 
 /** One title's archive, as the queue and the browser see it. */
@@ -604,10 +618,19 @@ export class ArchiveService {
     return entry.archive.verify?.ok === false && flaggedObjects(entry.archive.verify).length > 0;
   }
 
-  /** What the Library asks before offering an archive: which titles are left. */
+  /**
+   * What the Library asks before offering an archive: which titles are left.
+   *
+   * Oldest publication first, which is the order a backlog should be worked in
+   * — the title that has been waiting longest is the one still sitting in Bunny
+   * (and paying for itself there) for the longest. The automatic sweep takes the
+   * same list, so a library larger than one batch drains in the order it
+   * accumulated rather than newest first.
+   */
   preview(): { configured: boolean; enabled: boolean; candidates: ArchiveCandidate[] } {
     const candidates = this.deps.catalog
       .all()
+      .sort((a, b) => a.firstPublishedAt.localeCompare(b.firstPublishedAt))
       .filter((entry) => this.eligible(entry))
       .map((entry) => ({
         key: entry.key,
@@ -737,6 +760,56 @@ export class ArchiveService {
   }
 
   /**
+   * Retries the Bunny deletes that did not happen.
+   *
+   * A copy that verified in R2 but whose `deleteVideo` failed leaves the worst
+   * kind of leftover: the archive is complete and safe, the record says Bunny
+   * "still holds the video", and nothing ever tries again — so the title keeps
+   * its bytes in the library forever, which is exactly what the operator asked
+   * not to happen. Only entries whose archive **completed** are considered, so
+   * this can never take a video out of Bunny that is not already in the bucket,
+   * and turning `R2_KEEP_BUNNY` off later means the copies made while it was on
+   * are removed too — which is what the switch says.
+   */
+  async removeLeftovers(limit = 25): Promise<ArchiveRemovalReport> {
+    const report: ArchiveRemovalReport = { attempted: 0, removed: [], failed: [], skipped: 0 };
+    const config = this.deps.config.r2;
+    if (!config || config.keepBunny) return report;
+    const leftovers = this.deps.catalog
+      .all()
+      .filter((entry) => entry.archive?.complete === true && entry.archive.removedFromBunny !== true)
+      .slice(0, Math.max(1, Math.floor(limit)));
+    for (const entry of leftovers) {
+      const previous = entry.archive;
+      // Not reachable through the filter above, but it is what makes the record
+      // below a copy of a real archive rather than of `undefined`.
+      if (!previous) continue;
+      // The video the *archive* was made of: after a republish the entry points
+      // at a new one, and the old one is the copy that is already in R2.
+      const videoId = previous.videoId ?? entry.videoId;
+      const client = this.deps.client(entry);
+      if (!videoId || !client) {
+        report.skipped += 1;
+        continue;
+      }
+      report.attempted += 1;
+      try {
+        await client.deleteVideo(videoId);
+      } catch (error) {
+        const reason = describeError(error);
+        report.failed.push({ key: entry.key, error: reason });
+        this.logLine(`[archive] ${entry.key}: Bunny still refuses to delete the video — ${reason}`);
+        continue;
+      }
+      const archive: CatalogArchive = { ...previous, removedFromBunny: true, removedAt: this.nowIso() };
+      delete archive.note;
+      this.writeRecord(entry.key, archive);
+      report.removed.push(entry.key);
+    }
+    return report;
+  }
+
+  /**
    * Called with the catalogue entry a finished job wrote. Queues an archive when
    * there is one to do, and says so; returns false when there is not (nothing to
    * archive, no destination, or the title is already queued).
@@ -816,14 +889,26 @@ export class ArchiveService {
     return { configured: true, results };
   }
 
-  /** Runs the queue to completion, one title at a time. */
+  /**
+   * Runs the queue to completion, one title at a time.
+   *
+   * Every caller starts this as `void this.drain()`, so nothing it awaits may
+   * reject: a floating rejection is an unhandled one, and Node ends the process
+   * on it — killing every other upload with it. A title that throws is logged
+   * and the queue moves on.
+   */
   private drain(): Promise<void> {
     if (this.draining) return this.draining;
     this.draining = (async () => {
       while (this.queue.length) {
         const item = this.queue.shift();
         if (!item) break;
-        await this.execute(this.deps.catalog.get(item.key), item);
+        try {
+          await this.execute(this.deps.catalog.get(item.key), item);
+        } catch (error) {
+          this.active.delete(item.key);
+          this.logLine(`[archive] ${item.key}: the task failed — ${describeError(error)}`);
+        }
       }
     })().finally(() => {
       this.draining = undefined;
@@ -991,8 +1076,21 @@ export class ArchiveService {
     if (!client) return { status: 'skipped', note: 'the account that owns this video is gone' };
 
     // Whatever else is still working on this title (the subtitle repair) gets to
-    // finish first: the archive is the last thing that happens to a title.
-    await this.deps.before?.(entry.key).catch(() => undefined);
+    // finish first: the archive is the last thing that happens to a title, and
+    // deleting the video while a caption upload is still in flight would throw
+    // that translation away with the source it was read from.
+    //
+    // A wait that runs out (a rate-limited translator still retrying) stands the
+    // attempt aside rather than continuing: the copy is not urgent enough to
+    // cost the subtitle the operator asked to have filled in. The title stays a
+    // candidate, and the sweep brings it back once the repair has settled.
+    const busy = await Promise.resolve()
+      .then(() => this.deps.before?.(entry.key))
+      .then(() => undefined)
+      .catch((error: unknown) => describeError(error));
+    if (busy) {
+      return { status: 'skipped', note: `still waiting for the subtitle work on this title — ${busy}` };
+    }
 
     const video = await client.getVideo(entry.videoId);
     if (mapBunnyStatus(video.status) !== 'ready') {

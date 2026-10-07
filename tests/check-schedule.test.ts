@@ -162,6 +162,9 @@ function rig(options: { titles?: Array<[number, string]>; configVerify?: boolean
             urlTtl: 300,
             verify: options.configVerify ?? true,
             verifyIntervalMs: options.configIntervalMs ?? CHECK_DEFAULT_INTERVAL_MS,
+            sweep: false,
+            sweepIntervalMs: 5 * 60_000,
+            sweepBatch: 25,
           },
         }),
   });

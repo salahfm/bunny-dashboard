@@ -253,6 +253,9 @@ at startup and never overrides real environment variables.
 | `R2_KEEP_BUNNY` | `0` | `1` keeps the video in Bunny after a successful archive instead of deleting it |
 | `R2_VERIFY` | `1` | re-check the archive on a schedule, refreshing `verifiedAt` and reporting anything that stopped matching (also the default of the dashboard switch) |
 | `R2_VERIFY_INTERVAL_MS` | `604800000` | how often that pass runs, in ms (clamped 1 hour – 30 days); a weekly pass by default |
+| `R2_SWEEP` | `1` | reconcile the archive on a timer: queue whatever a publish did not finish archiving, and retry the removals Bunny refused |
+| `R2_SWEEP_INTERVAL_MS` | `300000` | how often the reconciler looks for work, in ms (clamped 30 s – 24 h) |
+| `R2_SWEEP_BATCH` | `25` | how many titles one pass queues; the next pass continues (max 500) |
 | `DASHBOARD_USER` | `index` | login user, used only when a password is set |
 | `DASHBOARD_PASSWORD` | – | set it to require the login on every page and API route |
 
@@ -434,6 +437,42 @@ old job finds a new source rather than failing on the URL the first attempt used
 
 Bunny video states are mapped as: `4` finished / `8` JIT playlists → ready,
 `5` error / `6` upload failed → failed, everything else → still working.
+
+### Staying up while the queue is busy
+
+A dashboard that dies takes every in-flight upload with it, and under a restart
+policy (`restart: unless-stopped` in the compose file, or the equivalent on a
+platform) it comes straight back with those jobs requeued — which reads, from the
+outside, as "it restarted itself while too many things were running". Three
+things keep that from happening:
+
+- **Persisting the queue cannot throw.** `db.json` is written on every structural
+  change, from inside the one-second job tick and the poll loop, and a data
+  folder that refuses the write (a full disk, a permissions change, antivirus or a
+  file-sync client holding `db.json.tmp` open) used to throw straight out of the
+  timer callback — an uncaught exception, and the process ended. The failure is
+  now logged once per distinct reason, counted on the store, and retried every
+  5 s, while the in-memory queue stays authoritative; a later successful write
+  logs that it recovered. `/api/diagnostics` reports the count and the reason.
+- **Nothing hot writes the whole database per item.** Progress, byte counters,
+  `stage`, `detail`, and the poll loop's `polls`/`statusCode`/`error` are
+  coalesced into one write (100 ms, flushed on shutdown). Everything else is still
+  written immediately, so an account or a status change is on disk before the call
+  returns. This is the difference between 300 encoding jobs costing one write per
+  poll round and costing 300: at 2 000 jobs that round went from ~11 s of the
+  event loop spent serialising to ~18 ms.
+- **Every background loop, and the process, is guarded.** The tick, the poll
+  loop, the folder scan, the archive queue and the subtitle repair each catch
+  their own failure and log it instead of letting it end the process, and
+  `uncaughtException`/`unhandledRejection` handlers catch the unforeseen: they
+  log, count the error and flush the queue, and the dashboard keeps running. The
+  count is on `/api/diagnostics`, so a recovered error is visible rather than
+  silent.
+
+**Settings → Check network** prints all of it in one row — uptime, memory,
+event-loop lag (worst included), the database write count with any failures and
+their reason, and the number of errors that escaped a loop — which is the first
+thing to look at when the dashboard feels slow or seems to have restarted.
 
 ## Watched folder
 
@@ -642,7 +681,45 @@ exist is streamed once into R2 — a signed `PUT` when it fits in one request, a
 real S3 multipart upload when it does not — and then `HEAD`-ed **in the bucket**:
 an object only counts once R2 itself says it is there, at the size that was sent.
 `manifest.json` is written last, so its presence is what "this folder is a
-complete archive" means.
+complete archive" means. A title's captions go in as they are: whatever the job
+scraped, plus every target language it was translated into, because all of them
+are attached to the video *before* it is considered finished.
+
+### Fully automatic: nothing is left behind
+
+The routing happens on its own, in this order, with no button involved:
+
+1. **A publish finishes** and Bunny reports the video ready. The job has already
+   attached every caption track it could — including the translated ones for
+   `SUBTITLE_TARGET_LANG` — and the full record is written to the catalogue.
+2. **A language the title arrived without** is filled in from the track it did
+   arrive with (see *Subtitles*), by the automatic repair.
+3. **The archive waits for that repair.** The video is not touched while a
+   caption upload is still in flight, because deleting it would throw the
+   translation away with the source it was read from. If the repair is still
+   retrying when the wait runs out, the archive stands this attempt aside rather
+   than continuing — the title stays a candidate and comes back round.
+4. **Everything is copied to R2** — renditions, stills, previews, sprites, and
+   one `subtitles/<lang>.vtt` per caption Bunny holds — each one verified in the
+   bucket as it lands, with `manifest.json` last.
+5. **Only then is the video deleted from Bunny** (unless `R2_KEEP_BUNNY=1`), and
+   the catalogue records what left, when, and under which folder.
+
+That is one event, and events get interrupted — so a **reconciler** (`R2_SWEEP`, on
+by default) re-reads the catalogue every five minutes and does what the *move to
+R2* button does: queue the titles with no completed copy, oldest publication
+first, and retry the deletions Bunny refused. It is what makes the routing
+survive a dashboard restart mid-copy, an R2 outage that outlasts the retry
+budget, a video Bunny would not delete after its copy was already safe, and
+simply having archiving switched off when a title published — none of which the
+single publish event can recover from on its own. Each pass queues a bounded
+batch (`R2_SWEEP_BATCH`), and while the Settings switch is off it queues nothing
+new (it still finishes a removal: the copy is already in the bucket, so that is
+not an archive).
+
+The Library header states it plainly — *automatic: every 5m, 25 title(s) at a
+time · last pass queued 3, removed 3 from Bunny · Bunny lets go once the copy is
+verified* — so whether titles are moving on their own is never a guess.
 
 ### It runs as a background queue, not inside a request
 
@@ -893,7 +970,7 @@ keeps the queue honest.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/api/health` | liveness + mock flag |
-| `GET` | `/api/diagnostics` | reachability of the Bunny API, each pull zone, the scraper hosts and the relay (what **Settings → Check network** renders) |
+| `GET` | `/api/diagnostics` | reachability of the Bunny API, each pull zone, the scraper hosts and the relay, plus a `runtime` block — uptime, Node version, RSS, event-loop lag, how many writes the data folder has refused, and how many errors have escaped a background loop (what **Settings → Check network** renders) |
 | `GET`/`PUT` | `/api/settings` | TMDB credential, queue limits, watched folder, automatic subtitle repair |
 | `GET`/`POST` | `/api/accounts` | list / add an account |
 | `PATCH`/`DELETE` | `/api/accounts/:id` | update (incl. `enabled`) / remove |
@@ -935,7 +1012,7 @@ keeps the queue honest.
 | `DELETE` | `/api/catalog/:key` | forget a record (Bunny keeps the video) |
 | `GET` | `/api/subtitles/backfill` | which published titles are still missing a target language, which languages each is missing, and what each would be translated from — a report only, nothing is fetched |
 | `POST` | `/api/subtitles/backfill` | fill them in: `{ keys?, limit? }`. Re-reads the recorded subtitle text once, translates and attaches every missing language to the video that already exists — no re-download, no re-publish |
-| `GET` | `/api/archive` | which published titles still have a Bunny copy waiting to be archived, what R2 holds and could be re-checked (`verify`), mended (`repair`) or put back (`restore`), plus the queue's live tasks (status, stage, bytes) |
+| `GET` | `/api/archive` | which published titles still have a Bunny copy waiting to be archived, what R2 holds and could be re-checked (`verify`), mended (`repair`) or put back (`restore`), plus the queue's live tasks (status, stage, bytes), the automatic reconciler (`sweep`: on/off, interval, batch, what its last pass did) and whether Bunny keeps its copy after archiving (`keepBunny`) |
 | `POST` | `/api/archive` | **queue** them: `{ keys?, limit? }`. Answers at once with what was queued and what was skipped; the copying runs on the archive's own queue and reports progress on `/api/events` |
 | `POST` | `/api/archive/verify` | **queue a verification pass**: re-read each manifest from R2 and re-hash every object it lists. `{ keys?, limit? }`, answers at once |
 | `POST` | `/api/archive/repair` | **queue a targeted repair**: mend just the objects the last check flagged, from Bunny or from the bucket's intact copies. `{ keys?, limit? }`, answers at once |
@@ -964,9 +1041,12 @@ keeps the queue honest.
   200-line log. Atomic, and set aside (not lost) if it cannot be parsed.
 - `DATA_DIR/db.json` — settings, accounts, jobs (atomic writes; a corrupt file is
   moved aside rather than crashing the process). A busy queue moves byte counters
-  many times a second, so those progress-only updates are coalesced into one write
-  (and flushed on a clean shutdown) while every structural change — a status, a
-  session URL — is written immediately.
+  many times a second and re-reads every encoding job's `polls`/`statusCode` on
+  every round, so those bookkeeping updates are coalesced into one write (and
+  flushed on a clean shutdown) while every structural change — a status, a
+  session URL — is written immediately. A write that fails (a full disk, a data
+  folder a sync client is holding open) is logged once, counted, and retried: it
+  never throws into the loop that made it, so it cannot end the process.
 - `DATA_DIR/.secret` — 32-byte AES-256-GCM key, generated on first run, mode
   `0600`. The Stream keys, the account API keys and the TMDB credential are
   stored encrypted; the API returns them masked (`••••1234`) and the dashboard
@@ -1072,11 +1152,11 @@ right home for the queue. Hosts that build from a git repository only need the
 
 ```bash
 npm run typecheck        # tsc --noEmit
-npm test                 # 308 tests (queue caps, crypto, store + its change hook, catalogue, the Stream client, the account client behind library provisioning, watermarks and the library read-back, TUS, watcher, job lifecycle, crash resume, HLS, source pipeline, subtitles, DeepL translation, multi-language targets, subtitle backfill and its automatic repair, the R2 archive background queue with its verification pass and its scheduled weekly sweep, targeted repair, restore and signed-URL playback, and its SigV4 signer/presigner, tunnel, network policy, diagnostics, login, autopilot, host politeness)
+npm test                 # 320 tests (queue caps, crypto, store + its change hook + its write-failure and write-coalescing behaviour, catalogue, the Stream client, the account client behind library provisioning, watermarks and the library read-back, TUS, watcher, job lifecycle + a tick that survives an unwritable data folder, crash resume, HLS, source pipeline, subtitles, DeepL translation, multi-language targets, subtitle backfill and its automatic repair, the R2 archive background queue with its verification pass, its scheduled weekly sweep, its automatic reconciler and the publish route that translates, copies every caption and only then deletes from Bunny, targeted repair, restore and signed-URL playback, and its SigV4 signer/presigner, tunnel, network policy, diagnostics, login, autopilot, host politeness)
 
 # End-to-end against a running mock server:
 npm run mock &           # or in another terminal
-node scripts/smoke.mjs   # 129 checks: TMDB, accounts, provisioning from an account key, the shared watermark (both placement modes, and the image served back for the frame) and the library read-back (check, drift, fix, re-check), uploads, concurrency cap, the live event stream, the source pipeline, the subtitle backfill (two titles repaired, one source fetch each), the autopilot, watched folder, cleanup
+node scripts/smoke.mjs   # 134 checks: TMDB, accounts, provisioning from an account key, the shared watermark (both placement modes, and the image served back for the frame) and the library read-back (check, drift, fix, re-check), uploads, concurrency cap, the archive queue and its automatic reconciler, the live event stream, the source pipeline, the subtitle backfill (two titles repaired, one source fetch each), the autopilot, the runtime health block (uptime, event-loop lag, queue size, write health, no escaped errors), watched folder, cleanup
 
 # The server under test must have no R2 destination: a block of the checks is
 # about that state, and one of them queues an archive — which on a real
@@ -1183,6 +1263,10 @@ upload session, no re-uploaded bytes.
   finest granularity you will see.
 - The JSON store is single-process: run one instance only, and don't point two
   instances at the same `DATA_DIR`.
+- A background failure is survivable by design, so the dashboard stays up where
+  it once exited: an unforeseen throw is logged, counted and flushed, but the
+  loop it came from may be mid-sequence. `/api/diagnostics` counts those errors —
+  a nonzero count is a bug to report, not a state to keep running in.
 - The login is one shared username/password (Basic Auth), not user accounts:
   whoever has it has full control of the dashboard.
 - The scraping hosts are third-party pages: when one changes shape its resolver

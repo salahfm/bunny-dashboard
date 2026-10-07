@@ -457,14 +457,25 @@ export class SubtitleAutoRepair {
     return true;
   }
 
-  /** Runs the queue to completion, one title at a time. */
+  /**
+   * Runs the queue to completion, one title at a time.
+   *
+   * Every caller starts this as `void this.drain()`, so nothing it awaits may
+   * reject: a floating rejection is an unhandled one, and Node ends the process
+   * on it. A title that throws is logged and the queue moves on.
+   */
   private drain(): Promise<void> {
     if (this.draining) return this.draining;
     this.draining = (async () => {
       while (this.queue.length) {
         const item = this.queue.shift();
         if (!item) break;
-        await this.attempt(item);
+        try {
+          await this.attempt(item);
+        } catch (error) {
+          this.active.delete(item.key);
+          this.logLine(`[repair] ${item.key}: the attempt failed — ${describeError(error)}`);
+        }
       }
     })().finally(() => {
       this.draining = undefined;

@@ -201,25 +201,38 @@ export interface Db {
 }
 
 /**
- * Job fields that change on every uploaded chunk or downloaded segment.
+ * Job fields that change on every uploaded chunk, downloaded segment or poll.
  *
  * Writing the whole database for one of these is the difference between a few
  * writes a second and a few hundred: a busy queue calls `updateJob` with a new
- * `progress` (or byte count) many times a second, and each call would otherwise
+ * `progress` (or byte count) many times a second, every encoding job is polled
+ * with a fresh `polls`/`statusCode` on each round, and each call would otherwise
  * re-serialise every job — candidates and all — and block the event loop doing
  * it. These are coalesced; everything else is written immediately.
+ *
+ * `polls`/`statusCode`/`error` belong here with the byte counters: they are
+ * bookkeeping the poll loop rewrites for *every* encoding job the moment it
+ * looks, so writing them through to disk one job at a time is exactly what made
+ * a full queue spend its time serialising instead of uploading.
  */
-const VOLATILE_JOB_FIELDS = new Set<keyof Job>(['progress', 'bytesIn', 'bytesOut', 'stage', 'detail']);
+const VOLATILE_JOB_FIELDS = new Set<keyof Job>(['progress', 'bytesIn', 'bytesOut', 'stage', 'detail', 'polls', 'statusCode', 'error']);
 
-/** How long a coalesced progress write may stay only in memory. */
+/** How long a coalesced write may stay only in memory. */
 const SAVE_DEBOUNCE_MS = 100;
+
+/** A failed write is tried again this soon, and never in a hot loop. */
+const SAVE_RETRY_MS = 5_000;
 
 export class Store {
   private config: AppConfig;
   private db: Db;
   private savePending = false;
   private saveTimer: NodeJS.Timeout | undefined;
+  private retryTimer: NodeJS.Timeout | undefined;
   private jobListeners = new Set<JobListener>();
+  private writeCount = 0;
+  private writeFailures = 0;
+  private lastWriteError: string | undefined;
 
   constructor(config: AppConfig) {
     this.config = config;
@@ -268,17 +281,78 @@ export class Store {
     }
   }
 
-  /** Writes the database now, cancelling any pending coalesced write. */
+  /**
+   * Writes the database now, cancelling any pending coalesced write.
+   *
+   * **A disk that refuses the write must never take the dashboard down with
+   * it.** This runs inside the job tick, the poll loop and the archive queue,
+   * where a thrown `writeFileSync`/`renameSync` escapes the timer callback and
+   * kills the process — mid-upload, with every in-flight job left to be requeued
+   * by whatever restarts it. A full disk, a permissions change, or Windows
+   * antivirus/the file-sync client in the data folder holding `db.json.tmp` open
+   * all throw exactly there, and exactly when the queue is busiest.
+   *
+   * So a failure is swallowed *here* and nowhere further: it is logged once per
+   * distinct message, counted, retried on a timer, and announced as healthy
+   * again when a later write succeeds. The in-memory queue stays authoritative
+   * the whole time.
+   */
   save(): void {
     if (this.saveTimer) {
       clearTimeout(this.saveTimer);
       this.saveTimer = undefined;
     }
     this.savePending = false;
-    fs.mkdirSync(path.dirname(this.config.dbPath), { recursive: true });
-    const tmp = `${this.config.dbPath}.tmp`;
-    fs.writeFileSync(tmp, `${JSON.stringify(this.db, null, 2)}\n`);
-    fs.renameSync(tmp, this.config.dbPath);
+    try {
+      fs.mkdirSync(path.dirname(this.config.dbPath), { recursive: true });
+      const tmp = `${this.config.dbPath}.tmp`;
+      fs.writeFileSync(tmp, `${JSON.stringify(this.db, null, 2)}\n`);
+      fs.renameSync(tmp, this.config.dbPath);
+      this.writeCount += 1;
+      if (this.lastWriteError) {
+        console.log(`[store] ${this.config.dbPath} is writable again (after ${this.lastWriteError})`);
+        this.lastWriteError = undefined;
+      }
+    } catch (error) {
+      this.writeFailures += 1;
+      const message = error instanceof Error ? error.message : String(error);
+      // One line per *distinct* problem: a disk that is full for an hour must
+      // not write a line per change for an hour.
+      if (message !== this.lastWriteError) {
+        this.lastWriteError = message;
+        console.error(
+          `[store] could not write ${this.config.dbPath}: ${message} — the queue is kept in memory and this write is retried every ${SAVE_RETRY_MS / 1000}s`,
+        );
+      }
+      this.savePending = true;
+      this.scheduleRetry();
+    }
+  }
+
+  /** One pending retry at a time, so a dead disk is a slow tick, not a hot loop. */
+  private scheduleRetry(): void {
+    if (this.retryTimer) return;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = undefined;
+      if (this.savePending) this.save();
+    }, SAVE_RETRY_MS);
+    this.retryTimer.unref?.();
+  }
+
+  /**
+   * What the persistence layer is doing, for the diagnostics endpoint.
+   *
+   * `writeFailures > 0` with a `lastError` is the dashboard telling the
+   * operator that its data folder is not writable — the reason a queue would
+   * otherwise "restart itself" for no visible cause.
+   */
+  get writeHealth(): { writes: number; failures: number; pending: boolean; lastError?: string } {
+    return {
+      writes: this.writeCount,
+      failures: this.writeFailures,
+      pending: this.savePending,
+      ...(this.lastWriteError ? { lastError: this.lastWriteError } : {}),
+    };
   }
 
   /**

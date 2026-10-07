@@ -217,6 +217,17 @@ check(
   Array.isArray(result.json?.verify) && Array.isArray(result.json?.restore) && Array.isArray(result.json?.repair),
   `${(result.json?.verify ?? []).length} checkable, ${(result.json?.repair ?? []).length} mendable, ${(result.json?.restore ?? []).length} restorable`,
 );
+// The reconciler behind the automatic routing: with no destination it must
+// report itself as configured-but-idle rather than quietly claiming to work.
+check(
+  'the automatic reconciler reports its interval, batch and last pass',
+  typeof result.json?.sweep?.enabled === 'boolean' &&
+    result.json?.sweep?.enabled === false &&
+    result.json?.sweep?.intervalMs > 0 &&
+    result.json?.sweep?.batchSize > 0 &&
+    result.json?.keepBunny === false,
+  `sweep ${result.json?.sweep?.enabled}, every ${result.json?.sweep?.intervalMs} ms, ${result.json?.sweep?.batchSize} at a time, keeps Bunny ${result.json?.keepBunny}`,
+);
 result = await request('POST', '/api/archive', { limit: 5 });
 check(
   'queueing an archive with nowhere to write queues nothing',
@@ -1179,6 +1190,38 @@ check(
   'retry-all answers with exactly the failed jobs it picked up',
   result.status === 200 && result.json?.retried === failedBefore && (result.json?.jobs ?? []).length === failedBefore,
   `failed ${failedBefore}, retried ${result.json?.retried}`,
+);
+
+/* runtime health -------------------------------------------------------- */
+// The dashboard's own vitals, beside the host checks. "It restarted itself and
+// it lagged" leaves no trace in a job's log; these numbers are what makes it
+// diagnosable — how long this process has been up, how far behind the event loop
+// has fallen, and whether the data folder has been refusing writes.
+result = await request('GET', '/api/diagnostics');
+const health = result.json?.runtime ?? {};
+check(
+  'diagnostics reports the process, not only the hosts',
+  result.status === 200 && typeof health.uptimeSec === 'number' && typeof health.node === 'string',
+  `uptime ${health.uptimeSec}s on ${health.node}`,
+);
+check(
+  'the runtime block measures the event loop and memory',
+  typeof health.eventLoopLagMs === 'number' &&
+    health.eventLoopLagMs >= 0 &&
+    typeof health.worstEventLoopLagMs === 'number' &&
+    Number(health.rssBytes) > 0,
+  `lag ${health.eventLoopLagMs}ms (worst ${health.worstEventLoopLagMs}ms), rss ${health.rssBytes}`,
+);
+const queueTotal = (await request('GET', '/api/jobs?limit=1')).json?.stats?.total ?? -1;
+check(
+  'it reports the queue it is really holding, and its write health',
+  health.jobs === queueTotal && Number(health.store?.writes) > 0 && health.store?.failures === 0,
+  `jobs ${health.jobs}/${queueTotal}, writes ${health.store?.writes}, failures ${health.store?.failures}`,
+);
+check(
+  'nothing has escaped a background loop',
+  health.uncaughtExceptions === 0 && health.unhandledRejections === 0,
+  `${health.uncaughtExceptions} uncaught, ${health.unhandledRejections} unhandled`,
 );
 
 /* cleanup -------------------------------------------------------------- */

@@ -410,3 +410,32 @@ test('a video is named by its TMDB id, so one library stays joinable', async () 
   assert.equal(store.job(episode.id)?.target.title, 'Breaking Bad');
   assert.equal(store.job(episode.id)?.target.episodeTitle, 'Pilot');
 });
+
+/**
+ * The tick is where the dashboard used to die.
+ *
+ * Starting a job writes the database from inside the one-second interval, and a
+ * write that failed there threw out of the timer callback — an uncaught
+ * exception, so the process ended and, under `restart: unless-stopped` (or any
+ * platform restart policy), came back with the job requeued. To the operator
+ * that is "it restarted itself while too many things were running". A tick now
+ * costs one log line and the queue keeps moving.
+ */
+test('a tick survives a data folder that refuses the write', () => {
+  const { config, store, service } = setup();
+  store.addAccount({ name: 'a', libraryId: '1', apiKeyEnc: 'x' });
+  // A disk that will not take the write, exactly as a full one behaves.
+  fs.mkdirSync(`${config.dbPath}.tmp`);
+  const job = service.createUrlJob({ kind: 'movie', tmdbId: 99, title: 'Tick Test' }, 'https://example.test/tick.mp4');
+
+  const originalError = console.error;
+  console.error = () => {};
+  try {
+    assert.doesNotThrow(() => service.tickNow(), 'the tick keeps the process alive');
+  } finally {
+    console.error = originalError;
+  }
+
+  assert.equal(store.job(job.id)?.status, 'uploading', 'and the job still started');
+  assert.ok(store.writeHealth.failures >= 1, 'the failed write is reported, not hidden');
+});

@@ -13,6 +13,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { ArchiveService, archiveFolder, archiveSlug, captionLanguages, planAssets, playbackRoute, streamedObject } from '../src/archive';
+import { SubtitleAutoRepair, type SubtitleBackfill } from '../src/backfill';
 import { BunnyClient, type BunnyVideo } from '../src/bunny';
 import { Catalog, type CatalogEntry } from '../src/catalog';
 import type { AppConfig } from '../src/config';
@@ -264,6 +265,10 @@ async function rig(
       // not have a weekly sweep put titles in line behind it.
       verify: options.verify ?? false,
       verifyIntervalMs: 7 * 24 * 60 * 60_000,
+      // The reconciler is off here too: a test queues its own work.
+      sweep: false,
+      sweepIntervalMs: 5 * 60_000,
+      sweepBatch: 25,
     },
   });
   const catalog = new Catalog(config);
@@ -1214,5 +1219,162 @@ test('captions come from the catalogue and from what Bunny still reports', () =>
     assert.deepEqual(languages, ['ar', 'en']);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* The automatic route a publish takes: translate, copy, then delete    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The whole point of the archive, in the order it has to happen.
+ *
+ * One publish queues two things — the fill-in for a language the title arrived
+ * without, and the copy to R2 — and they are wired so the second waits for the
+ * first: deleting the video while a caption upload is still in flight would
+ * throw that translation away with the source it was read from. This drives both
+ * halves together, the way `onPublished` and the archive's `before` hook do in
+ * the dashboard, and asserts what the bucket and Bunny end up holding.
+ */
+test('a publish is translated first, archived with every caption, and only then removed from Bunny', async () => {
+  const files: Record<string, FakePullZoneFile> = {
+    ...pullZoneFiles(),
+    // Bunny serves the Arabic captions only once the repair uploaded them, which
+    // is exactly what makes "did the archive wait?" observable here.
+    [`${VIDEO_ID}/captions/ar.vtt`]: { body: 'WEBVTT\n\n00:00.000 --> 00:02.000\nمرحبا\n', contentType: 'text/vtt' },
+  };
+  const { rig: r, r2Server, close } = await rig({ files });
+  try {
+    const deleted: string[] = [];
+    let translated = false;
+    const client = () =>
+      bunnyStub(
+        finishedVideo({
+          captions: translated
+            ? [
+                { srclang: 'en', label: 'English' },
+                { srclang: 'ar', label: 'Arabic' },
+              ]
+            : [{ srclang: 'en', label: 'English' }],
+        }),
+        deleted,
+      );
+
+    // What the job already attached when it published: English, scraped.
+    r.catalog.setSubtitles(r.entry.key, [
+      { srclang: 'en', label: 'English', url: `${r.account.pullZoneHost}/${VIDEO_ID}/captions/en.vtt`, uploaded: true },
+    ]);
+
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const repair = new SubtitleAutoRepair({
+      config: r.config,
+      catalog: r.catalog,
+      backfill: {
+        run: async () => {
+          await gate;
+          translated = true;
+          r.catalog.setSubtitles(r.entry.key, [
+            { srclang: 'en', label: 'English', url: `${r.account.pullZoneHost}/${VIDEO_ID}/captions/en.vtt`, uploaded: true },
+            { srclang: 'ar', label: 'Arabic', uploaded: true, translated: true, translatedFrom: 'en' },
+          ]);
+          return { results: [{ key: r.entry.key, title: 'Inception', status: 'translated', languages: ['ar'], cues: 4, bytes: 40 }] };
+        },
+      } as unknown as SubtitleBackfill,
+    });
+    const archive = new ArchiveService({
+      config: r.config,
+      catalog: r.catalog,
+      r2: r.r2,
+      client,
+      enabled: () => true,
+      before: (key) => repair.settled(key),
+      now: () => NOW,
+      retryDelayMs: 5,
+    });
+    const folder = 'archive/Movies/Inception (2010) [27205]';
+
+    try {
+      // One publish, wired the way the server wires it.
+      repair.consider(r.catalog.get(r.entry.key) as CatalogEntry);
+      archive.consider(r.catalog.get(r.entry.key) as CatalogEntry);
+
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      assert.deepEqual(deleted, [], 'nothing is deleted from Bunny while the translation is still in flight');
+      assert.equal(r2Server.objects().has(`${folder}/manifest.json`), false, 'and the copy has not been written yet');
+
+      release();
+      await archive.idle(10_000);
+      await repair.idle(10_000);
+
+      assert.ok(r2Server.objects().has(`${folder}/subtitles/en.vtt`), 'the caption the title arrived with is in the bucket');
+      assert.ok(r2Server.objects().has(`${folder}/subtitles/ar.vtt`), 'and so is the one translated for it');
+      assert.deepEqual(deleted, [VIDEO_ID], 'only then is the video taken out of Bunny');
+    } finally {
+      archive.stop();
+      repair.stop();
+    }
+  } finally {
+    await close();
+  }
+});
+
+/**
+ * The other half of "remove it from Bunny": the delete that did not happen.
+ *
+ * A refused delete leaves the copy complete and safe but the video sitting in
+ * the library, recorded as `removedFromBunny: false` and never tried again.
+ * That state is what the reconciler picks up, and this is it being finished.
+ */
+test('a delete Bunny refused is retried until the video is finally out', async () => {
+  const { rig: r, close } = await rig();
+  try {
+    let refuse = true;
+    const archive = new ArchiveService({
+      config: r.config,
+      catalog: r.catalog,
+      r2: r.r2,
+      client: () =>
+        ({
+          getVideo: async (id: string) => ({ ...finishedVideo(), guid: id }),
+          deleteVideo: async (id: string) => {
+            if (refuse) throw new Error('Bunny said no');
+            r.deleted.push(id);
+          },
+        }) as unknown as BunnyClient,
+      enabled: () => true,
+      now: () => NOW,
+      retryDelayMs: 5,
+    });
+
+    try {
+      await archive.archiveKeys([r.entry.key], 1);
+      const archived = r.catalog.get(r.entry.key) as CatalogEntry;
+      assert.equal(archived.archive?.complete, true, 'the copy is safe either way');
+      assert.equal(archived.archive?.removedFromBunny, false, 'and the record says Bunny still holds the video');
+      assert.match(archived.archive?.note ?? '', /Bunny still holds the video/);
+      assert.deepEqual(r.deleted, []);
+
+      refuse = false;
+      const report = await archive.removeLeftovers(10);
+      assert.deepEqual(report.removed, [r.entry.key]);
+      assert.deepEqual(r.deleted, [VIDEO_ID], 'the retry takes it out');
+
+      const after = r.catalog.get(r.entry.key) as CatalogEntry;
+      assert.equal(after.archive?.removedFromBunny, true);
+      assert.ok(after.archive?.removedAt, 'and the removal is dated');
+      assert.equal(after.archive?.note, undefined, 'with the warning gone now that it is true');
+
+      // Nothing left to do: a second pass finds no leftovers.
+      const again = await archive.removeLeftovers(10);
+      assert.deepEqual(again.removed, []);
+      assert.equal(again.attempted, 0);
+    } finally {
+      archive.stop();
+    }
+  } finally {
+    await close();
   }
 });

@@ -400,6 +400,11 @@ export class FolderWatcher {
       }
 
       this.prune();
+    } catch (error) {
+      // A scan runs from a timer as `void this.scan()`: anything thrown out here
+      // would be an unhandled rejection and would end the process. The folder is
+      // simply looked at again on the next tick.
+      console.error(`[watch] the folder scan failed: ${describeError(error)}`);
     } finally {
       this.scanning = false;
     }

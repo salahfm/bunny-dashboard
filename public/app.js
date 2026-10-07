@@ -47,6 +47,16 @@
     archiveRepair: [],
     /** The scheduled re-check: when it next runs, and what the last sweep found. */
     archiveCheck: null,
+    /**
+     * The automatic routing: the reconciler that queues what a publish missed.
+     *
+     * A title is queued for R2 the moment it finishes publishing, so this is the
+     * half an operator cannot see from the list of titles — whether anything is
+     * still picking up what that one event did not finish.
+     */
+    archiveSweep: null,
+    /** Whether an archive keeps the video in Bunny after copying it out. */
+    archiveKeepBunny: false,
     /** The shared watermark: one image and one placement, used by every account. */
     watermark: null,
     /** The last read-back report: what bunny.net holds, per library. */
@@ -1118,6 +1128,8 @@
       state.archiveVerify = queue?.verify ?? [];
       state.archiveRestore = queue?.restore ?? [];
       state.archiveRepair = queue?.repair ?? [];
+      state.archiveSweep = queue?.sweep ?? null;
+      state.archiveKeepBunny = queue?.keepBunny === true;
     } catch {
       /* the archive is optional: a failure to read it must not blank the Library */
     }
@@ -1622,7 +1634,43 @@
     return `${entry.title}${entry.year ? ` (${entry.year})` : ''}`;
   }
 
+  /**
+   * What happens to a finished title without anybody pressing the button.
+   *
+   * The queue's own counters say what is copying right now; this says what will
+   * happen to the titles that are not — which is the part that cannot be read
+   * off a list of titles, and the part that tells an operator whether the switch
+   * in Settings is doing what they think it is.
+   */
+  function renderArchiveAuto() {
+    const span = $('#library-archive-auto');
+    if (!span) return;
+    const sweep = state.archiveSweep;
+    const archive = state.settings?.archive;
+    if (!sweep || !archive?.configured) {
+      span.textContent = '';
+      return;
+    }
+    if (!archive.auto) {
+      span.textContent = 'automatic routing to R2 is off — titles wait for the button';
+      return;
+    }
+    if (!sweep.enabled) {
+      span.textContent = 'automatic routing to R2 is off (R2_SWEEP)';
+      return;
+    }
+    const last = sweep.lastReport;
+    span.textContent =
+      `automatic: every ${fmtDuration(sweep.intervalMs)}, ${sweep.batchSize} title(s) at a time` +
+      (last
+        ? ` · last pass queued ${last.queued}, removed ${last.removed} from Bunny${last.remaining ? `, ${last.remaining} still waiting` : ''}`
+        : ' · first pass in a moment') +
+      (last?.note ? ` · ${last.note}` : '') +
+      (state.archiveKeepBunny ? ' · Bunny keeps its copy (R2_KEEP_BUNNY)' : ' · Bunny lets go once the copy is verified');
+  }
+
   function renderLibrary() {
+    renderArchiveAuto();
     const stats = state.libraryStats;
     const scoped = state.librarySubtitles;
     // The missing count is only worth showing once the list itself is narrowed:
@@ -2607,6 +2655,48 @@
 
   /* ---------------------------------------------------------- diagnostics */
 
+  /**
+   * A footer row on the network table: what this process is doing.
+   *
+   * A dashboard that restarted itself, or that went slow, leaves no trace in a
+   * job's log — but it does leave one here: uptime says whether the process is
+   * the one that was serving half an hour ago, the event-loop lag says how long
+   * the busiest tick held the loop, and a nonzero write failure count names the
+   * data folder as the reason the queue stopped moving.
+   */
+  function appendRuntimeHealth(body, health) {
+    if (!health) return;
+    const store = health.store ?? {};
+    const failing = Number(store.failures ?? 0) > 0;
+    const stray = Number(health.uncaughtExceptions ?? 0) + Number(health.unhandledRejections ?? 0);
+    const uptime =
+      health.uptimeSec >= 3600
+        ? `${Math.floor(health.uptimeSec / 3600)}h ${Math.round((health.uptimeSec % 3600) / 60)}m`
+        : health.uptimeSec >= 60
+          ? `${Math.floor(health.uptimeSec / 60)}m ${health.uptimeSec % 60}s`
+          : `${health.uptimeSec}s`;
+    const text =
+      `up ${uptime} · ${bytes(health.rssBytes)} memory · event loop lag ${health.eventLoopLagMs} ms (worst ${health.worstEventLoopLagMs} ms) · ` +
+      `${store.writes ?? 0} database write(s) · ${health.jobs} job(s) in the queue` +
+      (failing ? ` · ${store.failures} write(s) FAILED: ${store.lastError ?? 'unknown error'}` : '') +
+      (stray ? ` · ${stray} error(s) escaped a background loop — see the server log` : '');
+    body.append(
+      h(
+        'tr',
+        {},
+        h(
+          'td',
+          { colspan: '5', class: 'small' },
+          h('span', { class: `status ${failing || stray ? 'failed' : 'ready'}`, text: failing ? 'data folder' : stray ? 'recovered' : 'process' }),
+          ' ',
+          text,
+          ' ',
+          h('span', { class: 'muted', text: `node ${health.node}` }),
+        ),
+      ),
+    );
+  }
+
   async function runNetworkCheck() {
     const body = clear($('#diagnostics-table tbody'));
     $('#diagnostics-summary').textContent = 'probing hosts…';
@@ -2617,6 +2707,7 @@
       $('#diagnostics-summary').textContent = report.summary ?? '';
       if (report.skipped) {
         body.append(h('tr', {}, h('td', { colspan: '5', class: 'muted small', text: report.summary })));
+        appendRuntimeHealth(body, report.runtime);
         return;
       }
       for (const check of report.checks ?? []) {
@@ -2632,6 +2723,7 @@
           ),
         );
       }
+      appendRuntimeHealth(body, report.runtime);
     } catch (error) {
       clear(body);
       $('#diagnostics-summary').textContent = describeError(error);

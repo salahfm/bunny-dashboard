@@ -43,6 +43,9 @@ test('the R2 archive switch follows R2_ARCHIVE until the dashboard overrides it'
       urlTtl: 300,
       verify: true,
       verifyIntervalMs: 7 * 24 * 60 * 60_000,
+      sweep: true,
+      sweepIntervalMs: 5 * 60_000,
+      sweepBatch: 25,
     },
   });
   const store = new Store(config);
@@ -133,8 +136,64 @@ test('a corrupt database is set aside instead of crashing', () => {
   assert.ok(fs.readdirSync(dir).some((name) => name.includes('.corrupt-')));
 });
 
-function storedJob(config: { dbPath: string }, id: string): { progress: number; status: string; bytesIn?: number } | undefined {
-  const db = JSON.parse(fs.readFileSync(config.dbPath, 'utf8')) as { jobs: Array<{ id: string; progress: number; status: string; bytesIn?: number }> };
+/**
+ * The failure this guards against took the whole dashboard down.
+ *
+ * `updateJob` runs inside the one-second job tick, and a data folder that
+ * refused the write threw straight out of the timer callback — which is an
+ * uncaught exception, so the process ended mid-upload and every in-flight job
+ * was requeued by whatever restarted it. A full disk, a permissions change, or
+ * a Windows file-sync client holding `db.json.tmp` open all throw there, and
+ * always at the busiest moment. Persistence is now the store's problem, and the
+ * operator can read what happened from `/api/diagnostics`.
+ */
+test('a data folder that refuses the write does not throw, and is reported', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bunny-store-'));
+  const config = testConfig(dir);
+  const store = new Store(config);
+  // Stand in for a disk that will not take the write: the path the atomic
+  // rename writes through exists, and is not a file.
+  fs.mkdirSync(`${config.dbPath}.tmp`);
+
+  assert.doesNotThrow(() => store.addAccount({ name: 'primary', libraryId: '1', apiKeyEnc: 'enc' }));
+  assert.equal(store.accounts.length, 1, 'the queue stays authoritative in memory');
+  assert.ok(store.writeHealth.failures >= 1, 'the failure is counted for /api/diagnostics');
+  assert.ok(store.writeHealth.lastError, 'and the reason is kept instead of swallowed');
+
+  fs.rmdirSync(`${config.dbPath}.tmp`);
+  store.save();
+  assert.equal(store.writeHealth.lastError, undefined, 'a later write clears the error');
+  assert.equal(new Store(config).accounts.length, 1, 'and the queue is on disk again');
+});
+
+/**
+ * Every encoding job is polled every ten seconds, and each poll used to carry
+ * `polls`/`statusCode`/`error` straight through to a full rewrite of the
+ * database: one synchronous serialise of the whole queue per job per round, on
+ * the event loop, while the uploads that need that loop were running. Those
+ * fields are bookkeeping — nothing reads them from disk between polls — so they
+ * coalesce with the byte counters.
+ */
+test('poll bookkeeping coalesces, while a status change is written at once', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bunny-store-'));
+  const config = testConfig(dir);
+  const store = new Store(config);
+  const job = store.addJob(
+    newJob({ kind: 'movie', tmdbId: 2, title: 'Y' }, { kind: 'url', name: 'y.mp4', url: 'https://example.test/y.mp4' }),
+  );
+
+  store.updateJob(job.id, { progress: 40, polls: 3, statusCode: 2, error: undefined });
+  assert.equal(store.hasPendingSave, true, 'a poll tick does not rewrite the whole database');
+  assert.equal(storedJob(config, job.id)?.status, 'queued', 'and nothing structural has moved yet');
+
+  store.updateJob(job.id, { status: 'encoding' });
+  assert.equal(store.hasPendingSave, false, 'a status change is written immediately');
+  assert.equal(storedJob(config, job.id)?.status, 'encoding');
+  assert.equal(storedJob(config, job.id)?.polls, 3, 'the coalesced bookkeeping rode along with it');
+});
+
+function storedJob(config: { dbPath: string }, id: string): { progress: number; status: string; bytesIn?: number; polls?: number } | undefined {
+  const db = JSON.parse(fs.readFileSync(config.dbPath, 'utf8')) as { jobs: Array<{ id: string; progress: number; status: string; bytesIn?: number; polls?: number }> };
   return db.jobs.find((job) => job.id === id);
 }
 

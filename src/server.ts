@@ -17,6 +17,7 @@ import { BunnyClient, BunnyError } from './bunny';
 import { ALL_RESOLUTIONS, BunnyCoreClient, libraryDrift, type LibraryFinding } from './bunny-core';
 import { Catalog, type CatalogEntry } from './catalog';
 import { ArchiveCheckSchedule, CheckScheduleError } from './check-schedule';
+import { ArchiveSweep } from './archive-sweep';
 import { MAX_UPLOAD_BYTES, loadConfig } from './config';
 import { decryptSecret, encryptSecret, loadOrCreateSecret, maskSecret } from './crypto';
 import { runDiagnostics } from './diagnostics';
@@ -376,6 +377,23 @@ const checkSchedule = new ArchiveCheckSchedule({
 });
 
 /**
+ * The other automatic pass, and the reason routing to R2 is not a one-shot.
+ *
+ * A publish queues its own archive exactly once. A restart mid-copy, an R2
+ * outage that outlasts the retry budget, a delete Bunny refused, or archiving
+ * being switched off at the time all leave a title sitting in Bunny with nothing
+ * to pick it up again — so this re-reads the catalogue on a timer and does what
+ * the Archive button does: queues what is still missing, oldest first, and
+ * retries the removals. Nothing here reads a bucket or touches Bunny itself; it
+ * only puts work on the archive's queue, behind the operator's own switch.
+ */
+const archiveSweep = new ArchiveSweep({
+  ...(config.r2 ? { config: config.r2 } : {}),
+  archive,
+  log: (message) => console.log(message),
+});
+
+/**
  * The autopilot: walk TMDB's top-rated lists and queue what clears the rating
  * floor, then retry what failed, then look again.
  */
@@ -400,6 +418,86 @@ const watcher = new FolderWatcher({
   store,
   tmdb: tmdbClient,
   enqueue: (target, tempPath, name, bytes) => jobs.createFileJob(target, tempPath, name, bytes),
+});
+
+/* ------------------------------------------------------------------ */
+/* Runtime health                                                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * What this process is doing, as opposed to what the network is doing.
+ *
+ * "It restarts itself and it lags" cannot be diagnosed from a job log: the
+ * operator needs uptime, memory, how far behind the event loop has fallen, and
+ * whether any background loop has thrown. All four are sampled here and served
+ * by `/api/diagnostics` beside the host checks.
+ */
+const runtime = {
+  startedAt: Date.now(),
+  eventLoopLagMs: 0,
+  worstEventLoopLagMs: 0,
+  uncaughtExceptions: 0,
+  unhandledRejections: 0,
+};
+
+/**
+ * How late a 1 s timer fired — the standard event-loop lag probe.
+ *
+ * A delay here is work that was done on the loop instead of off it (a full
+ * database write, a large synchronous spool write), which is exactly the
+ * "lagging" an operator sees as a frozen page while the queue is busy.
+ */
+const LAG_SAMPLE_MS = 1_000;
+let lagSampledAt = Date.now();
+setInterval(() => {
+  const now = Date.now();
+  const lag = Math.max(0, now - lagSampledAt - LAG_SAMPLE_MS);
+  lagSampledAt = now;
+  runtime.eventLoopLagMs = lag;
+  if (lag > runtime.worstEventLoopLagMs) runtime.worstEventLoopLagMs = lag;
+}, LAG_SAMPLE_MS).unref?.();
+
+function runtimeHealth(): Record<string, unknown> {
+  const memory = process.memoryUsage();
+  return {
+    uptimeSec: Math.round((Date.now() - runtime.startedAt) / 1000),
+    node: process.version,
+    rssBytes: memory.rss,
+    heapUsedBytes: memory.heapUsed,
+    eventLoopLagMs: runtime.eventLoopLagMs,
+    worstEventLoopLagMs: runtime.worstEventLoopLagMs,
+    uncaughtExceptions: runtime.uncaughtExceptions,
+    unhandledRejections: runtime.unhandledRejections,
+    jobs: store.jobs.length,
+    accounts: store.accounts.length,
+    // A data folder that cannot be written is the top cause of a dashboard that
+    // "restarts itself": the queue keeps working from memory while this says so.
+    store: store.writeHealth,
+  };
+}
+
+/**
+ * The last line of defence: nothing that happens on a timer, a socket or an
+ * upload may end this process.
+ *
+ * Every background loop guards itself and the store's write path cannot throw,
+ * so these handlers are the net under the unforeseen. Staying up is the right
+ * trade here: a dashboard that dies mid-upload takes every in-flight job with it
+ * and, under `restart: unless-stopped` (or any platform restart policy), comes
+ * straight back with those jobs requeued — which is what the operator sees as
+ * "it restarted itself for no reason". Either way the failure is logged in full,
+ * counted in `/api/diagnostics`, and the queue on disk is flushed.
+ */
+process.on('uncaughtException', (error) => {
+  runtime.uncaughtExceptions += 1;
+  console.error('[dashboard] uncaught exception — staying up, this tick is lost:', error);
+  store.flush();
+});
+
+process.on('unhandledRejection', (reason) => {
+  runtime.unhandledRejections += 1;
+  console.error('[dashboard] unhandled rejection — staying up:', reason);
+  store.flush();
 });
 
 /* ------------------------------------------------------------------ */
@@ -525,6 +623,11 @@ function settingsView() {
           totals: check.totals,
         };
       })(),
+      // The reconciler: what makes the routing fully automatic rather than a
+      // single event, so the Settings tab can say whether it is on and when it
+      // last looked. The Library's archive panel reads /api/archive for the
+      // detail of what it queued.
+      sweep: archiveSweep.stateView(),
     },
     // The watermark every account shares: the placement in force, whether an
     // image is stored, and the corners the dashboard may offer. The Settings tab
@@ -672,7 +775,11 @@ app.get('/api/diagnostics', handle(async (_req, res) => {
     timeoutMs: config.networkTimeoutMs,
     tunnelUrl: tunnel.status().url,
   });
-  res.json(report);
+  // The network answer *and* what this process is doing: "is Bunny reachable?"
+  // and "why did it restart / why is it slow?" are the same button for the
+  // operator. `runtime` is additive, so a client that only knows the checks is
+  // unaffected.
+  res.json({ ...report, runtime: runtimeHealth() });
 }));
 
 app.get('/api/tunnel', (_req, res) => {
@@ -1622,6 +1729,10 @@ app.get('/api/archive', (_req, res) => {
     repair: archive.repairCandidates(),
     busy: archive.busy,
     tasks: archive.list(),
+    // The automatic half: when the reconciler last ran and what it did, so
+    // "why is this title still in Bunny?" has an answer on the panel.
+    sweep: archiveSweep.stateView(),
+    keepBunny: config.r2?.keepBunny ?? false,
   });
 });
 
@@ -1820,6 +1931,9 @@ autopilot.start();
 // The verification schedule too: it only checks while it is switched on and R2
 // is configured, and a tick is a clock read when it is not.
 checkSchedule.start();
+// And the reconciler, so a title that missed its one publish event still lands
+// in R2 and out of Bunny without anybody noticing it was missed.
+archiveSweep.start();
 const loopback = ['127.0.0.1', 'localhost', '::1'].includes(config.host);
 if (!config.dashboardPassword && !loopback) {
   console.warn(
@@ -1841,6 +1955,7 @@ function shutdown(): void {
   jobs.stop();
   autopilot.stop();
   checkSchedule.stop();
+  archiveSweep.stop();
   autoRepair.stop();
   archive.stop();
   store.flush();

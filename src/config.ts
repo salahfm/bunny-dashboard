@@ -131,6 +131,42 @@ export interface R2ArchiveConfig {
   verify: boolean;
   /** How often that pass runs, in milliseconds (default: weekly). */
   verifyIntervalMs: number;
+  /**
+   * Whether the archive is reconciled on a schedule, without being asked
+   * (default: yes).
+   *
+   * A publish queues its own archive exactly once, and anything that interrupts
+   * that one attempt — a restart, an R2 outage, a delete Bunny refused, the
+   * switch being off at the time — would otherwise leave the title in Bunny for
+   * good. The sweep is what makes "it ends up in R2 and out of Bunny" a state
+   * the dashboard keeps converging to.
+   */
+  sweep: boolean;
+  /** How often the sweep looks for work, in milliseconds (default: 5 minutes). */
+  sweepIntervalMs: number;
+  /** How many titles one sweep puts in line; the next one continues (default 25). */
+  sweepBatch: number;
+}
+
+/** Where the automatic sweep sits by default: often enough to be invisible. */
+export const SWEEP_DEFAULT_INTERVAL_MS = 5 * 60_000;
+export const SWEEP_MIN_INTERVAL_MS = 30_000;
+export const SWEEP_MAX_INTERVAL_MS = 24 * 60 * 60_000;
+export const SWEEP_DEFAULT_BATCH = 25;
+export const SWEEP_MAX_BATCH = 500;
+
+/** `R2_SWEEP_INTERVAL_MS`, kept inside a range where a sweep is a sweep. */
+export function clampSweepInterval(value: unknown): number {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return SWEEP_DEFAULT_INTERVAL_MS;
+  return Math.max(SWEEP_MIN_INTERVAL_MS, Math.min(SWEEP_MAX_INTERVAL_MS, Math.floor(n)));
+}
+
+/** `R2_SWEEP_BATCH`, capped so one sweep cannot queue an entire library. */
+export function clampSweepBatch(value: unknown): number {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return SWEEP_DEFAULT_BATCH;
+  return Math.max(1, Math.min(SWEEP_MAX_BATCH, Math.floor(n)));
 }
 
 export function clampConcurrency(value: unknown, fallback = DEFAULT_CONCURRENCY): number {
@@ -250,6 +286,11 @@ export function parseR2(env: NodeJS.ProcessEnv): { config?: R2ArchiveConfig; not
       // still checking that it is all there.
       verify: envFlag(env.R2_VERIFY, true),
       verifyIntervalMs: clampCheckInterval(verifyInterval === '' ? undefined : verifyInterval),
+      // The reconciler too: the one-shot publish event is the fast path, and
+      // this is what makes the routing survive everything the fast path doesn't.
+      sweep: envFlag(env.R2_SWEEP, true),
+      sweepIntervalMs: clampSweepInterval(read('R2_SWEEP_INTERVAL_MS')),
+      sweepBatch: clampSweepBatch(read('R2_SWEEP_BATCH')),
     },
   };
 }

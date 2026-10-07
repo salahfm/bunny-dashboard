@@ -79,7 +79,30 @@ test('the R2 archive needs all of its keys, or none of them', () => {
     urlTtl: 300,
     verify: true,
     verifyIntervalMs: 7 * 24 * 60 * 60_000,
+    // The reconciler that picks up a title whose own publish event did not
+    // finish the job: on by default, often enough to be invisible.
+    sweep: true,
+    sweepIntervalMs: 5 * 60_000,
+    sweepBatch: 25,
   });
+});
+
+test('the automatic R2 sweep has its own switch, interval and batch', () => {
+  const base = { R2_ACCOUNT_ID: 'a', R2_ACCESS_KEY_ID: 'k', R2_SECRET_ACCESS_KEY: 's', R2_BUCKET: 'b' };
+
+  assert.equal(parseR2({ ...base, R2_SWEEP: 'off' }).config?.sweep, false);
+  assert.equal(parseR2({ ...base, R2_SWEEP: '1' }).config?.sweep, true);
+
+  // Clamped at both ends: a sweep that runs every second is a busy loop, and one
+  // that runs monthly is not a reconcile at all.
+  assert.equal(parseR2({ ...base, R2_SWEEP_INTERVAL_MS: '600000' }).config?.sweepIntervalMs, 600_000);
+  assert.equal(parseR2({ ...base, R2_SWEEP_INTERVAL_MS: '1' }).config?.sweepIntervalMs, 30_000);
+  assert.equal(parseR2({ ...base, R2_SWEEP_INTERVAL_MS: '99999999999' }).config?.sweepIntervalMs, 24 * 60 * 60_000);
+  assert.equal(parseR2({ ...base, R2_SWEEP_INTERVAL_MS: 'soon' }).config?.sweepIntervalMs, 5 * 60_000);
+
+  assert.equal(parseR2({ ...base, R2_SWEEP_BATCH: '100' }).config?.sweepBatch, 100);
+  assert.equal(parseR2({ ...base, R2_SWEEP_BATCH: '0' }).config?.sweepBatch, 25);
+  assert.equal(parseR2({ ...base, R2_SWEEP_BATCH: '999999' }).config?.sweepBatch, 500);
 });
 
 test('the archive switches read like every other flag, and the prefix has a default', () => {

@@ -185,9 +185,47 @@ export class JobService {
     }
   }
 
+  /**
+   * The two background loops, each body guarded.
+   *
+   * This is the difference between "a tick failed" and "the dashboard restarted
+   * itself": an exception thrown out of a timer callback is an uncaught
+   * exception, and Node ends the process on one. A disk that refused a write at
+   * the wrong moment used to kill the dashboard here, mid-upload, at the busiest
+   * possible instant — so a failure now costs one tick and is logged.
+   */
   start(): void {
-    this.timers.push(setInterval(() => this.tickNow(), this.config.tickIntervalMs));
-    this.timers.push(setInterval(() => void this.pollNow(), this.config.pollIntervalMs));
+    this.timers.push(setInterval(() => this.guard('tick', () => this.tickNow()), this.config.tickIntervalMs));
+    this.timers.push(setInterval(() => void this.guardAsync('poll', () => this.pollNow()), this.config.pollIntervalMs));
+  }
+
+  /** Runs one synchronous background step, keeping any failure inside it. */
+  private guard(what: string, step: () => void): void {
+    try {
+      step();
+    } catch (error) {
+      console.error(`[jobs] the ${what} pass failed: ${describeError(error)}`);
+    }
+  }
+
+  /** The same guard for an async step, so no rejection floats out of a timer. */
+  private async guardAsync(what: string, step: () => Promise<void>): Promise<void> {
+    try {
+      await step();
+    } catch (error) {
+      console.error(`[jobs] the ${what} pass failed: ${describeError(error)}`);
+    }
+  }
+
+  /**
+   * Starts one job without letting its promise reject into the tick that began
+   * it. `run` handles its own failures; this is the net under a throw from that
+   * handling — or from the store's own write path.
+   */
+  private startJob(jobId: string): void {
+    void this.run(jobId)
+      .catch((error) => console.error(`[jobs] ${jobId} failed outside its own handler: ${describeError(error)}`))
+      .finally(() => this.inFlight.delete(jobId));
   }
 
   stop(): void {
@@ -244,7 +282,7 @@ export class JobService {
         attempts: job.attempts + 1,
       });
       this.inFlight.add(job.id);
-      void this.run(job.id).finally(() => this.inFlight.delete(job.id));
+      this.startJob(job.id);
     }
     this.requeueStaleUploads();
   }
