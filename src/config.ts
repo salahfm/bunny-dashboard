@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { clampCheckInterval } from './check-schedule';
+import { builtInProxies, parseProxyList, type ProxyEndpoint } from './proxies';
 import { clampPresignExpiry } from './r2';
 import { normalizeLanguage } from './subtitles';
 import { clampChunkBytes } from './tus';
@@ -22,6 +23,11 @@ export interface AppConfig {
   port: number;
   host: string;
   dataDir: string;
+  /**
+   * Where working files live: a scraped source's spool while it is downloaded
+   * and uploaded, and a manual upload's `.bin` until it reaches Bunny. Set
+   * `SCRATCH_DIR` to move this onto a RAM disk (see [resolveUploadsDir]).
+   */
   uploadsDir: string;
   dbPath: string;
   secretPath: string;
@@ -64,6 +70,17 @@ export interface AppConfig {
    * request then leaves from Bunny's edge instead of this machine.
    */
   scrapeEgress: Record<string, string>;
+  /**
+   * The exits the scrape layer sends its requests through, in order.
+   *
+   * Built in (see [BUILT_IN_PROXIES]); `SCRAPER_PROXIES` replaces the list, and
+   * `SCRAPER_PROXIES=off` empties it, which puts the scraper back on this
+   * machine's own connection. Empty means "no proxies": nothing in the download
+   * path ever reads this list, so it cannot make a video download metered.
+   */
+  scrapeProxies: ProxyEndpoint[];
+  /** What the proxy plan allows, in bytes. Only ever used to warn. */
+  scrapeProxyBudgetBytes: number;
   /** Carry a stream's subtitle tracks into Bunny as caption tracks. */
   subtitleUpload: boolean;
   /**
@@ -211,6 +228,37 @@ export function parseEgressMap(value: unknown): Record<string, string> {
   return out;
 }
 
+/**
+ * `SCRAPER_PROXIES` — where the scrape layer's requests should leave from.
+ *
+ * Absent means the list built into the code. An explicit `off`/`none` (or an empty
+ * value) turns proxying off entirely and the scraper talks to the hosts from this
+ * machine again. Anything else is parsed as proxies — `host:port:user:pass` lines,
+ * comma or newline separated, exactly as a provider exports them.
+ */
+export function parseScrapeProxies(value: unknown): ProxyEndpoint[] {
+  if (value === undefined) return builtInProxies();
+  const text = String(value).trim();
+  if (!text || SCRAPER_PROXIES_OFF.has(text.toLowerCase())) return [];
+  return parseProxyList(text);
+}
+
+/** The values of `SCRAPER_PROXIES` that mean "send from this machine". */
+const SCRAPER_PROXIES_OFF = new Set(['off', 'none', 'no', '0', 'false', 'disabled']);
+
+/**
+ * `SCRAPER_PROXY_BUDGET_MB` — what the proxy plan allows, so the dashboard can
+ * say how much of it is spent. Nothing is switched off when it runs out: the
+ * exits themselves stop answering (402) and the pool sets them aside.
+ */
+export function parseProxyBudgetBytes(value: unknown): number {
+  const mb = Number(value);
+  if (!Number.isFinite(mb) || mb <= 0) return DEFAULT_PROXY_BUDGET_BYTES;
+  return Math.floor(mb) * 1_048_576;
+}
+
+export const DEFAULT_PROXY_BUDGET_BYTES = 1024 * 1_048_576;
+
 /** The values of `SUBTITLE_TRANSLATOR` that mean "carry, never translate". */
 const TRANSLATE_OFF = new Set(['off', 'none', 'no', '0', 'false', 'disabled', 'never']);
 
@@ -343,13 +391,54 @@ function loadEnvFile(root: string, env: NodeJS.ProcessEnv): void {
   }
 }
 
+/**
+ * The directory that holds working files: a scraped source's spool while it is
+ * being downloaded and uploaded at the same time, and a manual upload's `.bin`
+ * until it reaches Bunny.
+ *
+ * Nothing in here is meant to outlive its job, but a stream in flight can still
+ * occupy gigabytes, so `SCRATCH_DIR` exists to point the whole thing at memory —
+ * `/dev/shm` on Linux, or a `tmpfs` mount — and keep real storage out of the
+ * transfer entirely. Unset means `DATA_DIR/uploads`, which is where these files
+ * have always lived.
+ */
+export function resolveUploadsDir(dataDir: string, env: NodeJS.ProcessEnv = process.env): string {
+  const configured = env.SCRATCH_DIR?.trim();
+  return configured ? path.resolve(configured) : path.join(dataDir, 'uploads');
+}
+
+/**
+ * Creates the scratch directory, and says which knob was wrong when it cannot.
+ *
+ * A `SCRATCH_DIR` that points at a RAM disk which is not mounted is a typo worth
+ * failing on, not a silent fall back to the very disk the operator asked to
+ * keep the transfer away from.
+ */
+function ensureScratchDir(dir: string, env: NodeJS.ProcessEnv = process.env): void {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    const name = env.SCRATCH_DIR?.trim() ? 'SCRATCH_DIR' : 'DATA_DIR';
+    throw new Error(`${name} points at ${dir}, which could not be created (${reason})`);
+  }
+}
+
+/** One startup line naming the scratch directory, when it has been moved. */
+export function scratchNotice(uploadsDir: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (!env.SCRATCH_DIR?.trim()) return undefined;
+  return `SCRATCH_DIR is set: working files go to ${uploadsDir} and are deleted as each job finishes, so nothing is kept there.`;
+}
+
 export function loadConfig(argv = process.argv.slice(2), env = process.env): AppConfig {
   const root = path.resolve(here, '..');
   loadEnvFile(root, env);
   const mock = argv.includes('--mock') || env.MOCK_PROVIDERS === '1' || env.MOCK_PROVIDERS === 'true';
   const dataDir = env.DATA_DIR ? path.resolve(env.DATA_DIR) : path.join(root, 'data');
-  const uploadsDir = path.join(dataDir, 'uploads');
-  fs.mkdirSync(uploadsDir, { recursive: true });
+  const uploadsDir = resolveUploadsDir(dataDir, env);
+  ensureScratchDir(uploadsDir, env);
+  const scratch = scratchNotice(uploadsDir, env);
+  if (scratch) console.log(scratch);
 
   const port = Number(env.PORT ?? 4747);
   const translate = parseTranslator(env);
@@ -392,6 +481,8 @@ export function loadConfig(argv = process.argv.slice(2), env = process.env): App
     scrapeMinIntervalMs: clampIntervalMs(env.SCRAPER_MIN_INTERVAL_MS, 350, 0),
     scrapeCooldownMs: clampIntervalMs(env.SCRAPER_COOLDOWN_MS, 60_000, 1_000),
     scrapeEgress: parseEgressMap(env.SCRAPER_EGRESS),
+    scrapeProxies: parseScrapeProxies(env.SCRAPER_PROXIES),
+    scrapeProxyBudgetBytes: parseProxyBudgetBytes(env.SCRAPER_PROXY_BUDGET_MB),
     subtitleUpload: envFlag(env.SUBTITLES, true),
     subtitleTargetLanguages: parseSubtitleTargets(env.SUBTITLE_TARGET_LANG),
     subtitleTranslate: translate !== undefined,

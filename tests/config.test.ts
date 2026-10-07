@@ -1,6 +1,22 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
-import { HARD_MAX_SUBTITLE_TARGETS, clampConcurrency, clampMaxAccounts, parseR2, parseSubtitleTargets, parseUploadMode } from '../src/config';
+import {
+  DEFAULT_PROXY_BUDGET_BYTES,
+  HARD_MAX_SUBTITLE_TARGETS,
+  clampConcurrency,
+  clampMaxAccounts,
+  loadConfig,
+  parseProxyBudgetBytes,
+  parseR2,
+  parseScrapeProxies,
+  parseSubtitleTargets,
+  parseUploadMode,
+  resolveUploadsDir,
+  scratchNotice,
+} from '../src/config';
 import { DEFAULT_TUS_CHUNK_BYTES, MAX_TUS_CHUNK_BYTES, MIN_TUS_CHUNK_BYTES, clampChunkBytes } from '../src/tus';
 
 test('per-account concurrency is clamped to the hard cap of 10', () => {
@@ -135,4 +151,64 @@ test('the TUS chunk size is clamped to sane bounds', () => {
   assert.equal(clampChunkBytes(1), MIN_TUS_CHUNK_BYTES);
   assert.equal(clampChunkBytes(Number.MAX_SAFE_INTEGER), MAX_TUS_CHUNK_BYTES);
   assert.equal(clampChunkBytes('nonsense'), DEFAULT_TUS_CHUNK_BYTES);
+});
+
+test('working files can be moved off the disk with SCRATCH_DIR', () => {
+  const dataDir = path.join(os.tmpdir(), 'bunny-config-data');
+  // Unset (or blank): where these files have always lived, inside DATA_DIR.
+  assert.equal(resolveUploadsDir(dataDir, {}), path.join(dataDir, 'uploads'));
+  assert.equal(resolveUploadsDir(dataDir, { SCRATCH_DIR: '' }), path.join(dataDir, 'uploads'));
+  assert.equal(resolveUploadsDir(dataDir, { SCRATCH_DIR: '   ' }), path.join(dataDir, 'uploads'));
+  // Set: that directory, resolved — a relative path must not be read against
+  // whatever cwd the process happens to have.
+  const ram = path.join(os.tmpdir(), 'bunny-ram-scratch');
+  assert.equal(resolveUploadsDir(dataDir, { SCRATCH_DIR: ram }), path.resolve(ram));
+  assert.equal(resolveUploadsDir(dataDir, { SCRATCH_DIR: 'scratch-here' }), path.resolve('scratch-here'));
+  // The startup line is only worth printing when the location was moved.
+  assert.equal(scratchNotice(ram, {}), undefined);
+  assert.match(scratchNotice(ram, { SCRATCH_DIR: ram }) ?? '', new RegExp(ram.replace(/[\\^$*+?.()|[\]{}]/g, '\\$&')));
+});
+
+test('the scrape proxies come from the code, from SCRAPER_PROXIES, or from nowhere', () => {
+  // Absent: the list built into the code, so a fresh checkout scrapes through the
+  // exits it was shipped with.
+  assert.equal(parseScrapeProxies(undefined).length, 90);
+  // Set: exactly what it says, in the export format.
+  const list = parseScrapeProxies('user:pass@1.2.3.4:8080, other:secret@5.6.7.8:3128');
+  assert.equal(list.length, 2);
+  assert.equal(list[0]?.host, '1.2.3.4');
+  assert.equal(list[1]?.password, 'secret');
+  // Switched off: no proxies at all, which is what puts the scraper back on this
+  // machine's own connection.
+  assert.deepEqual(parseScrapeProxies('off'), []);
+  assert.deepEqual(parseScrapeProxies('none'), []);
+  assert.deepEqual(parseScrapeProxies('   '), []);
+  // Nonsense is not silently replaced by the built-in list: an operator who set a
+  // broken value should see scraping go direct, not out through proxies they did
+  // not name.
+  assert.deepEqual(parseScrapeProxies('not a proxy'), []);
+});
+
+test('the proxy budget is what the plan allows, and only ever warns', () => {
+  assert.equal(parseProxyBudgetBytes(undefined), DEFAULT_PROXY_BUDGET_BYTES);
+  assert.equal(DEFAULT_PROXY_BUDGET_BYTES, 1024 * 1_048_576, '1 GB, the plan the built-in list came from');
+  assert.equal(parseProxyBudgetBytes(512), 512 * 1_048_576);
+  assert.equal(parseProxyBudgetBytes(0), DEFAULT_PROXY_BUDGET_BYTES);
+  assert.equal(parseProxyBudgetBytes('nonsense'), DEFAULT_PROXY_BUDGET_BYTES);
+});
+
+test('loadConfig puts the working files where SCRATCH_DIR says, and makes the folder', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bunny-config-'));
+  const scratch = path.join(root, 'ram');
+  try {
+    const config = loadConfig([], { SCRATCH_DIR: scratch });
+    assert.equal(config.uploadsDir, scratch);
+    assert.equal(fs.statSync(config.uploadsDir).isDirectory(), true, 'the scratch folder is created at startup');
+    // The database and the key file stay in DATA_DIR, so a RAM disk that loses
+    // its contents on restart cannot take the settings and accounts with it.
+    assert.equal(config.dbPath.startsWith(config.uploadsDir), false);
+    assert.equal(config.secretPath.startsWith(config.uploadsDir), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

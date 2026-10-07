@@ -1,17 +1,22 @@
 /**
  * Job orchestration: each job is one upload of one target (movie or episode)
  * into one Bunny Stream library. The service owns the queue lifecycle —
- * queued → uploading → encoding → ready — and keeps the store in sync.
+ * queued → uploading → encoding → (archiving) → ready — and keeps the store in
+ * sync. `archiving` is where a job waits for its copy to R2, and it is skipped
+ * entirely when this dashboard has no destination to copy to.
  */
 import fs from 'node:fs';
 import path from 'node:path';
+// The shape of a copy's verdict, defined where a copy happens. Type-only, so the
+// archive and the queue stay free to be built and tested apart.
+import type { ArchiveSettled } from './archive';
 import type { Catalog, CatalogEntry } from './catalog';
 import type { AppConfig } from './config';
 import { BunnyError, bunnyStatusLabel, mapBunnyStatus, playbackUrlFor, type BunnyClient } from './bunny';
 import { isActiveStatus, planAssignments } from './queue';
 import type { RelayHub } from './relay';
 import type { Account, Job, JobSource, JobTarget, Store } from './store';
-import { newJob } from './store';
+import { newJob, targetKey } from './store';
 import { runStreamJob, type StreamDeps } from './stream';
 import type { TunnelManager } from './tunnel';
 
@@ -30,8 +35,44 @@ export interface JobServiceDeps {
    * knows a publish just happened.
    */
   onPublished?: (entry: CatalogEntry, job: Job) => void;
+  /**
+   * The R2 copy, when this dashboard has one to wait for. Absent (or disabled)
+   * means a publish is finished the moment Bunny has encoded it.
+   */
+  archive?: ArchiveWatch;
   now?: () => number;
 }
+
+/**
+ * What a finished job waits on before it can call itself finished.
+ *
+ * Copying a title out of Bunny is the last thing that ever happens to it, so it
+ * is part of the job rather than something that trails after it: the job stays
+ * open until the copy is verified and Bunny has let the video go, which is why a
+ * dashboard with a destination never shows a title as `ready` while its bytes
+ * exist in exactly one place.
+ *
+ * A dashboard without one never calls any of this — [ArchiveWatch.enabled] is
+ * false — and a publish finishes the moment Bunny has encoded it.
+ */
+export interface ArchiveWatch {
+  /** Whether this dashboard has somewhere to copy to at all. */
+  enabled(): boolean;
+  /**
+   * Puts this title's copy in line if it still needs one, and says whether it
+   * took one on. Called on the publish path (where the server's own hook has
+   * usually queued it already, so this is a no-op) and again after a restart
+   * (where nothing has, so this is the only thing that queues it).
+   */
+  request(entry: CatalogEntry): boolean;
+  /** Resolves once this title has no copy work left, whatever the outcome. */
+  settled(key: string): Promise<ArchiveSettled>;
+  /** The copy's progress, for the job's own progress bar. */
+  progress(key: string): { percent: number; detail: string } | undefined;
+}
+
+/** How often the copy's progress is copied onto the job row. */
+const ARCHIVE_REPORT_MS = 1_000;
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -80,6 +121,7 @@ export class JobService {
   private tunnel: TunnelManager;
   private catalog: Catalog | undefined;
   private onPublished: ((entry: CatalogEntry, job: Job) => void) | undefined;
+  private archive: ArchiveWatch | undefined;
   private now: () => number;
   private inFlight = new Set<string>();
   private polling = new Set<string>();
@@ -93,6 +135,7 @@ export class JobService {
     this.tunnel = deps.tunnel;
     this.catalog = deps.catalog;
     this.onPublished = deps.onPublished;
+    this.archive = deps.archive;
     this.now = deps.now ?? (() => Date.now());
   }
 
@@ -107,6 +150,15 @@ export class JobService {
    */
   recover(): void {
     for (const job of [...this.store.jobs]) {
+      // A job that was waiting on its copy when the dashboard stopped. The copy's
+      // queue did not survive the restart, so the title is handed back to the
+      // archive and watched again — nothing is assumed to have finished.
+      if (job.status === 'archiving') {
+        const entry = this.catalog?.get(targetKey(job.target));
+        if (entry) this.settleArchive(job.id, entry);
+        else this.store.updateJob(job.id, { status: 'ready', progress: 100, detail: 'published — there was nothing left to copy' });
+        continue;
+      }
       if (job.status !== 'uploading') continue;
       this.requeue(job, 'requeued after the dashboard restarted');
     }
@@ -152,7 +204,8 @@ export class JobService {
 
   /**
    * Removes staged files left in the uploads directory by jobs that no longer
-   * exist: `.bin` uploads, and the `.ts`/`.mp4` spools of finished stream jobs.
+   * exist: `.bin` uploads, the `.ts`/`.mp4` spools of finished stream jobs, and
+   * the `repair-` folder an archive mend spooled into when it was killed part-way.
    * Only files older than an hour are touched, so a spool being written right now
    * cannot be swept out from under its downloader.
    */
@@ -166,19 +219,20 @@ export class JobService {
       );
       const now = this.now();
       for (const name of fs.readdirSync(this.config.uploadsDir)) {
-        if (!/\.(bin|ts|mp4)$/i.test(name) || referenced.has(name)) continue;
+        if (!/\.(bin|ts|mp4)$/i.test(name) && !/^repair-/.test(name)) continue;
+        if (referenced.has(name)) continue;
         const filePath = path.join(this.config.uploadsDir, name);
         // A staged `.bin` is written before its job exists, so it is swept at
-        // once; a spool belongs to a live download and is only swept when it is
-        // old enough that no downloader could still be filling it.
-        if (/\.(ts|mp4)$/i.test(name)) {
+        // once; a spool (or a repair folder) belongs to work in flight and is
+        // only swept when it is old enough that nothing could still be filling it.
+        if (!/\.bin$/i.test(name)) {
           try {
             if (now - fs.statSync(filePath).mtimeMs < 60 * 60_000) continue;
           } catch {
             continue;
           }
         }
-        fs.rmSync(filePath, { force: true });
+        fs.rmSync(filePath, { recursive: true, force: true });
       }
     } catch {
       /* housekeeping only */
@@ -598,10 +652,13 @@ export class JobService {
         // The permanent record is written here, not when the job is created —
         // "published" means Bunny finished encoding it, with everything the
         // job learned along the way (every source, every quality rung).
-        if (ready) this.publish(ready, account);
+        const entry = ready ? this.publish(ready, account) : undefined;
         // Bunny has everything it needs from the relay by now.
         this.releaseRelay(job);
         this.cleanupTemp(job);
+        // …and with a destination configured this is not the end of the job: it
+        // is finished when the title's bytes are in R2, not when Bunny says yes.
+        this.settleArchive(jobId, entry);
         return;
       }
       if (outcome === 'failed') {
@@ -631,15 +688,16 @@ export class JobService {
   }
 
   /** Records a finished job in the published catalogue, if one is configured. */
-  private publish(job: Job, account: Account): void {
-    if (!this.catalog) return;
+  /** Writes the permanent record, and answers with the entry it wrote. */
+  private publish(job: Job, account: Account): CatalogEntry | undefined {
+    if (!this.catalog) return undefined;
     let entry: CatalogEntry;
     try {
       entry = this.catalog.record(job, account);
     } catch (error) {
       // Losing the record must never fail a job that is already published.
       console.error(`[catalog] could not record ${job.id}: ${describeError(error)}`);
-      return;
+      return undefined;
     }
     // The hook acts *after* the record exists, so it can read the entry (the
     // tracks the publish attached) rather than the job's own copy. It must not
@@ -649,6 +707,76 @@ export class JobService {
     } catch (error) {
       console.error(`[catalog] the published-title hook failed for ${job.id}: ${describeError(error)}`);
     }
+    return entry;
+  }
+
+  /**
+   * Keeps a published job open until its copy to R2 has finished.
+   *
+   * The copy is the last thing that ever happens to a title, so it belongs to the
+   * job: the job reports `archiving` — carrying the copy's own progress — and only
+   * turns `ready` once every file is in the bucket and verified, which is also
+   * after the subtitle languages the title was missing have been translated (the
+   * copy waits behind that work on purpose).
+   *
+   * A copy that failed does not fail the job. The video is published, playable and
+   * safe in Bunny either way, and the archive's own reconciler is already looking
+   * for titles it missed — so the job says what happened and finishes ready.
+   */
+  private settleArchive(jobId: string, entry: CatalogEntry | undefined): void {
+    const watch = this.archive;
+    if (!watch || !entry || !watch.enabled()) return;
+    try {
+      watch.request(entry);
+    } catch (error) {
+      console.error(`[jobs] ${jobId}: the copy to R2 could not be queued — ${describeError(error)}`);
+      return;
+    }
+    this.store.updateJob(jobId, {
+      status: 'archiving',
+      stage: 'archiving',
+      detail: 'translating the subtitles it was missing, then copying every file to R2',
+    });
+    void this.guardAsync('archive watch', () => this.watchArchive(jobId, entry.key));
+  }
+
+  /**
+   * Follows one title's copy: reports it on the job while it runs, and finishes
+   * the job with what the copy did.
+   */
+  private async watchArchive(jobId: string, key: string): Promise<void> {
+    const watch = this.archive;
+    if (!watch) return;
+    const ticker = setInterval(() => {
+      const job = this.store.job(jobId);
+      // Cancelled or deleted while the copy ran: the copy is its own work now,
+      // and it is still the copy that decides whether the title is safe.
+      if (!job || job.status !== 'archiving') {
+        clearInterval(ticker);
+        return;
+      }
+      const progress = watch.progress(key);
+      if (!progress || (progress.percent === job.progress && progress.detail === job.detail)) return;
+      this.store.updateJob(jobId, { progress: progress.percent, detail: progress.detail });
+    }, ARCHIVE_REPORT_MS);
+    let outcome: ArchiveSettled;
+    try {
+      outcome = await watch.settled(key);
+    } finally {
+      clearInterval(ticker);
+    }
+    const job = this.store.job(jobId);
+    if (!job || job.status !== 'archiving') return;
+    const note = outcome.note ? ` — ${outcome.note}` : '';
+    const detail =
+      outcome.status === 'done'
+        ? `in R2${note}`
+        : outcome.status === 'failed'
+          ? `the copy to R2 did not finish${note} — the video is safe in Bunny, and the reconciler will try again`
+          : outcome.status === 'skipped'
+            ? `nothing was copied to R2${note}`
+            : `the copy to R2 is still running${note}`;
+    this.store.updateJob(jobId, { status: 'ready', progress: 100, detail });
   }
 
   retry(jobId: string): Job | undefined {

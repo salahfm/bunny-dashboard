@@ -516,6 +516,72 @@ test('consider() archives the title a publish just wrote, after the subtitle rep
   }
 });
 
+test('settled() answers what the copy did, and progress() says where it is', async () => {
+  const { rig: r, close } = await rig();
+  try {
+    // Nothing queued: the answer is about the title, not about a task.
+    assert.equal((await r.archive.settled(r.entry.key)).status, 'skipped');
+
+    assert.ok(r.archive.enqueue(r.entry));
+    const live = r.archive.progress(r.entry.key);
+    assert.equal(typeof live?.percent, 'number');
+    assert.ok((live?.detail ?? '').length > 0, 'the copy says what it is doing while it runs');
+
+    const settled = await r.archive.settled(r.entry.key);
+    assert.equal(settled.status, 'done');
+    assert.match(settled.note ?? '', /file\(s\)/);
+    assert.match(settled.note ?? '', /Bunny has let it go/);
+    assert.deepEqual(r.deleted, [VIDEO_ID]);
+    assert.equal(r.archive.progress(r.entry.key)?.percent, 100);
+
+    // Asked again afterwards, the answer is still about the title.
+    assert.equal((await r.archive.settled(r.entry.key)).status, 'done');
+  } finally {
+    await close();
+  }
+});
+
+test('a copy that failed is reported as failed, with Bunny still holding the video', async () => {
+  const { rig: r, r2Server, close } = await rig();
+  try {
+    r2Server.failPuts(100, 403);
+    assert.ok(r.archive.enqueue(r.entry));
+    const settled = await r.archive.settled(r.entry.key);
+    assert.equal(settled.status, 'failed');
+    assert.ok((settled.note ?? '').length > 0, 'and says why');
+    assert.deepEqual(r.deleted, [], 'a failed copy must not delete the video');
+  } finally {
+    await close();
+  }
+});
+
+test('a title already in the bucket settles done even with nothing queued for it', async () => {
+  const { rig: r, close } = await rig();
+  try {
+    await r.archive.archiveKeys([r.entry.key], 1);
+    // A service that never saw this copy — a dashboard that just restarted, say,
+    // or a sweep that landed it first — still answers honestly about the title.
+    const fresh = new ArchiveService({
+      config: r.config,
+      catalog: r.catalog,
+      r2: r.r2,
+      client: () => bunnyStub(finishedVideo(), []),
+      enabled: () => true,
+      now: () => NOW,
+    });
+    try {
+      const settled = await fresh.settled(r.entry.key);
+      assert.equal(settled.status, 'done');
+      assert.match(settled.note ?? '', /already in the bucket/);
+      assert.equal(fresh.progress(r.entry.key), undefined, 'nothing is in hand to report');
+    } finally {
+      fresh.stop();
+    }
+  } finally {
+    await close();
+  }
+});
+
 test('the archive is never attempted when no destination is configured', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bunny-archive-'));
   const config = testConfig(dir);

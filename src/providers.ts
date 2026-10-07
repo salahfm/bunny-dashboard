@@ -8,8 +8,9 @@
  * browser (vidfast, cinesrc). Those two keep their plain page scan here, which
  * is exactly the fallback ogaro itself runs when no browser is configured.
  */
-import { HostGuard, hostOf, looksLikeChallenge } from './hostguard';
+import { HostGuard, hostOf, isBlockingStatus, looksLikeChallenge } from './hostguard';
 import { fetchWithPolicy } from './net';
+import { proxyFetcher, type ProxyEndpoint, type ProxyPool } from './proxies';
 import type { JobTarget } from './store';
 
 export type StreamType = 'hls' | 'mp4';
@@ -92,10 +93,23 @@ export function streamHeaders(referer?: string, extra: Record<string, string> = 
  * The provider's own cap still bounds the total: retries here never extend it.
  *
  * This is the raw transport (candidate probes and media downloads use it too),
- * so it is deliberately not throttled per host — see [scrapeFetch].
+ * so it is deliberately not throttled per host — see [scrapeSend]. It is also the
+ * reason the proxy pool cannot leak into the download path: the pool is only ever
+ * handed in by the scrape layer, as `via`, and a media request passes nothing.
  */
-export async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs = 9000): Promise<Response> {
-  return fetchWithPolicy(url, init, { timeoutMs, retries: 1, backoffMs: 400, what: 'the host' });
+export async function fetchWithTimeout(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs = 9000,
+  via?: typeof fetch,
+): Promise<Response> {
+  return fetchWithPolicy(url, init, {
+    timeoutMs,
+    retries: 1,
+    backoffMs: 400,
+    what: 'the host',
+    ...(via ? { fetchImpl: via } : {}),
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -115,16 +129,33 @@ export class HostBlockedError extends Error {
 
 let egressMap: Record<string, string> = {};
 let hostGuard: HostGuard | undefined;
+let proxyPool: ProxyPool | undefined;
 
-/** Wires the shared guard and the host → base rewrite map into the scraper. */
-export function configureScraper(options: { egress?: Record<string, string>; guard?: HostGuard }): void {
+/**
+ * Wires the shared guard, the host → base rewrite map and the proxy pool into the
+ * scraper.
+ *
+ * The pool is optional and only the scrape layer ever sees it: with no pool every
+ * request goes straight out, which is what this dashboard did before one existed.
+ */
+export function configureScraper(options: {
+  egress?: Record<string, string>;
+  guard?: HostGuard;
+  proxies?: ProxyPool;
+}): void {
   if (options.egress) egressMap = options.egress;
   if (options.guard) hostGuard = options.guard;
+  if (options.proxies) proxyPool = options.proxies;
 }
 
 /** The guard in use, so the dashboard can show which hosts are cooling down. */
 export function scraperGuard(): HostGuard | undefined {
   return hostGuard;
+}
+
+/** The pool in use, so the dashboard can show which exits are alive. */
+export function scraperProxies(): ProxyPool | undefined {
+  return proxyPool;
 }
 
 /**
@@ -151,10 +182,42 @@ export function egressFor(url: string): { request: string; origin: string; via?:
 }
 
 /**
- * One scrape-layer request: paced and serialised per host, refused early while
- * the host is cooling down, and observed so a refusal starts a cooldown.
+ * How many exits one scrape request may try before the host itself is blamed.
+ *
+ * Three is enough to step over a set whose plan has run out of bandwidth and a
+ * single exit the host happens to dislike, without turning one slow host into a
+ * long wait: every attempt after the first one costs a round trip through a
+ * different address.
  */
-async function scrapeFetch(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+export const SCRAPE_EXITS = 3;
+
+/** How many exits this request may try (one when there is no pool to draw on). */
+function scrapeTries(): number {
+  const ready = proxyPool?.ready() ?? 0;
+  return Math.max(1, Math.min(SCRAPE_EXITS, ready + 1));
+}
+
+/**
+ * Puts the exit that answered aside after a refusal, and says whether another one
+ * is worth asking.
+ *
+ * A refusal through a proxy may say nothing about the host at all: the block can
+ * be on the exit's address, which is the whole reason the pool exists — so the
+ * exit is set aside and a different one is tried before the host is cooled down.
+ * With no proxy in play there is nothing to rotate to, and the refusal is the
+ * host's, exactly as it was before the pool.
+ */
+function rotateExit(endpoint: ProxyEndpoint | undefined, reason: string): boolean {
+  if (!endpoint) return false;
+  proxyPool?.report(endpoint, 'blocked', reason);
+  return (proxyPool?.ready() ?? 0) > 0;
+}
+
+/**
+ * One scrape-layer request: paced and serialised per host, refused early while
+ * the host is cooling down, and sent through one exit of the pool.
+ */
+async function scrapeAttempt(url: string, init: RequestInit, timeoutMs: number): Promise<{ response: Response; proxy?: ProxyEndpoint }> {
   const egress = egressFor(url);
   const cooling = hostGuard?.cooling(egress.origin);
   if (cooling) {
@@ -162,15 +225,38 @@ async function scrapeFetch(url: string, init: RequestInit, timeoutMs: number): P
     throw new HostBlockedError(`${egress.origin} is cooling down for another ${left}s (${cooling.reason})`, egress.origin);
   }
   const target = hostOf(egress.request);
-  const send = (): Promise<Response> => fetchWithTimeout(egress.request, init, timeoutMs);
+  // Which exit answered is reported back through this closure, so a reader that
+  // finds a refusal inside the *body* (a bot wall) can rotate away from it too.
+  let used: ProxyEndpoint | undefined;
+  const via = proxyPool ? proxyFetcher(proxyPool, (endpoint) => (used = endpoint)) : undefined;
+  const send = (): Promise<Response> => fetchWithTimeout(egress.request, init, timeoutMs, via);
   const response = hostGuard ? await hostGuard.run(target, send) : await send();
-  hostGuard?.observe(egress.origin, response.status, response.headers);
-  return response;
+  return { response, proxy: used };
+}
+
+/**
+ * One scrape request, through as many exits as it takes to stop being refused by
+ * a proxy that the *host* has no quarrel with.
+ *
+ * A 401/403/429/503 arriving through a proxy is not yet a verdict on this
+ * machine, so it rotates first and only observes the response — which is what
+ * starts a host cooldown — once no other exit is worth trying.
+ */
+async function scrapeSend(url: string, init: RequestInit, timeoutMs: number): Promise<{ response: Response; proxy?: ProxyEndpoint }> {
+  const tries = scrapeTries();
+  let answer = await scrapeAttempt(url, init, timeoutMs);
+  for (let attempt = 1; attempt < tries; attempt += 1) {
+    if (!isBlockingStatus(answer.response.status)) break;
+    if (!rotateExit(answer.proxy, `HTTP ${answer.response.status}`)) break;
+    answer = await scrapeAttempt(url, init, timeoutMs);
+  }
+  hostGuard?.observe(egressFor(url).origin, answer.response.status, answer.response.headers);
+  return answer;
 }
 
 export async function fetchJson<T = unknown>(url: string, referer?: string, timeoutMs = 9000): Promise<T | null> {
   try {
-    const response = await scrapeFetch(
+    const { response } = await scrapeSend(
       url,
       { headers: baseHeaders(referer, { Accept: 'application/json, text/plain, */*' }) },
       timeoutMs,
@@ -186,25 +272,31 @@ export async function fetchJson<T = unknown>(url: string, referer?: string, time
 }
 
 export async function fetchText(url: string, referer?: string, timeoutMs = 10000): Promise<string | null> {
-  try {
-    const response = await scrapeFetch(
-      url,
-      { headers: baseHeaders(referer, { Accept: 'text/html,application/json,*/*' }) },
-      timeoutMs,
-    );
-    if (!response.ok) return null;
-    const text = await response.text();
-    // A 200 that is a bot wall is a refusal too: cool the host instead of
-    // reporting "no playable URL found" and asking it again immediately.
-    if (looksLikeChallenge(text)) {
-      const egress = egressFor(url);
-      hostGuard?.penalize(hostOf(egress.request), 'a bot challenge');
-      throw new HostBlockedError(`${egress.origin} answered a bot challenge instead of the page`, egress.origin);
+  const tries = scrapeTries();
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      const { response, proxy } = await scrapeSend(
+        url,
+        { headers: baseHeaders(referer, { Accept: 'text/html,application/json,*/*' }) },
+        timeoutMs,
+      );
+      if (!response.ok) return null;
+      const text = await response.text();
+      // A 200 that is a bot wall is a refusal too. It is a refusal of the exit
+      // that got it before it is one of the host — a page that challenges one
+      // address happily serves another — so another exit is asked first, and
+      // only a wall at every exit cools this host down.
+      if (looksLikeChallenge(text)) {
+        const egress = egressFor(url);
+        if (attempt < tries && rotateExit(proxy, 'a bot challenge')) continue;
+        hostGuard?.penalize(egress.origin, 'a bot challenge');
+        throw new HostBlockedError(`${egress.origin} answered a bot challenge instead of the page`, egress.origin);
+      }
+      return text;
+    } catch (error) {
+      if (error instanceof HostBlockedError) throw error;
+      return null;
     }
-    return text;
-  } catch (error) {
-    if (error instanceof HostBlockedError) throw error;
-    return null;
   }
 }
 
@@ -223,15 +315,19 @@ export async function fetchScrapeText(
   headers: Record<string, string> = {},
   timeoutMs = 15_000,
 ): Promise<string> {
-  const response = await scrapeFetch(url, { headers: { ...baseHeaders(headers.Referer), ...headers } }, timeoutMs);
-  if (!response.ok) throw new Error(`the subtitle request failed (HTTP ${response.status})`);
-  const body = await response.text();
-  if (looksLikeChallenge(body)) {
-    const egress = egressFor(url);
-    hostGuard?.penalize(hostOf(egress.request), 'a bot challenge');
-    throw new HostBlockedError(`${egress.origin} answered a bot challenge instead of the file`, egress.origin);
+  const tries = scrapeTries();
+  for (let attempt = 1; ; attempt += 1) {
+    const { response, proxy } = await scrapeSend(url, { headers: { ...baseHeaders(headers.Referer), ...headers } }, timeoutMs);
+    if (!response.ok) throw new Error(`the subtitle request failed (HTTP ${response.status})`);
+    const body = await response.text();
+    if (looksLikeChallenge(body)) {
+      const egress = egressFor(url);
+      if (attempt < tries && rotateExit(proxy, 'a bot challenge')) continue;
+      hostGuard?.penalize(egress.origin, 'a bot challenge');
+      throw new HostBlockedError(`${egress.origin} answered a bot challenge instead of the file`, egress.origin);
+    }
+    return body;
   }
-  return body;
 }
 
 /** enc-dec.app encryptor, used by hosts that only accept an encrypted id. */

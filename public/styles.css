@@ -745,7 +745,8 @@ button.link {
 }
 
 .status.uploading,
-.status.encoding {
+.status.encoding,
+.status.archiving {
   color: var(--accent);
   border-color: var(--accent);
 }

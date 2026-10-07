@@ -30,10 +30,13 @@ Bunny does the encoding; the dashboard tracks every job until it is playable.
 3. **Measure.** Every segment's size is read (`Content-Length`/`Content-Range`,
    or `#EXT-X-BYTERANGE`) so the upload can declare an exact length before it
    starts. AES-128 segments are decrypted, fMP4 init segments are prepended.
-4. **Download while uploading.** Segments land in `DATA_DIR/uploads/<job-id>.ts`
-   (or `.mp4`); the same file is read at the other end by whichever transport is
-   carrying it, so the bytes are downloaded once and the transfer overlaps the
-   download.
+4. **Download while uploading.** Segments land in
+   `DATA_DIR/uploads/<job-id>.ts` (or `.mp4`); the same file is read at the other
+   end by whichever transport is carrying it, so the bytes are downloaded once
+   and the transfer overlaps the download. That scratch file is a working file,
+   not a stored copy — it is deleted as soon as the job finishes, and
+   `SCRATCH_DIR` moves the whole thing onto a RAM disk so it never touches real
+   storage at all (see [Working files](#working-files)).
 5. **Transport.** With the tunnel up, Bunny is handed
    `/relay/<token>/stream.<ext>` and pulls the file from Bunny's own network;
    without one (or if Bunny refuses), the dashboard streams the spool into
@@ -52,6 +55,47 @@ node scripts/demo-source.mjs        # http://127.0.0.1:4800/master.m3u8
 ```
 
 Paste that URL into **Source URL** and press **Download & upload**.
+
+## Working files
+
+Downloading and uploading already happen at the same time. A scraped source's
+segments are appended to a spool file while the transport reads that same file
+at its own pace, so the bytes are downloaded once and the upload is never
+waiting for the download to finish. One spool, two transports:
+
+- with a tunnel up, Bunny pulls `/relay/<token>/stream.<ext>` and reads the
+  spool through the tunnel as it grows;
+- without one, the dashboard sends TUS chunks to Bunny and each chunk read waits
+  for exactly the bytes that chunk needs.
+
+The spool is a **working file, never a stored copy**. It is deleted the moment
+the job finishes — `ready`, `failed` or cancelled — a failed *resumable* upload
+keeps it only so **Retry** can continue where it stopped, and anything an
+orphaned crash left behind is swept at the next startup. The same is true of a
+manual upload's `<job-id>.bin` and of the spool an archive repair pulls.
+
+The one thing that is noticeable is size: a single 1080p title can occupy
+several gigabytes *while it runs*. `SCRATCH_DIR` is what keeps even that off
+your storage:
+
+| Where | How |
+| --- | --- |
+| Linux | `SCRATCH_DIR=/dev/shm/bunny-publisher` — path is created if it does not exist |
+| Docker | `SCRATCH_DIR=/scratch` plus a `tmpfs` mount; already set up in `docker-compose.yml` |
+| Windows / macOS | no `/dev/shm`; any RAM-disk volume works the same way |
+
+A RAM disk is the version that keeps every guarantee: TUS needs its exact
+`Upload-Length` before it starts and re-reads a byte range after a failed chunk,
+and the relay must serve a segment whenever Bunny asks for it — possibly minutes
+after it was produced. Those bytes come back out of the working file, so the
+file has to still be there; putting it in memory removes the storage without
+removing the retries.
+
+Size it above one title's worth of bytes, times the streams you run at once. A
+scratch file that cannot be written (a full RAM disk, an unmounted `/dev/shm`)
+fails that job with the write error and leaves nothing half-published; it never
+quietly falls back to the disk. A `SCRATCH_DIR` that cannot be created at all is
+a startup error naming the variable, not a silent default.
 
 ## Features
 
@@ -217,7 +261,8 @@ at startup and never overrides real environment variables.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `PORT` / `HOST` | `4747` / `127.0.0.1` | HTTP listener |
-| `DATA_DIR` | `./data` | `db.json`, the AES key file, temporary uploads |
+| `DATA_DIR` | `./data` | `db.json`, the AES key file, and working files unless `SCRATCH_DIR` moves them |
+| `SCRATCH_DIR` | `DATA_DIR/uploads` | where working files live while a job runs — a stream's spool, an upload's `.bin`, a repair's spool. Point it at a RAM disk to keep the transfer off real storage |
 | `PER_ACCOUNT_CONCURRENCY` | `10` | concurrent uploads per account (clamped to 1–10) |
 | `MAX_ACCOUNTS` | `30` | account limit (clamped to 1–30) |
 | `TICK_INTERVAL_MS` / `POLL_INTERVAL_MS` | `1000` / `10000` | scheduler tick / Bunny status poll |
@@ -237,6 +282,8 @@ at startup and never overrides real environment variables.
 | `SCRAPER_MIN_INTERVAL_MS` | `350` | smallest gap between two requests to the same scraping host (`0` disables) |
 | `SCRAPER_COOLDOWN_MS` | `60000` | first cooldown for a host that refused us (min 1000); doubles per repeat, capped at 30 min |
 | `SCRAPER_EGRESS` | – | route a scraping host through a bunny.net pull zone: `host=base,host=base` |
+| `SCRAPER_PROXIES` | built in | the proxy exits scrape requests leave through: `host:port:user:pass`, comma or newline separated; `off` sends them from this machine |
+| `SCRAPER_PROXY_BUDGET_MB` | `1024` | what the proxy plan allows, so the dashboard can say how much of it is spent (a warning only) |
 | `SUBTITLES` | `1` | carry a scraped stream's subtitle tracks into Bunny as caption tracks |
 | `SUBTITLE_TARGET_LANG` | `ar` | the languages a title should end up with, in order — one code or a list (`ar,fr,es`, `Arabic, French, Spanish`); each one the stream does not already carry is translated and attached |
 | `SUBTITLE_TRANSLATOR` | `deepl` | whether the missing languages are machine-translated; `off` = carry the stream's tracks only, invent nothing |
@@ -374,14 +421,22 @@ placement and ladder in one request, the image after it.
 
 ## How the queue works
 
-1. `POST /api/jobs/upload` streams the file to `DATA_DIR/uploads/<job-id>.bin`
-   (no size buffering in memory); `POST /api/jobs/remote` just records the URL.
+1. `POST /api/jobs/upload` streams the file into the working directory as
+   `<job-id>.bin` (no size buffering in memory); `POST /api/jobs/remote` just
+   records the URL. Both the `.bin` and a scraped stream's spool are deleted as
+   soon as the job finishes — see [Working files](#working-files).
 2. A tick every second assigns queued jobs to accounts with free capacity —
    oldest first, spread as evenly as possible, never above the per-account cap.
 3. A worker creates the Bunny video object, then either uploads the file over
    TUS (see below) or calls `POST /videos/fetch` for remote URLs.
 4. Status moves `queued → uploading → encoding → ready` (or `failed`), polling
    Bunny every 10 s. While uploading, `progress` tracks bytes sent to Bunny.
+5. With an R2 destination configured there is one more step before that last
+   one: `archiving`. Bunny finishing its encode is not the end of the work — the
+   title's missing subtitle languages are translated first, then every file is
+   copied into the bucket and verified, and only then does the job turn `ready`
+   with the copy's outcome in its detail line. See
+   [It is part of the job](#it-is-part-of-the-job).
 
 ### Live queue
 
@@ -685,13 +740,47 @@ complete archive" means. A title's captions go in as they are: whatever the job
 scraped, plus every target language it was translated into, because all of them
 are attached to the video *before* it is considered finished.
 
+### It is part of the job
+
+With a destination configured a job does not stop when Bunny finishes encoding.
+It gains one more status — `archiving` — and stays there until the title's bytes
+are in the bucket:
+
+```
+queued → uploading → encoding → archiving → ready
+```
+
+The queue row becomes a progress bar for the copy itself (`copying to R2 ·
+video/1080p.mp4 · 3/9 file(s)`), and while the copy is held back waiting for a
+subtitle to be translated it says that instead (`waiting for the last of this
+title’s subtitle work to finish`). Only then does the job finish, with what
+happened in its detail line:
+
+| The copy | The job's detail |
+| --- | --- |
+| Landed and verified | `in R2 — 9 file(s), 812 MB — Bunny has let it go` |
+| Gave up | `the copy to R2 did not finish — <why> — the video is safe in Bunny, and the reconciler will try again` |
+| Had nothing to do | `nothing was copied to R2 — nothing was left to copy` |
+
+A copy that failed does **not** fail the job: the video is published, playable and
+safely in Bunny either way, and the reconciler below is already looking for titles
+the archive missed. `archiving` is deliberately *not* counted against an account's
+upload slots — Bunny has finished with that video — so a long copy cannot slow the
+queue down. With no destination configured the status is never used at all: a
+publish finishes the moment Bunny says it is encoded, exactly as before.
+
+A dashboard that stops while a job is `archiving` hands the title back to the
+archive on the way up and watches it again, rather than declaring the copy done or
+leaving the row stuck: nothing is assumed to have copied.
+
 ### Fully automatic: nothing is left behind
 
 The routing happens on its own, in this order, with no button involved:
 
-1. **A publish finishes** and Bunny reports the video ready. The job has already
-   attached every caption track it could — including the translated ones for
-   `SUBTITLE_TARGET_LANG` — and the full record is written to the catalogue.
+1. **Bunny reports the video ready**, the full record is written to the catalogue,
+   and the job moves to `archiving` rather than finishing. It has already attached
+   every caption track it could — including the translated ones for
+   `SUBTITLE_TARGET_LANG`.
 2. **A language the title arrived without** is filled in from the track it did
    arrive with (see *Subtitles*), by the automatic repair.
 3. **The archive waits for that repair.** The video is not touched while a
@@ -915,7 +1004,7 @@ restart resumes where it stopped instead of re-walking the same pages.
 | interval | `5 min` | how often a cycle runs (min 10 s) |
 | expand shows | on | queue every episode of a show rather than stepping over shows |
 
-## Avoiding blocks (politeness and bunny.net egress)
+## Avoiding blocks (politeness, proxy exits and bunny.net egress)
 
 The scraping hosts are third-party players, and asking one of them for a
 thousand titles looks exactly like abuse. Two layers keep the dashboard out of
@@ -933,6 +1022,47 @@ cannot be retried into a permanent ban. While a host cools, every request to it
 fails fast with a clear reason and the sweep moves on to the next host rather
 than burning its timeout. **Settings → Cooling down** lists the hosts that are
 cooling, why, and when they recover.
+
+**A block lands on an address, not on a request.** Once a host has decided this
+machine is a scraper, being politer does not help: the same address keeps
+getting `403` (or a bot wall) however slowly it asks. So every scrape request
+leaves through a **pool of proxy exits** and the pool spreads them — one request
+per exit in turn, and an exit that gets refused is skipped for a while instead of
+taking the whole host down with it.
+
+Three things follow from that, and they are the whole design:
+
+- **Only the scrape is proxied.** These exits are metered by the gigabyte, and a
+  page, a provider API answer or a subtitle file is tens of kilobytes, while a
+  video is gigabytes. The playlist, the segments, the Bunny upload and the R2
+  copy stay on this machine's own connection, where a byte is free. A test pins
+  that boundary (`src/hls.ts`, `src/stream.ts`, `src/tus.ts`, `src/r2.ts` and the
+  Bunny clients must not import the pool), because it is the kind of thing that
+  is easy to break by accident.
+- **An exit that the *host* refused is not the host's fault yet.** A `403`
+  through a proxy puts that exit aside and the request is retried through another
+  one; only when every exit is refused is the host put into cooldown. A wall in
+  the *body* (a bot challenge) is treated exactly the same way.
+- **An exit the *proxy* refused is dropped.** A plan that has run out of
+  bandwidth answers `402` to every request; wrong credentials answer `407`. Both
+  put that exit out of the pool for a long while, and when no exit is left the
+  scraper falls back to talking to the host from this machine — which is exactly
+  what it did before the pool existed.
+
+The list is built into the code (`BUILT_IN_PROXIES` in `src/proxies.ts`), so a
+fresh checkout is proxied without configuration. `SCRAPER_PROXIES` replaces it,
+and `SCRAPER_PROXIES=off` turns proxying off:
+
+```bash
+# one exit per line, or comma separated; `host:port:user:pass` is the export format
+SCRAPER_PROXIES="1.2.3.4:8080:user:pass,5.6.7.8:3128:user:pass"
+```
+
+**Settings → Proxy exits** lists the exits that are sitting out and why, and
+**Test exits** asks every one of them for a single small page (`example.com`, a
+few hundred bytes each) and reports what answered. That is the button that tells
+the two causes of "scraping is blocked" apart: the hosts refusing these
+addresses, or the plan being spent.
 
 **Egress through bunny.net.** A CDN's job is to fetch content from an origin on
 behalf of its visitors — and Bunny **forwards the visitor's headers unchanged**
@@ -994,7 +1124,8 @@ keeps the queue honest.
 | `POST` | `/api/jobs/bulk` | `{ text \| lines[], expandSeries?, seasons?, maxJobs?, skipQueued?, only?, minHeight? }` → one job per movie, every episode per show; answers `{ created, skipped, counts, truncated }` |
 | `POST` | `/api/jobs/series` | `{ target: { tmdbId, title? }, seasons?, maxJobs?, only?, minHeight? }` → every episode of the show (`seasons` narrows it) |
 | `POST` | `/api/jobs/retry-failed` | retry every failed job in one call |
-| `GET` | `/api/sources/providers` | the scraping hosts, the default tier floor, and the hosts currently cooling down |
+| `GET` | `/api/sources/providers` | the scraping hosts, the default tier floor, the hosts currently cooling down, and the proxy exits the scrape leaves through |
+| `POST` | `/api/proxies/test` | one tiny request through every proxy exit: which answered, how fast, and what the rest said |
 | `POST` | `/api/sources/preview` | `{ target, only?, minHeight? }` → what a scrape would pick |
 | `GET` | `/api/tunnel` | tunnel state + recent cloudflared log |
 | `POST` | `/api/tunnel/start` / `/stop` | bring the quick tunnel up or down |
@@ -1152,7 +1283,7 @@ right home for the queue. Hosts that build from a git repository only need the
 
 ```bash
 npm run typecheck        # tsc --noEmit
-npm test                 # 320 tests (queue caps, crypto, store + its change hook + its write-failure and write-coalescing behaviour, catalogue, the Stream client, the account client behind library provisioning, watermarks and the library read-back, TUS, watcher, job lifecycle + a tick that survives an unwritable data folder, crash resume, HLS, source pipeline, subtitles, DeepL translation, multi-language targets, subtitle backfill and its automatic repair, the R2 archive background queue with its verification pass, its scheduled weekly sweep, its automatic reconciler and the publish route that translates, copies every caption and only then deletes from Bunny, targeted repair, restore and signed-URL playback, and its SigV4 signer/presigner, tunnel, network policy, diagnostics, login, autopilot, host politeness)
+npm test                 # 346 tests (queue caps, crypto, store + its change hook + its write-failure and write-coalescing behaviour, catalogue, the Stream client, the account client behind library provisioning, watermarks and the library read-back, TUS, watcher, job lifecycle + a tick that survives an unwritable data folder, crash resume, HLS, source pipeline, subtitles, DeepL translation, multi-language targets, subtitle backfill and its automatic repair, the R2 archive background queue with its verification pass, its scheduled weekly sweep, its automatic reconciler and the publish route that translates, copies every caption and only then deletes from Bunny, targeted repair, restore and signed-URL playback, and its SigV4 signer/presigner, tunnel, network policy, diagnostics, login, autopilot, host politeness, and the scrape proxy pool — its list, its rotation and the boundary that keeps the metered exits out of the download path)
 
 # End-to-end against a running mock server:
 npm run mock &           # or in another terminal

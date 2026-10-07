@@ -14,7 +14,9 @@ COPY src ./src
 COPY public ./public
 
 # Listen on every interface so the platform can route to the container, and
-# keep all mutable state (db.json, the AES key, temp uploads) on one volume.
+# keep all mutable state (db.json, the AES key, accounts) on one volume. A
+# scraped stream's working file is not state — `SCRATCH_DIR` moves it onto a
+# RAM disk so a title in flight never lands on the volume (see docker-compose.yml).
 ENV HOST=0.0.0.0 \
     PORT=4747 \
     DATA_DIR=/data

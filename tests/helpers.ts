@@ -32,6 +32,11 @@ export function testConfig(dataDir: string, overrides: Partial<AppConfig> = {}):
     scrapeMinIntervalMs: 0,
     scrapeCooldownMs: 60_000,
     scrapeEgress: {},
+    // No proxies unless a test asks for them: a suite that dialled the real,
+    // built-in list would be slow, metered and non-deterministic. The proxy tests
+    // point at a proxy of their own instead.
+    scrapeProxies: [],
+    scrapeProxyBudgetBytes: 0,
     subtitleUpload: true,
     subtitleTargetLanguages: ['ar'],
     // On by default like the real configuration; a test that cares points the

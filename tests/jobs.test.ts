@@ -3,10 +3,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import type { ArchiveSettled } from '../src/archive';
 import type { BunnyClient, BunnyVideo } from '../src/bunny';
 import { Catalog, type CatalogEntry } from '../src/catalog';
 import type { AppConfig } from '../src/config';
-import { JobService } from '../src/jobs';
+import { JobService, type ArchiveWatch } from '../src/jobs';
 import { Store } from '../src/store';
 import { testConfig, testStreamDeps, waitFor } from './helpers';
 
@@ -109,6 +110,7 @@ class FakeBunny {
 function setup(
   overrides: Partial<AppConfig> = {},
   onPublished?: (entry: CatalogEntry) => void,
+  archive?: ArchiveWatch,
 ): { config: AppConfig; store: Store; fake: FakeBunny; service: JobService; catalog: Catalog } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bunny-jobs-'));
   const config = testConfig(dir, overrides);
@@ -123,10 +125,137 @@ function setup(
     clientFactory: () => fake as unknown as BunnyClient,
     catalog,
     ...(onPublished ? { onPublished } : {}),
+    ...(archive ? { archive } : {}),
     ...testStreamDeps(dir),
   });
   return { config, store, fake, service, catalog };
 }
+
+/**
+ * The R2 copy, stood in for so the queue can be driven without a bucket: it
+ * remembers every title it was asked for, and hands the test the resolver for
+ * each wait so the copy can be made to land (or fail) on demand.
+ */
+function fakeArchive(options: { enabled?: () => boolean; progress?: () => { percent: number; detail: string } | undefined } = {}) {
+  const requested: string[] = [];
+  const waits: Array<(settled: ArchiveSettled) => void> = [];
+  const watch: ArchiveWatch = {
+    enabled: options.enabled ?? (() => true),
+    request: (entry) => {
+      requested.push(entry.key);
+      return true;
+    },
+    settled: () => new Promise<ArchiveSettled>((resolve) => waits.push(resolve)),
+    progress: options.progress ?? (() => undefined),
+  };
+  return { watch, requested, waits };
+}
+
+/**
+ * A job driven all the way to the moment Bunny says it is encoded, which is where * the copy takes over.
+ */
+async function encodeOne(service: JobService, store: Store, fake: FakeBunny, config: AppConfig): Promise<string> {
+  store.addAccount({ name: 'a', libraryId: '1', apiKeyEnc: 'x' });
+  const clip = path.join(config.uploadsDir, 'clip.mp4');
+  fs.writeFileSync(clip, Buffer.from('fake video bytes'));
+  const job = service.createFileJob({ kind: 'movie', tmdbId: 27205, title: 'Inception', year: '2010' }, clip, 'clip.mp4', 16);
+  service.tickNow();
+  await waitFor(() => store.job(job.id)?.status === 'encoding', 'the upload to finish');
+  fake.statuses.set(fake.created[0] as string, 4);
+  await service.pollNow();
+  return job.id;
+}
+
+test('a job is not ready until its copy to R2 has landed', async () => {
+  const archive = fakeArchive();
+  const { config, store, fake, service, catalog } = setup({}, undefined, archive.watch);
+  const jobId = await encodeOne(service, store, fake, config);
+
+  // Bunny has finished with it — and the job is still running, because the
+  // title's bytes exist in exactly one place until the copy lands.
+  assert.equal(store.job(jobId)?.status, 'archiving');
+  assert.equal(store.job(jobId)?.stage, 'archiving');
+  assert.deepEqual(archive.requested, ['movie:27205'], 'the copy is asked for on the publish');
+  assert.ok(catalog.get('movie:27205'), 'and the record exists before it is asked for');
+
+  archive.waits[0]?.({ status: 'done', note: '13 file(s), 812 MB — Bunny has let it go' });
+  await waitFor(() => store.job(jobId)?.status === 'ready', 'the job to finish when the copy lands');
+  assert.equal(store.job(jobId)?.progress, 100);
+  assert.match(store.job(jobId)?.detail ?? '', /in R2/);
+  assert.match(store.job(jobId)?.detail ?? '', /Bunny has let it go/);
+  service.stop();
+});
+
+test("the copy's own progress is reported on the job that is waiting for it", async () => {
+  const progress = { percent: 3, detail: 'reading what Bunny holds' };
+  const archive = fakeArchive({ progress: () => ({ ...progress }) });
+  const { config, store, fake, service } = setup({}, undefined, archive.watch);
+  const jobId = await encodeOne(service, store, fake, config);
+  assert.equal(store.job(jobId)?.status, 'archiving');
+
+  progress.percent = 42;
+  progress.detail = 'copying to R2 · video/1080p.mp4 · 3/9 file(s)';
+  await waitFor(() => store.job(jobId)?.progress === 42, 'the copy progress to reach the row', 4_000);
+  assert.equal(store.job(jobId)?.detail, 'copying to R2 · video/1080p.mp4 · 3/9 file(s)');
+
+  archive.waits[0]?.({ status: 'done', note: '9 file(s), 812 MB' });
+  await waitFor(() => store.job(jobId)?.status === 'ready', 'the job to finish');
+  assert.equal(store.job(jobId)?.progress, 100);
+  service.stop();
+});
+
+test('with no R2 destination a publish finishes as soon as Bunny has encoded it', async () => {
+  const archive = fakeArchive({ enabled: () => false });
+  const { config, store, fake, service } = setup({}, undefined, archive.watch);
+  const jobId = await encodeOne(service, store, fake, config);
+
+  assert.equal(store.job(jobId)?.status, 'ready');
+  assert.deepEqual(archive.requested, [], 'nothing is asked of a destination that does not exist');
+  service.stop();
+});
+
+test('a copy that failed leaves the job ready with the reason, not failed', async () => {
+  const archive = fakeArchive();
+  const { config, store, fake, service } = setup({}, undefined, archive.watch);
+  const jobId = await encodeOne(service, store, fake, config);
+  assert.equal(store.job(jobId)?.status, 'archiving');
+
+  archive.waits[0]?.({ status: 'failed', note: 'the bucket answered 503' });
+  await waitFor(() => store.job(jobId)?.status === 'ready', 'the job to finish once the copy gave up');
+  const detail = store.job(jobId)?.detail ?? '';
+  assert.match(detail, /did not finish/);
+  assert.match(detail, /503/);
+  assert.match(detail, /safe in Bunny/);
+  assert.equal(store.job(jobId)?.error, undefined, 'a published, playable video is not a failed job');
+  service.stop();
+});
+
+test('a job that was waiting on its copy is handed back to the archive after a restart', async () => {
+  const first = fakeArchive();
+  const { config, store, fake, service, catalog } = setup({}, undefined, first.watch);
+  const jobId = await encodeOne(service, store, fake, config);
+  assert.equal(store.job(jobId)?.status, 'archiving');
+  service.stop();
+
+  // The restart: the copy's own queue did not survive, and the job is still
+  // waiting on it.
+  const second = fakeArchive();
+  const restarted = new JobService({
+    store,
+    config,
+    clientFactory: () => fake as unknown as BunnyClient,
+    catalog,
+    archive: second.watch,
+    ...testStreamDeps(config.root),
+  });
+  restarted.recover();
+
+  assert.equal(store.job(jobId)?.status, 'archiving', 'it is not quietly declared finished');
+  assert.deepEqual(second.requested, ['movie:27205'], 'the copy is queued again');
+  second.waits[0]?.({ status: 'done', note: '13 file(s), 812 MB' });
+  await waitFor(() => store.job(jobId)?.status === 'ready', 'the restarted dashboard to finish it');
+  restarted.stop();
+});
 
 test('a file job flows queued → encoding → ready and cleans up its temp file', async () => {
   const { config, store, fake, service } = setup();
@@ -356,6 +485,24 @@ test('startup sweeps temp files whose job no longer exists', () => {
   assert.equal(fs.existsSync(referenced), true, 'a referenced temp file is kept');
   assert.equal(fs.existsSync(orphan), false, 'an orphaned .bin file is removed');
   assert.equal(fs.existsSync(foreign), true, 'files that are not ours are left alone');
+});
+
+test('an abandoned repair spool is swept, a repair still running keeps its own', () => {
+  const { config, service } = setup();
+  const live = path.join(config.uploadsDir, 'repair-live');
+  fs.mkdirSync(live, { recursive: true });
+  fs.writeFileSync(path.join(live, 'object.mp4'), Buffer.from('being mended'));
+  const abandoned = path.join(config.uploadsDir, 'repair-abandoned');
+  fs.mkdirSync(abandoned, { recursive: true });
+  fs.writeFileSync(path.join(abandoned, 'object.mp4'), Buffer.from('left by a crash'));
+  // A repair spool is long-lived work, so it is age-gated like a stream spool.
+  const longAgo = new Date(Date.now() - 2 * 60 * 60_000);
+  fs.utimesSync(abandoned, longAgo, longAgo);
+
+  service.recover();
+
+  assert.equal(fs.existsSync(live), true, 'a repair that could still be running keeps its spool');
+  assert.equal(fs.existsSync(abandoned), false, 'a repair spool nothing could still be using is removed');
 });
 
 test('UPLOAD_MODE=put still uploads in a single request', async () => {

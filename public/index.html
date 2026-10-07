@@ -265,6 +265,7 @@
               <option value="queued">queued</option>
               <option value="uploading">uploading</option>
               <option value="encoding">encoding</option>
+              <option value="archiving">archiving</option>
               <option value="ready">ready</option>
               <option value="failed">failed</option>
               <option value="cancelled">cancelled</option>
@@ -661,6 +662,30 @@
                 <th>Host</th>
                 <th>Reason</th>
                 <th>Recovers</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+          <h2>Proxy exits</h2>
+          <p class="muted small">
+            A host that has had enough of this machine answers <code>HTTP 403</code> — or a bot wall — for
+            every request that follows, because the block is on the address and not on the request. So the
+            scrape leaves through these exits instead, and the pool spreads the requests across them. They
+            are metered by the gigabyte: nothing in the download path uses them. The playlist, the
+            segments, the Bunny upload and the R2 copy stay on this machine's own connection.
+          </p>
+          <div class="row">
+            <button id="proxies-test">Test exits</button>
+            <span id="proxies-summary" class="muted small"></span>
+          </div>
+          <table class="table" id="proxies-table">
+            <thead>
+              <tr>
+                <th>Exit</th>
+                <th>State</th>
+                <th>Requests</th>
+                <th>Carried</th>
+                <th>Last said</th>
               </tr>
             </thead>
             <tbody></tbody>

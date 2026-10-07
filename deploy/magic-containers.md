@@ -75,6 +75,7 @@ Environment variables:
 HOST=0.0.0.0
 PORT=4747
 DATA_DIR=/data
+SCRATCH_DIR=/dev/shm/bunny-publisher
 DASHBOARD_USER=index
 DASHBOARD_PASSWORD=<your password>
 SOURCE_TUNNEL=0
@@ -94,6 +95,14 @@ starting a quick tunnel or fetching cloudflared inside the container, and
 `TUNNEL_PUBLIC_URL` is the public base the pipeline uses in every case — so the
 relay is served on the app's own bunny.net endpoint and Bunny Stream is told to
 fetch it there instead of through a tunnel from your PC.
+
+`SCRATCH_DIR` keeps a scraped title's working file off the volume: a stream is
+downloaded and uploaded at the same time out of one scratch file, and a single
+1080p title can occupy gigabytes while it runs. `/dev/shm` is the container's own
+RAM disk, the path is created at startup, and nothing put there outlives its job
+— the file is deleted as soon as the job finishes. Size it against how many
+streams run at once (the memory counts towards the container's limit), or leave
+`SCRATCH_DIR` unset and the working files go to `/data/uploads` as before.
 
 Optional: `UPLOAD_MODE=tus`, `NETWORK_TIMEOUT_MS=30000`, `NETWORK_RETRIES=3`.
 

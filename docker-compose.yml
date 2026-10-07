@@ -14,7 +14,14 @@ services:
     environment:
       HOST: 0.0.0.0
       DATA_DIR: /data
+      # Working files — the spool a scraped source is downloaded into and
+      # uploaded out of at the same time — go on a RAM disk instead of the
+      # volume, so a stream in flight never touches real storage. Nothing put
+      # there outlives its job. Bump the size for larger/parallel titles.
+      SCRATCH_DIR: /scratch
       # MOCK_PROVIDERS: "1"   # uncomment for a fully offline demo run
+    tmpfs:
+      - /scratch:size=2g,mode=1777
     volumes:
       - dashboard-data:/data
 

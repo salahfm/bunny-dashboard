@@ -670,8 +670,11 @@
     const stats = state.stats;
     const counts = stats?.counts ?? {};
     $('#queue-badge').textContent = `${stats?.active ?? 0} active · ${stats?.queued ?? 0} queued`;
+    // `archiving` is its own count: a job waiting on its copy to R2 is running,
+    // but it does not hold an account's upload slot — Bunny is already done with
+    // that video — so it is deliberately not part of the "active" number above.
     $('#queue-summary').textContent = stats
-      ? `uploading ${counts.uploading ?? 0} · encoding ${counts.encoding ?? 0} · ready ${counts.ready ?? 0} · failed ${counts.failed ?? 0} · cancelled ${counts.cancelled ?? 0} · capacity ${stats.capacity}`
+      ? `uploading ${counts.uploading ?? 0} · encoding ${counts.encoding ?? 0} · archiving ${counts.archiving ?? 0} · ready ${counts.ready ?? 0} · failed ${counts.failed ?? 0} · cancelled ${counts.cancelled ?? 0} · capacity ${stats.capacity}`
       : '';
   }
 
@@ -729,6 +732,10 @@
     if (['queued', 'uploading', 'encoding'].includes(job.status)) {
       actions.append(h('button', { text: 'cancel', onclick: () => void jobAction(job.id, 'cancel') }));
     } else {
+      // An archiving job is offered `delete` and not `cancel` on purpose: its
+      // video is already encoded and being copied, and cancelling would take the
+      // video out of Bunny while the copy is reading it. Deleting the row only
+      // stops watching it — the copy finishes on the archive's own queue.
       actions.append(h('button', { text: 'delete', onclick: () => void jobAction(job.id, 'delete') }));
     }
     if (job.playbackUrl) {
@@ -2822,8 +2829,9 @@
         'scrape egress',
         Object.keys(settings.source?.egress ?? {}).length
           ? Object.entries(settings.source.egress).map(([host, base]) => `${host} → ${base}`).join(', ')
-          : 'direct (no proxy)',
+          : 'no host is rewritten',
       ],
+      ['scrape exits', proxySummary(settings.source?.proxies)],
       ['watched folder', settings.watchEnabled ? settings.watchDir || '(not set)' : 'off'],
       ['limits', `≤${settings.limits.maxAccounts} accounts · ≤${settings.limits.perAccountConcurrency} uploads each · ${bytes(settings.limits.maxUploadBytes)} per file`],
       ['network calls', `${settings.network?.timeoutMs ?? 30000} ms per attempt · ${settings.network?.retries ?? 3} retries`],
@@ -2857,7 +2865,127 @@
         );
       }
     }
+
+    renderProxies(settings.source?.proxies);
   }
+
+  /* -------------------------------------------------------------- proxies */
+
+  /**
+   * Where the scrape requests leave from, in one line.
+   *
+   * The number that matters most is the bytes carried: it is the difference
+   * between "the scrape is proxied" and "the plan is spent", and a spent plan
+   * looks exactly like every host blocking this machine at once.
+   */
+  function proxySummary(pool) {
+    if (!pool?.total) return 'off — the scrape talks to the hosts directly';
+    const parts = [`${pool.ready}/${pool.total} exit(s) ready`];
+    if (pool.blocked) parts.push(`${pool.blocked} set aside`);
+    if (pool.unusable) parts.push(`${pool.unusable} out of use`);
+    // `bytes()` draws nothing as an em dash, which is right in a table cell and
+    // wrong here: "nothing carried yet" is a number worth showing.
+    const carried = Number(pool.bytes ?? 0) > 0 ? bytes(pool.bytes) : '0 B';
+    parts.push(`${carried} of ${bytes(pool.budgetBytes ?? 0)} carried`);
+    if (pool.overBudget) parts.push('over the plan');
+    return parts.join(' · ');
+  }
+
+  /**
+   * The exit table.
+   *
+   * With no test behind it this shows only the exits that are *not* quietly
+   * working — ninety healthy rows would bury the two that explain a block. After
+   * a test it shows every exit and what it answered, the failures first, because
+   * that is the list someone acts on.
+   */
+  function renderProxies(pool, results) {
+    const body = clear($('#proxies-table tbody'));
+
+    if (results?.length) {
+      const rows = [...results].sort((a, b) => Number(a.ok) - Number(b.ok) || a.label.localeCompare(b.label));
+      for (const result of rows) {
+        body.append(
+          h(
+            'tr',
+            {},
+            h('td', { class: 'mono small', text: result.label }),
+            h('td', {}, h('span', { class: `status ${result.ok ? 'ready' : 'failed'}`, text: result.ok ? 'ok' : 'down' })),
+            h('td', { class: 'mono small', text: `${result.ms} ms` }),
+            h('td', { class: 'mono small', text: bytes(result.bytes ?? 0) }),
+            h('td', { class: 'small muted', text: result.ok ? `HTTP ${result.status ?? '?'}` : result.error ?? 'no answer' }),
+          ),
+        );
+      }
+      $('#proxies-summary').textContent = `${proxySummary(pool)} · ${results.filter((result) => result.ok).length} of ${results.length} answered`;
+      return;
+    }
+
+    if (!pool?.total) {
+      body.append(
+        h('tr', {}, h('td', { colspan: '5', class: 'muted small', text: 'no exits are configured — the scrape uses this machine’s own connection' })),
+      );
+      return;
+    }
+
+    const notable = pool.notable ?? [];
+    if (!notable.length) {
+      body.append(h('tr', {}, h('td', { colspan: '5', class: 'muted small', text: 'every exit is answering — nothing is sitting out' })));
+    } else {
+      for (const entry of notable) {
+        body.append(
+          h(
+            'tr',
+            {},
+            h('td', { class: 'mono small', text: entry.label }),
+            h(
+              'td',
+              {},
+              h('span', {
+                class: `status ${entry.state === 'unusable' ? 'failed' : 'skipped'}`,
+                text: entry.state === 'unusable' ? 'out of use' : 'set aside',
+              }),
+            ),
+            h('td', { class: 'mono small', text: String(entry.requests ?? 0) }),
+            h('td', { class: 'mono small', text: bytes(entry.bytes ?? 0) }),
+            h(
+              'td',
+              { class: 'small muted', text: `${entry.lastError ?? '—'}${entry.until ? ` · back in ${fmtDuration(entry.until - Date.now())}` : ''}` },
+            ),
+          ),
+        );
+      }
+    }
+    $('#proxies-summary').textContent = proxySummary(pool);
+  }
+
+  /**
+   * One tiny request through every exit.
+   *
+   * "Scraping is blocked" is either the hosts refusing these addresses or the
+   * proxy plan being spent (a proxy answers 402 for that), and the two need
+   * opposite responses — this is the button that tells them apart, for a few
+   * hundred bytes per exit.
+   */
+  $('#proxies-test').addEventListener('click', async () => {
+    const body = clear($('#proxies-table tbody'));
+    const button = $('#proxies-test');
+    button.disabled = true;
+    $('#proxies-summary').textContent = 'asking every exit for one small page…';
+    body.append(h('tr', {}, h('td', { colspan: '5', class: 'muted small', text: 'asking every exit for one small page…' })));
+    try {
+      const report = await api('POST', '/api/proxies/test', {});
+      renderProxies(report.proxies, report.results ?? []);
+      const answered = (report.results ?? []).filter((result) => result.ok).length;
+      toast(`${answered} of ${(report.results ?? []).length} exit(s) answered`, answered ? 'ok' : 'bad');
+    } catch (error) {
+      clear(body);
+      $('#proxies-summary').textContent = describeError(error);
+      toast(describeError(error), 'bad');
+    } finally {
+      button.disabled = false;
+    }
+  });
 
   $('#settings-save').addEventListener('click', async () => {
     const body = {

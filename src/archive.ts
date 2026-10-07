@@ -76,7 +76,6 @@
  */
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { bunnyAssets, mapBunnyStatus, MAX_SEEK_SPRITES, playbackUrlFor, pullZoneBase, seekSpriteUrl, type BunnyClient, type BunnyVideo } from './bunny';
 import type { Catalog, CatalogArchive, CatalogArchiveObject, CatalogEntry } from './catalog';
@@ -145,6 +144,40 @@ export type ArchiveStage =
  * two hosts, so they share one queue, one task shape and one stream.
  */
 export type ArchiveOperation = 'archive' | 'verify' | 'restore' | 'repair';
+
+/**
+ * Where a title stands with its copy, for the job that is waiting on it.
+ *
+ * `done` means the bytes are in the bucket and verified; `failed` means the copy
+ * gave up (the video is still safe in Bunny, and the reconciler will try again);
+ * `skipped` means there was nothing to copy; `running` means it is still going
+ * after a wait far longer than any copy should take.
+ */
+export interface ArchiveSettled {
+  status: 'done' | 'failed' | 'skipped' | 'running';
+  note?: string;
+}
+
+/** How long a job waits on its copy before it is told the copy is still going. */
+export const ARCHIVE_SETTLE_TIMEOUT_MS = 2 * 60 * 60_000;
+/** How often that wait re-checks whether the queue still holds the title. */
+const ARCHIVE_SETTLE_POLL_MS = 250;
+
+/** The copy's own stages, in the short words a queue row has room for. */
+const COPY_STAGE_WORDS: Record<ArchiveStage, string> = {
+  queued: 'queued for R2',
+  checking: 'reading what Bunny holds',
+  scanning: 'weighing every file',
+  uploading: 'copying to R2',
+  manifest: 'writing the manifest',
+  deleting: 'letting Bunny forget it',
+  verifying: 'verifying what R2 stored',
+  downloading: 'pulling a copy back down',
+  repairing: 'mending a broken object',
+  done: 'in the bucket',
+  failed: 'the copy failed',
+  skipped: 'nothing to copy',
+};
 
 /**
  * What one pass over the titles Bunny still holds did.
@@ -523,6 +556,79 @@ export class ArchiveService {
 
   task(key: string): ArchiveTask | undefined {
     return this.tasks.get(key);
+  }
+
+  /**
+   * Resolves once this title has nothing left in the copy queue.
+   *
+   * The publish path waits on this, and that is what makes "it is in R2" the end
+   * of a job rather than something that trails after it. The wait covers
+   * everything between an encode finishing and Bunny letting the video go: the
+   * subtitle languages the title was missing (the `before` hook holds the copy
+   * until that work has settled), every asset, the manifest, the verification and
+   * the delete.
+   *
+   * The answer is about the *title*, not about one task, so a copy that finished
+   * before anyone asked still reads `done`. `timeoutMs` guards against a task
+   * that never settles for a reason of its own — the caller is told `running` and
+   * can say so, rather than waiting for ever.
+   */
+  async settled(key: string, timeoutMs = ARCHIVE_SETTLE_TIMEOUT_MS): Promise<ArchiveSettled> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.busyWith(key)) {
+      if (Date.now() > deadline) return { status: 'running', note: this.copyDetail(key) };
+      await new Promise((resolve) => setTimeout(resolve, ARCHIVE_SETTLE_POLL_MS));
+    }
+    const task = this.tasks.get(key);
+    if (task?.status === 'done') return { status: 'done', note: this.copySummary(task) };
+    if (task?.status === 'failed') return { status: 'failed', note: task.note ?? task.error ?? 'the copy did not finish' };
+    // Nothing is queued for it: either it landed already (a sweep, or the button)
+    // or there was never anything to copy.
+    if (this.deps.catalog.get(key)?.archive?.complete) return { status: 'done', note: 'it was already in the bucket' };
+    return { status: 'skipped', note: task?.note ?? 'nothing was left to copy' };
+  }
+
+  /** Whether this title is queued, waiting out a retry, or moving right now. */
+  private busyWith(key: string): boolean {
+    return this.active.has(key) || this.queue.some((item) => item.key === key);
+  }
+
+  /**
+   * How far this title's copy has got, for a queue row that is waiting on it.
+   * `undefined` means there is no copy in hand to report — which is the honest
+   * answer before one is queued.
+   */
+  progress(key: string): { percent: number; detail: string } | undefined {
+    const task = this.tasks.get(key);
+    if (!task) return undefined;
+    return { percent: task.percent, detail: this.copyDetail(key) };
+  }
+
+  /** One line describing where a title's copy stands, in the queue's own words. */
+  private copyDetail(key: string): string {
+    const task = this.tasks.get(key);
+    if (!task) return 'waiting for the copy to start';
+    if (task.status === 'done') return this.copySummary(task);
+    if (task.status === 'failed') return task.note ?? 'the copy did not finish';
+    if (task.status === 'queued') {
+      const behind = task.position && task.position > 1 ? ` — ${task.position - 1} title(s) ahead of it` : '';
+      return `${task.note ?? COPY_STAGE_WORDS.queued}${behind}`;
+    }
+    // A note on a running task is one somebody put there on purpose ("waiting for
+    // the subtitle work"), and it says more than the stage alone would.
+    if (task.note) return task.note;
+    const asset = task.asset ? ` · ${task.asset}` : '';
+    const files = task.assets ? ` · ${task.stored}/${task.assets} file(s)` : '';
+    return `${COPY_STAGE_WORDS[task.stage]}${asset}${files}`;
+  }
+
+  /** What a finished copy was, in one phrase a queue row can show. */
+  private copySummary(task: ArchiveTask): string {
+    const objects = `${task.assets || 0} file(s), ${Math.round(task.bytes / 1_048_576)} MB`;
+    // Only a copy has a Bunny video to talk about; a check or a mend must not
+    // claim Bunny let go of something it never touched.
+    if (task.operation !== 'archive') return objects;
+    return `${objects} — ${task.removedFromBunny ? 'Bunny has let it go' : 'Bunny still holds the video'}`;
   }
 
   /** How many titles are queued or moving — the "N archiving" in the Library. */
@@ -1084,10 +1190,15 @@ export class ArchiveService {
     // attempt aside rather than continuing: the copy is not urgent enough to
     // cost the subtitle the operator asked to have filled in. The title stays a
     // candidate, and the sweep brings it back once the repair has settled.
+    // The wait is said out loud: the job holding open for this copy shows the
+    // note, and "a subtitle is being translated" is the honest thing for it to
+    // say rather than "copying files" while nothing is being copied yet.
+    this.touch(task, { note: 'waiting for the last of this title’s subtitle work to finish' });
     const busy = await Promise.resolve()
       .then(() => this.deps.before?.(entry.key))
       .then(() => undefined)
       .catch((error: unknown) => describeError(error));
+    this.touch(task, { note: undefined });
     if (busy) {
       return { status: 'skipped', note: `still waiting for the subtitle work on this title — ${busy}` };
     }
@@ -1404,7 +1515,15 @@ export class ArchiveService {
     const drifted: string[] = [];
     const unrecoverable: CatalogArchiveObject[] = [];
     const updated = new Map<string, CatalogArchiveObject>();
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bunny-repair-'));
+    // The repair spool is a working file like every other one, so it lives in the
+    // scratch directory rather than the system temp folder: mending a large title
+    // pulls gigabytes back out of the pull zone, and `SCRATCH_DIR` is what keeps
+    // that off the disk (see `resolveUploadsDir`). The directory is created here
+    // rather than assumed, the way a stream spool creates its own, and it is
+    // removed below — a repair killed mid-run leaves a `repair-` folder that the
+    // job sweeper collects once it is old enough.
+    fs.mkdirSync(this.deps.config.uploadsDir, { recursive: true });
+    const dir = fs.mkdtempSync(path.join(this.deps.config.uploadsDir, 'repair-'));
     try {
       let bytes = 0;
       let handled = 0;
@@ -1487,10 +1606,10 @@ export class ArchiveService {
   /**
    * Fetches one flagged object again from the pull zone and puts it back.
    *
-   * The fresh copy is spooled to disk and hashed *before* the stored object is
-   * touched, which is what keeps a changed pull zone from silently redefining the
-   * archive mid-repair. Nothing is uploaded for an object the pull zone no longer
-   * has.
+   * The fresh copy is spooled to the scratch directory and hashed *before* the
+   * stored object is touched, which is what keeps a changed pull zone from
+   * silently redefining the archive mid-repair. Nothing is uploaded for an object
+   * the pull zone no longer has.
    */
   private async recopy(object: CatalogArchiveObject, task: ArchiveTask, completedBytes: number, dir: string): Promise<RepairResult> {
     const r2 = this.deps.r2 as R2Client;
@@ -1816,11 +1935,12 @@ function repairNote(repair: { recopied: string[]; dropped: string[]; drifted: st
 }
 
 /**
- * Streams a response body to disk, hashing and counting as it lands.
+ * Streams a response body to a scratch file, hashing and counting as it lands.
  *
  * The hash is what decides whether the fresh bytes are the object the manifest
  * recorded, so it has to be taken *before* anything is overwritten — which is
- * why a repair spools to disk instead of streaming straight into the bucket.
+ * why a repair spools to the scratch directory instead of streaming straight
+ * into the bucket.
  */
 async function spoolToFile(body: ReadableStream<Uint8Array>, filePath: string, onProgress: (written: number) => void): Promise<{ bytes: number; sha256: string }> {
   const handle = await fs.promises.open(filePath, 'w');

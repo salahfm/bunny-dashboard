@@ -25,6 +25,7 @@ import { JobService, jobTitle, sourceNameFromUrl } from './jobs';
 import { HostGuard } from './hostguard';
 import { DEFAULT_MIN_HEIGHT, previewScrape } from './stream';
 import { configureScraper, providerCatalog, targetFromEmbedUrl } from './providers';
+import { ProxyPool, testExits } from './proxies';
 import { queueStats } from './queue';
 import { DEFAULT_PRESIGN_SECONDS, R2Client } from './r2';
 import { RelayHub } from './relay';
@@ -52,7 +53,28 @@ const hostGuard = new HostGuard({
   baseCooldownMs: config.scrapeCooldownMs,
   log: (message) => console.log(message),
 });
-configureScraper({ egress: config.scrapeEgress, guard: hostGuard });
+
+/**
+ * The exits the scrape layer leaves through.
+ *
+ * A host that blocks this machine's address blocks it for every request, so the
+ * scrape half of the pipeline goes out through a pool of proxies instead and
+ * spreads its requests across them. The download half does not: those exits are
+ * metered, and a video is three orders of magnitude bigger than a page. The pool
+ * starts with the list built into the code and `SCRAPER_PROXIES` replaces it.
+ */
+const proxyPool = new ProxyPool(config.scrapeProxies, {
+  budgetBytes: config.scrapeProxyBudgetBytes,
+  log: (message) => console.log(message),
+});
+configureScraper({ egress: config.scrapeEgress, guard: hostGuard, proxies: proxyPool });
+
+if (proxyPool.size) {
+  console.log(
+    `[scrape] ${proxyPool.size} proxy exit(s) configured — pages, provider APIs and subtitles go out through them; ` +
+      'downloads, uploads and the R2 copy never do',
+  );
+}
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -355,6 +377,16 @@ const jobs = new JobService({
     autoRepair.consider(entry);
     archive.consider(entry);
   },
+  // The copy is part of the job, not something that trails after it: a title is
+  // only `ready` once every file is in the bucket and verified (and, before
+  // that, once the subtitle languages it was missing have been translated — the
+  // copy's own `before` hook is what holds it behind that work).
+  archive: {
+    enabled: () => archive.enabled(),
+    request: (entry) => archive.consider(entry),
+    settled: (key) => archive.settled(key),
+    progress: (key) => archive.progress(key),
+  },
 });
 jobs.recover();
 
@@ -577,12 +609,15 @@ function settingsView() {
       tunnelUrl: config.tunnelPublicUrl ?? null,
       cloudflaredPath: config.cloudflaredPath ?? null,
       providers: providerCatalog(),
-      // The scraping hosts' outbound policy: how politely we ask, and which
-      // hosts are routed somewhere else (a bunny.net pull zone, typically).
+      // The scraping hosts' outbound policy: how politely we ask, which hosts are
+      // routed somewhere else (a bunny.net pull zone, typically), and — since a
+      // block lands on an address rather than a request — which proxy exits the
+      // scrape requests leave through.
       egress: config.scrapeEgress,
       minIntervalMs: config.scrapeMinIntervalMs,
       cooldownMs: config.scrapeCooldownMs,
       cooling: hostGuard.snapshot(),
+      proxies: proxyPool.stats(),
     },
     // Subtitles: whether a scrape carries the stream's caption tracks into
     // Bunny, and the text engine that fills in each missing target language when
@@ -779,7 +814,40 @@ app.get('/api/diagnostics', handle(async (_req, res) => {
   // and "why did it restart / why is it slow?" are the same button for the
   // operator. `runtime` is additive, so a client that only knows the checks is
   // unaffected.
-  res.json({ ...report, runtime: runtimeHealth() });
+  //
+  // `proxies` is here for the same reason. Every check above is made from this
+  // machine, so a host can answer them all and still refuse every scrape — the
+  // scrape goes out through the pool, and whether that pool is alive is the one
+  // thing this table cannot see by itself.
+  res.json({ ...report, runtime: runtimeHealth(), proxies: proxyPool.size ? proxyPool.stats() : undefined });
+}));
+
+/**
+ * One tiny request through every scrape exit, so a block can be read for what it
+ * is.
+ *
+ * "Scraping is blocked" has two completely different causes: the hosts have
+ * started refusing these addresses, or the proxy plan behind them has run out of
+ * bandwidth (which a proxy answers with HTTP 402, and which then looks like every
+ * host refusing at once). This is the difference between "wait and retry" and
+ * "paste a fresh list", and it costs a few hundred bytes per exit.
+ */
+app.post('/api/proxies/test', handle(async (req, res) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  if (config.mock) {
+    res.status(409).json({ error: 'mock mode never touches the network, so there is nothing to test' });
+    return;
+  }
+  if (!proxyPool.size) {
+    res.status(409).json({ error: 'no scrape proxies are configured — set SCRAPER_PROXIES to test a list' });
+    return;
+  }
+  // One exit can be re-tested on its own, which is how a single 402 is confirmed
+  // without spending a request on the other eighty-nine.
+  const label = typeof body.label === 'string' ? body.label : undefined;
+  const only = label ? proxyPool.all().filter((entry) => entry.label === label) : [];
+  const results = await testExits(proxyPool, { ...(only.length ? { endpoints: only } : {}), ...(only.length ? { concurrency: 1 } : {}) });
+  res.json({ proxies: proxyPool.stats(), results });
 }));
 
 app.get('/api/tunnel', (_req, res) => {
@@ -1304,6 +1372,10 @@ app.get('/api/sources/providers', (_req, res) => {
     // Hosts that refused us and are serving a cooldown, with the reason and the
     // time they become usable again.
     cooling: hostGuard.snapshot(),
+    // Where a scrape leaves from: without this the panel cannot tell "the host
+    // is blocking us" from "the proxy plan is spent, so every request is going
+    // out from this machine again".
+    proxies: proxyPool.size ? proxyPool.stats() : undefined,
   });
 });
 

@@ -12,6 +12,10 @@ export interface Assignment {
 }
 
 export function isActiveStatus(status: JobStatus): boolean {
+  // Deliberately not `archiving`: a job waiting on its copy to R2 is running,
+  // but it is not holding one of the account's upload slots — Bunny has already
+  // finished with the video — so counting it would throttle the queue over work
+  // that account is not doing.
   return status === 'uploading' || status === 'encoding';
 }
 
@@ -88,7 +92,7 @@ export interface QueueStats {
 
 export function queueStats(jobs: Job[], accounts: Account[], perAccountConcurrency: number): QueueStats {
   const cap = clampConcurrency(perAccountConcurrency);
-  const counts: Record<JobStatus, number> = { queued: 0, uploading: 0, encoding: 0, ready: 0, failed: 0, cancelled: 0 };
+  const counts: Record<JobStatus, number> = { queued: 0, uploading: 0, encoding: 0, archiving: 0, ready: 0, failed: 0, cancelled: 0 };
   for (const job of jobs) counts[job.status] = (counts[job.status] ?? 0) + 1;
   const active = activeCounts(jobs);
   const accountsView = accounts.map((account) => ({

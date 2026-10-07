@@ -4,7 +4,16 @@ import path from 'node:path';
 import type { AppConfig } from './config';
 import { clampConcurrency, clampMaxAccounts } from './config';
 
-export type JobStatus = 'queued' | 'uploading' | 'encoding' | 'ready' | 'failed' | 'cancelled';
+/**
+ * Where one job has got to.
+ *
+ * `archiving` sits between `encoding` and `ready` on purpose, and only when this
+ * dashboard has somewhere to copy to: Bunny finishing its encode is not the end
+ * of the work — the title still has to be pulled into R2 (with its missing
+ * subtitle languages translated first) and only then is it `ready`. A dashboard
+ * with no R2 destination never uses it.
+ */
+export type JobStatus = 'queued' | 'uploading' | 'encoding' | 'archiving' | 'ready' | 'failed' | 'cancelled';
 export type TargetKind = 'movie' | 'episode';
 
 export interface JobTarget {
