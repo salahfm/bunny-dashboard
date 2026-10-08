@@ -24,6 +24,9 @@
  * pool existed.
  */
 
+import fs from 'node:fs';
+import { createRequire } from 'node:module';
+import path from 'node:path';
 import type { Dispatcher, ProxyAgent } from 'undici';
 
 /* ------------------------------------------------------------------ */
@@ -322,6 +325,7 @@ export class ProxyPool {
   private now: () => number;
   private log: ((message: string) => void) | undefined;
   private budgetWarned = false;
+  private warned = new Set<string>();
   private requests = 0;
   private bytes = 0;
 
@@ -512,6 +516,17 @@ export class ProxyPool {
     };
   }
 
+  /**
+   * Says one thing once, in the pool's own voice: a condition that is not about
+   * any single exit (a transport that cannot be loaded, a budget spent) and would
+   * otherwise be repeated on every request.
+   */
+  warnOnce(message: string): void {
+    if (this.warned.has(message)) return;
+    this.warned.add(message);
+    this.log?.(`[scrape] ${message}`);
+  }
+
   /** Forgets every verdict — used by the exit test and by a manual reset. */
   clear(): void {
     for (const account of this.accounts) {
@@ -538,17 +553,80 @@ const agents = new Map<string, ProxyAgent>();
 let undici: typeof import('undici') | undefined;
 
 /**
+ * The first undici major whose import breaks this process's `fetch`.
+ *
+ * Loading 8.x makes every request that carries an explicit `content-length`
+ * header fail client-side with `UND_ERR_INVALID_ARG: invalid content-length
+ * header`. Uploads are the requests that set one, so the visible symptom is not
+ * "the pool is broken" but "every upload silently stopped landing" — while the
+ * bodyless calls around them (a multipart create, an abort) still reach the
+ * service and are counted. 7.x was measured and is safe, so the line is drawn at 8.
+ */
+export const UNDICI_BREAKING_MAJOR = 8;
+
+/**
+ * The installed undici's version, read from its manifest rather than imported.
+ *
+ * Reading the version must not load the package: importing is the thing that
+ * breaks the process, so the check has to happen before any import. A missing or
+ * unreadable manifest answers `undefined`, which is treated as "usable" — the
+ * import in [transport] is what reports a genuinely absent package.
+ */
+export function installedUndiciVersion(): string | undefined {
+  try {
+    const require = createRequire(import.meta.url);
+    let manifest: string;
+    try {
+      manifest = require.resolve('undici/package.json');
+    } catch {
+      // Some builds hide `package.json` from the exports map; the entry point is
+      // next to it.
+      manifest = path.join(path.dirname(require.resolve('undici')), 'package.json');
+    }
+    const parsed = JSON.parse(fs.readFileSync(manifest, 'utf8')) as { version?: unknown };
+    return typeof parsed.version === 'string' ? parsed.version : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Why this undici install cannot be used, or nothing when it can.
+ *
+ * A pure function of the version so the rule can be tested without installing
+ * anything: it is the one place that knows which releases are safe to import.
+ */
+export function undiciImportNote(version: string | undefined = installedUndiciVersion()): string | undefined {
+  const major = Number(/^(\d+)\./.exec(version ?? '')?.[1] ?? Number.NaN);
+  if (!Number.isFinite(major) || major < UNDICI_BREAKING_MAJOR) return undefined;
+  return (
+    `undici ${version} is installed: importing it makes every request with a content-length header fail in this process ` +
+    `(uploads stop landing while the calls around them are still counted), so the proxy exits are standing aside — ` +
+    `pin undici to ^6 (package.json) and run npm install to bring the pool back.`
+  );
+}
+
+/** Raised when the pool cannot be used at all, as opposed to one exit failing. */
+export class ProxyTransportError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ProxyTransportError';
+  }
+}
+
+/**
  * The transport library, loaded the first time an exit is actually used.
  *
  * Deliberately lazy, and deliberately *not* a top-level import: importing it is
- * not free — undici v8 puts something on a global symbol that Node's own `fetch`
- * then picks up, and a `content-length` header on a Buffer body (which the R2
- * client sends) starts failing with `invalid content-length header` in every
- * request in the process. That is a real bug this cost an afternoon to find, so
- * the fix is two-fold: the version is pinned to the 6.x line, and a process that
- * never uses a proxy never loads it at all.
+ * not free — see [UNDICI_BREAKING_MAJOR]. That is a real bug this cost an
+ * afternoon to find, so the fix is three-fold: the version is pinned to the 6.x
+ * line, a process that never uses a proxy never loads it at all, and a future
+ * install that resolves a breaking major is refused here instead of quietly
+ * breaking every upload in the process.
  */
 async function transport(): Promise<typeof import('undici')> {
+  const note = undiciImportNote();
+  if (note) throw new ProxyTransportError(note);
   undici ??= await import('undici');
   return undici;
 }
@@ -640,6 +718,14 @@ async function throughProxy(endpoint: ProxyEndpoint, input: string | URL | Reque
  */
 export function proxyFetcher(pool: ProxyPool, seen?: (endpoint: ProxyEndpoint) => void): typeof fetch {
   return (async (input: string | URL | Request, init?: RequestInit) => {
+    // A transport that cannot be imported is not an exit failing: there is
+    // nothing to rotate away from. Say why once, through the pool's own log, and
+    // take the direct route — the same fallback as a pool with no exit left.
+    const blocked = undiciImportNote();
+    if (blocked) {
+      pool.warnOnce(blocked);
+      return fetch(input as Parameters<typeof fetch>[0], init);
+    }
     const tried = new Set<string>();
     for (;;) {
       const endpoint = pool.pick(tried);
@@ -703,6 +789,14 @@ export async function testExits(pool: ProxyPool, options: ProxyTestOptions = {})
   const timeoutMs = options.timeoutMs ?? 20_000;
   const concurrency = Math.max(1, Math.min(16, options.concurrency ?? 6));
   const endpoints = options.endpoints ?? pool.all();
+  // Nothing to reach the exits with: every row says so rather than reporting
+  // ninety identical connection failures that blame the proxies for our own
+  // install.
+  const blocked = undiciImportNote();
+  if (blocked) {
+    pool.warnOnce(blocked);
+    return endpoints.map((endpoint) => ({ label: endpoint.label, ok: false, ms: 0, bytes: 0, error: blocked }));
+  }
   const results: ProxyTestResult[] = new Array(endpoints.length);
 
   let next = 0;

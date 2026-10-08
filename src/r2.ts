@@ -153,7 +153,24 @@ export function canonicalHeaders(headers: Record<string, string | string[]>): { 
 
 export interface SignatureInput {
   method: string;
-  /** The request path, undecoded; each segment is encoded here. */
+  /**
+   * The path exactly as it must appear in the canonical request. It is signed
+   * verbatim — nothing is encoded here.
+   *
+   * That is deliberate, and it is the one place this signer ever got wrong: it
+   * used to run the path through [encodeRfc3986] itself, and the client already
+   * hands it an encoded path, so every path was encoded **twice**. Nothing notices
+   * for a plain key (`archive/_probe/x.txt` encodes to itself), which is why the
+   * suite was green — but every real archive folder is
+   * `Movies/Inception (2010) [27205]`, and `%20` encoded twice is `%2520`: R2
+   * answers the mismatch with `403 SignatureDoesNotMatch` on the PUT, the HEAD
+   * and the manifest write alike. That is a title whose operations are counted and
+   * whose files never land.
+   *
+   * Measured against the real service (`.scratch/canonical-method.ts`): signing
+   * the single-encoded path answers `200`/`404`, signing the raw one `403`, and
+   * signing it double-encoded `403`.
+   */
   path: string;
   query?: Array<[string, string]>;
   /** Headers to sign, including `host`. Case-insensitive names. An array is a repeated header. */
@@ -193,7 +210,7 @@ export function signRequest(input: SignatureInput): Signature {
   const scope = `${amz.slice(0, 8)}/${input.region}/${input.service}/aws4_request`;
   const canonicalRequest = [
     input.method.toUpperCase(),
-    encodeRfc3986(input.path || '/', false),
+    input.path || '/',
     canonicalQuery(input.query ?? []),
     block,
     signed,
@@ -321,6 +338,7 @@ export class R2Client {
     ];
     const signature = signRequest({
       method: 'GET',
+      // Signed and requested identically, each segment encoded exactly once.
       path: this.pathFor(key),
       query,
       headers: { host: new URL(this.endpoint).host },
@@ -335,7 +353,7 @@ export class R2Client {
   }
 
   /**
-   * The bucket path a key signs and requests, each segment RFC 3986-encoded.
+   * The bucket path a key is requested at, each segment RFC 3986-encoded.
    *
    * An empty key is the bucket root — `/<bucket>` with no trailing slash — which
    * is what `ListObjectsV2` addresses when there is no prefix to list under.
@@ -353,6 +371,8 @@ export class R2Client {
   ): Promise<Response> {
     const payload = typeof options.body === 'string' ? Buffer.from(options.body, 'utf8') : options.body;
     const payloadHash = sha256Hex(payload ?? '');
+    // One string, signed and requested: [SignatureInput.path] is signed as given
+    // and this path is already encoded exactly once.
     const encodedPath = this.pathFor(key);
     const date = this.now();
     const signedHeaders: Record<string, string> = {
@@ -374,8 +394,22 @@ export class R2Client {
       date,
     });
 
-    const outgoing: Record<string, string> = { ...(options.headers ?? {}), 'x-amz-content-sha256': payloadHash, 'x-amz-date': signedHeaders['x-amz-date'] as string, authorization: signature.authorization };
-    if (payload) outgoing['content-length'] = String(payload.length);
+    // `content-length` is deliberately *not* set by hand: the transport computes
+    // it from the body, and a hand-set one is exactly what undici 8 refuses with
+    // `UND_ERR_INVALID_ARG: invalid content-length header` — a client-side error
+    // raised before a byte leaves the process, which from the bucket's side looks
+    // like work that was counted and produced nothing. The header is not part of
+    // the signature (only the headers above are signed), so letting fetch label
+    // the body changes nothing about who R2 thinks is asking.
+    //
+    // `accept-encoding: identity` is not signed either, and it is what makes a
+    // HEAD answer the object's own length: for a compressible content type the
+    // edge otherwise serves a gzipped representation with no `content-length` at
+    // all, and this client's whole verification story — "R2 says the object is
+    // there, at the size that was uploaded" — has nothing to compare against. It
+    // also keeps `read()` hashing the bytes that were stored rather than a
+    // re-encoding of them. Measured: `.scratch/head-identity.ts`.
+    const outgoing: Record<string, string> = { ...(options.headers ?? {}), 'x-amz-content-sha256': payloadHash, 'x-amz-date': signedHeaders['x-amz-date'] as string, 'accept-encoding': 'identity', authorization: signature.authorization };
     const target = options.query?.length
       ? `${this.endpoint}${encodedPath}?${options.query.map(([name, value]) => `${name}=${encodeRfc3986(value, true)}`).join('&')}`
       : `${this.endpoint}${encodedPath}`;
@@ -463,7 +497,7 @@ export class R2Client {
     }
 
     const body = Buffer.concat(buffers, bytes);
-    const response = await this.send('PUT', key, { headers: { ...headers, 'content-length': String(body.length) }, body, timeoutMs: this.transferTimeoutMs });
+    const response = await this.send('PUT', key, { headers, body, timeoutMs: this.transferTimeoutMs });
     return { key, bytes, sha256: sha256Hex(body), parts: 1, ...(response.headers.get('etag') ? { etag: response.headers.get('etag') as string } : {}) };
   }
 

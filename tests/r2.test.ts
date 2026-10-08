@@ -312,6 +312,181 @@ test('put sends a small body as one signed PUT', async () => {
   }
 });
 
+/**
+ * A transport that behaves the way undici 8 does: a request carrying its own
+ * `content-length` header is refused client-side with `UND_ERR_INVALID_ARG`
+ * before it is sent, exactly as loading that major in the process makes every
+ * upload in it fail. The client must leave the header to the transport.
+ *
+ * This is the regression test for the bug where the archive counted operations
+ * and landed nothing: the bodyless calls around an upload (a multipart create, an
+ * abort) still reached R2, while every request with a body died before the
+ * socket — so the bucket stayed empty while its metrics moved.
+ */
+function strictFetch(): typeof fetch {
+  return (input, init) => {
+    const headers = new Headers(init?.headers ?? {});
+    if (init?.body !== undefined && headers.has('content-length')) {
+      return Promise.reject(new TypeError('fetch failed', { cause: new Error('invalid content-length header (UND_ERR_INVALID_ARG)') }));
+    }
+    return fetch(input, init);
+  };
+}
+
+test('a single PUT survives a transport that refuses a hand-set content-length', async () => {
+  const fake = await startFakeR2();
+  try {
+    const r2 = clientFor(fake, { fetchImpl: strictFetch() });
+    const body = Buffer.from('thumbnail bytes');
+    const result = await r2.put('archive/movies/1/thumbnail.jpg', body, { contentType: 'image/jpeg' });
+    assert.equal(result.parts, 1);
+    assert.equal(result.sha256, sha256Hex(body));
+    assert.equal(fake.objects().get('archive/movies/1/thumbnail.jpg')?.body.toString('utf8'), 'thumbnail bytes');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('a multipart upload survives the same transport, parts included', async () => {
+  const fake = await startFakeR2();
+  try {
+    const r2 = clientFor(fake, { singlePutLimitBytes: 64, partBytes: 32, fetchImpl: strictFetch() });
+    const body = Buffer.alloc(200, 7);
+    const result = await r2.put('big.bin', body, { contentLength: body.length });
+    assert.equal(result.parts, Math.ceil(body.length / 32));
+    assert.equal(result.sha256, sha256Hex(body));
+    assert.deepEqual(fake.objects().get('big.bin')?.body, body);
+    assert.equal(fake.transcript.multipartCreates, 1);
+    assert.equal(fake.transcript.completes, 1);
+    assert.equal(fake.transcript.aborts, 0);
+  } finally {
+    await fake.close();
+  }
+});
+
+/**
+ * The canonical URI is the path with each segment encoded **exactly once** — the
+ * one signature rule this client got wrong, and it cost every real archive its
+ * uploads. A plain key like `archive/_probe/x.txt` encodes to itself, so the
+ * suite stayed green; every archive folder is `Movies/Inception (2010) [27205]`,
+ * and there the signer encoded a path the caller had already encoded — `%2520`
+ * instead of `%20` — which R2 answers with `403 SignatureDoesNotMatch` on every
+ * request. The fake in front of these tests never verified signatures, so only a
+ * live bucket could say it.
+ */
+test('the canonical request carries the path encoded exactly once', () => {
+  // No signature comparison here: the string the service hashes is the point,
+  // and a signature checked against another made by the same function proves
+  // nothing about it.
+  const signature = signRequest({
+    method: 'PUT',
+    path: '/archive/Movies/Inception%20%282010%29%20%5B27205%5D/video/1080p.mp4',
+    headers: { host: 'account.r2.cloudflarestorage.com' },
+    payloadHash: EMPTY_HASH,
+    ...VECTOR,
+  });
+  const canonicalUri = signature.canonicalRequest.split('\n')[1] ?? '';
+  assert.equal(canonicalUri, '/archive/Movies/Inception%20%282010%29%20%5B27205%5D/video/1080p.mp4');
+  assert.doesNotMatch(canonicalUri, /%25/, 'an escape that was escaped again');
+});
+
+/**
+ * The edge compresses a compressible object on the fly, and a compressed HEAD has
+ * no `content-length` — which is the one number every verification in the archive
+ * compares against. Asking for `identity` is what keeps the answer honest, so it
+ * is pinned on every request the client makes, not only on HEAD.
+ */
+test('every request asks for the object itself, uncompressed', async () => {
+  const fake = await startFakeR2();
+  const seen: Array<Record<string, string>> = [];
+  const recording: typeof fetch = (input, init) => {
+    seen.push(Object.fromEntries(new Headers(init?.headers ?? {}).entries()));
+    return fetch(input, init);
+  };
+  try {
+    const r2 = clientFor(fake, { fetchImpl: recording });
+    await r2.put('archive/_probe/plain.txt', Buffer.from('x'));
+    await r2.head('archive/_probe/plain.txt');
+    await r2.delete('archive/_probe/plain.txt');
+    assert.equal(seen.length, 3);
+    for (const headers of seen) assert.equal(headers['accept-encoding'], 'identity');
+    assert.equal(fake.objects().size, 0);
+  } finally {
+    await fake.close();
+  }
+});
+
+test('the client signs the once-encoded path it asks the bucket for', async () => {
+  const fake = await startFakeR2();
+  try {
+    const r2 = clientFor(fake);
+    const key = 'Movies/Inception (2010) [27205]/video/1080p.mp4';
+    const body = Buffer.from('rendition bytes');
+    await r2.put(key, body, { contentType: 'video/mp4' });
+    assert.deepEqual([...fake.objects().keys()], [key]);
+
+    const sent = fake.transcript.requests.at(-1);
+    assert.ok(sent?.authorization, 'the request was signed');
+    const payloadHash = sha256Hex(body);
+    const shared = {
+      method: 'PUT',
+      headers: {
+        'content-type': 'video/mp4',
+        host: new URL(fake.url).host,
+        'x-amz-content-sha256': payloadHash,
+        'x-amz-date': '20240102T030405Z',
+      },
+      payloadHash,
+      accessKeyId: 'key-id',
+      secretAccessKey: 'secret',
+      region: 'auto',
+      service: 's3' as const,
+      date: new Date('2024-01-02T03:04:05Z'),
+    };
+    const once = signRequest({ ...shared, path: `/archive/${encodeRfc3986(key, false)}` });
+    const twice = signRequest({ ...shared, path: `/archive/${encodeRfc3986(encodeRfc3986(key, false), false)}` });
+    assert.notEqual(once.authorization, twice.authorization, 'the two forms are not the same signature');
+    assert.equal(sent.authorization, once.authorization);
+  } finally {
+    await fake.close();
+  }
+});
+
+test('a presigned URL signs the same once-encoded path it serves', () => {
+  const r2 = new R2Client({
+    accountId: 'account',
+    accessKeyId: 'key-id',
+    secretAccessKey: 'secret',
+    bucket: 'archive',
+    endpoint: 'https://account.r2.cloudflarestorage.com',
+    now: () => new Date('2024-01-02T03:04:05Z'),
+  });
+  const key = 'Movies/Inception (2010) [27205]/video/1080p.mp4';
+  const url = r2.presign(key, { expiresIn: 300 });
+  // The request path is the encoded one, because that is what a bucket answers.
+  assert.match(url, /\/archive\/Movies\/Inception%20%282010%29%20%5B27205%5D\/video\/1080p\.mp4\?/);
+  const query: Array<[string, string]> = [
+    ['X-Amz-Algorithm', 'AWS4-HMAC-SHA256'],
+    ['X-Amz-Credential', 'key-id/20240102/auto/s3/aws4_request'],
+    ['X-Amz-Date', '20240102T030405Z'],
+    ['X-Amz-Expires', '300'],
+    ['X-Amz-SignedHeaders', 'host'],
+  ];
+  const expected = signRequest({
+    method: 'GET',
+    path: `/archive/${encodeRfc3986(key, false)}`,
+    query,
+    headers: { host: 'account.r2.cloudflarestorage.com' },
+    payloadHash: 'UNSIGNED-PAYLOAD',
+    accessKeyId: 'key-id',
+    secretAccessKey: 'secret',
+    region: 'auto',
+    service: 's3',
+    date: new Date('2024-01-02T03:04:05Z'),
+  });
+  assert.equal(new URL(url).searchParams.get('X-Amz-Signature'), expected.signature);
+});
+
 test('a key with spaces and unicode lands byte-for-byte under the same key', async () => {
   const fake = await startFakeR2();
   try {

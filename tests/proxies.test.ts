@@ -22,11 +22,13 @@ import {
   builtInProxies,
   closeDispatchers,
   countBytes,
+  installedUndiciVersion,
   isProxyRefusal,
   parseProxyEntry,
   parseProxyList,
   readProxyFailure,
   testExits,
+  undiciImportNote,
 } from '../src/proxies';
 import { FAKE_PROXY_AUTHORIZATION, startFakeProxy } from './support/fake-proxy';
 
@@ -312,6 +314,47 @@ test('the exit test says which proxies are alive and which are spent', async () 
     await spent.close();
     await target.close();
   }
+});
+
+/**
+ * The undici guard: which releases may be imported into this process.
+ *
+ * Importing undici 8 makes every request that carries a `content-length` header
+ * fail client-side, and uploads are the requests that carry one — so the pool
+ * must refuse to load it rather than quietly breaking the rest of the process.
+ * The rule is a pure function of the version, which is what makes it testable
+ * without installing anything.
+ */
+test('the transport refuses an undici release that breaks the process’s fetch', () => {
+  const note = undiciImportNote('8.11.2');
+  assert.ok(note, 'v8 is refused');
+  assert.match(note, /undici 8\.11\.2/);
+  assert.match(note, /content-length/);
+  assert.match(note, /\^6/, 'and the fix it names is the pin');
+
+  assert.equal(undiciImportNote('6.29.0'), undefined, 'v6 is what the pool is built on');
+  assert.equal(undiciImportNote('7.30.0'), undefined, 'v7 was measured and is safe');
+  assert.equal(undiciImportNote(undefined), undefined, 'a missing manifest is not a verdict');
+  assert.equal(undiciImportNote('6.29.0-beta.1'), undefined, 'a prerelease reads by its major');
+});
+
+test('the installed undici is a version the pool is allowed to import', () => {
+  // The pin, as a test: a future `npm install` that floats this dependency to a
+  // breaking major fails here, with the reason in the message, instead of
+  // failing later as uploads that stop landing.
+  const version = installedUndiciVersion();
+  assert.ok(version, 'undici is installed — the pool depends on it');
+  assert.equal(undiciImportNote(), undefined, `undici ${version} must be importable; pin it to ^6 if this fails`);
+});
+
+test('a pool says a stand-aside reason once, however often it is asked', () => {
+  const lines: string[] = [];
+  const pool = new ProxyPool([], { log: (message) => lines.push(message) });
+  pool.warnOnce('undici 8.11.2 is installed');
+  pool.warnOnce('undici 8.11.2 is installed');
+  pool.warnOnce('something else');
+  assert.equal(lines.length, 2);
+  assert.match(lines[0] ?? '', /^\[scrape\] undici 8\.11\.2/);
 });
 
 test('nothing in the download half of the pipeline can reach the pool', async () => {

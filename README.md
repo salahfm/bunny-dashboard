@@ -740,6 +740,41 @@ complete archive" means. A title's captions go in as they are: whatever the job
 scraped, plus every target language it was translated into, because all of them
 are attached to the video *before* it is considered finished.
 
+### When nothing lands in the bucket
+
+The failure to know about is the one where the bucket's *operations* graph moves
+and its object list stays empty. Each of these produces it, and each is a request
+refused before the object exists:
+
+- **The signature covers the path encoded exactly once.** The canonical URI is the
+  key with each segment percent-encoded once
+  (`Movies/Inception%20(2010)%20%5B27205%5D/video/1080p.mp4`) and the URL carries
+  that same string. An earlier revision encoded it a second time inside the
+  signer — invisible for a plain key (`archive/_probe/x.txt` encodes to itself),
+  fatal for a real one, because every archive folder is `Movies/Title (year) [id]`:
+  R2 answers `403 SignatureDoesNotMatch` to the PUT, the HEAD and the manifest
+  alike, so the operations are counted and no file is stored. `tests/r2.test.ts`
+  pins the canonical request itself, not one signature against another.
+- **`content-length` is not set by hand.** An undici 8 in `node_modules` makes
+  every request that carries its own fail client-side with `UND_ERR_INVALID_ARG:
+  invalid content-length header`, so the transport labels the body and the
+  dependency is pinned to `undici@^6` — and the pool refuses to import a breaking
+  major at all, logging `[scrape] undici 8… the proxy exits are standing aside`
+  instead of arming a transport that breaks the rest of the process.
+- **`accept-encoding: identity`.** For a compressible content type the edge
+  otherwise serves a gzipped representation, and a gzipped `HEAD` has no
+  `content-length` — the one number every verification in the archive compares
+  against. Asking for identity keeps the answer honest and keeps `read()` hashing
+  the bytes that were stored.
+
+So when a title is not appearing in R2, ask in this order: does `GET /api/diagnostics`
+name the bucket, prefix and endpoint you are looking at (the folder is `archive/`
+unless `R2_PREFIX` says otherwise)? does the job's detail line say **what the copy
+did** (`in R2`, or a failure and its reason)? and was the title ever a *candidate*
+— a publish that finished before a destination was configured is only picked up by
+the reconciler if it is in the catalogue, so an empty Library means nothing has
+been queued since.
+
 ### It is part of the job
 
 With a destination configured a job does not stop when Bunny finishes encoding.
@@ -1283,7 +1318,7 @@ right home for the queue. Hosts that build from a git repository only need the
 
 ```bash
 npm run typecheck        # tsc --noEmit
-npm test                 # 346 tests (queue caps, crypto, store + its change hook + its write-failure and write-coalescing behaviour, catalogue, the Stream client, the account client behind library provisioning, watermarks and the library read-back, TUS, watcher, job lifecycle + a tick that survives an unwritable data folder, crash resume, HLS, source pipeline, subtitles, DeepL translation, multi-language targets, subtitle backfill and its automatic repair, the R2 archive background queue with its verification pass, its scheduled weekly sweep, its automatic reconciler and the publish route that translates, copies every caption and only then deletes from Bunny, targeted repair, restore and signed-URL playback, and its SigV4 signer/presigner, tunnel, network policy, diagnostics, login, autopilot, host politeness, and the scrape proxy pool — its list, its rotation and the boundary that keeps the metered exits out of the download path)
+npm test                 # 355 tests (queue caps, crypto, store + its change hook + its write-failure and write-coalescing behaviour, catalogue, the Stream client, the account client behind library provisioning, watermarks and the library read-back, TUS, watcher, job lifecycle + a tick that survives an unwritable data folder, crash resume, HLS, source pipeline, subtitles, DeepL translation, multi-language targets, subtitle backfill and its automatic repair, the R2 archive background queue with its verification pass, its scheduled weekly sweep, its automatic reconciler and the publish route that translates, copies every caption and only then deletes from Bunny, targeted repair, restore and signed-URL playback, and its SigV4 signer/presigner — including the canonical path that must be encoded exactly once and the identity encoding that keeps a HEAD's length honest — tunnel, network policy, diagnostics, login, autopilot, host politeness, and the scrape proxy pool — its list, its rotation, the boundary that keeps the metered exits out of the download path, and its refusal to import an undici that would break every upload in the process)
 
 # End-to-end against a running mock server:
 npm run mock &           # or in another terminal
